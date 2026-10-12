@@ -1731,6 +1731,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
            "port": port}
     if dflash is not None:                         # DFlash2 drafts instead of the MTP block (the engine loads no MTP)
         cfg["args"] += ["--dflash", str(dflash)]
+    if a.lora:                                     # a llama.cpp LoRA adapter GGUF on top of the model
+        cfg["args"] += ["--lora", str(a.lora)]
     env = parse_env(a.env)
     if pc.get("backend") == "hip":
         cfg["backend"] = "hip"
@@ -2502,6 +2504,8 @@ def main() -> int:
     ap.add_argument("--host-compiler", help="the C++ compiler nvcc uses, e.g. g++-12 (when the default g++ is newer "
                                             "than your CUDA accepts)")
     ap.add_argument("--llama-dir", help="a llama.cpp checkout at the pinned commit, instead of downloading its source")
+    ap.add_argument("--lora", help="a llama.cpp LoRA adapter GGUF applied on top of the model (the engine's --lora; "
+                                   "its scale is the adapter's alpha over its rank, as llama.cpp applies it)")
     ap.add_argument("--rebuild", action="store_true", help="compile the engine again")
     ap.add_argument("--repack", action="store_true", help="build the pack again")
     ap.add_argument("--report", action="store_true", help="write maya-report.txt - this PC, the setup and the engine's "

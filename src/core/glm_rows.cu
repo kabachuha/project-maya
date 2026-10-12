@@ -324,6 +324,13 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             }
             gf::MvJob o = {Ly.out.q, S->gated_q, nullptr, S->mixer, nullptr, 1.0f, Ly.out.type, DI, E};
             if (!mv(&o, 1, "kda output")) return false;
+            if (Ly.lora_attn.has) {   // the adapter's delta on the KDA out projection (per row)
+                for (int i = 0; i < n; ++i) {
+                    gf::lora_a_q8(Ly.lora_attn.a, rows_q(S->gated_q, DI, i), DI, lora_.r, F->lora_t, s);
+                    gf::lora_b_f32(Ly.lora_attn.b, F->lora_t, Ly.lora_attn.out, lora_.r, Ly.lora_attn.scale,
+                                   rows(S->mixer, E, i), s);
+                }
+            }
         } else {
             const float prescale = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
             gf::MvJob j[5];
@@ -386,6 +393,14 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             gf::MvJob o = {Ly.out.q, S->attn_q, nullptr, S->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head,
                            E};
             if (!mv(&o, 1, "dsa output")) return false;
+            if (Ly.lora_attn.has) {   // the adapter's delta on the DSA out projection (per row)
+                for (int i = 0; i < n; ++i) {
+                    gf::lora_a_q8(Ly.lora_attn.a, rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, i),
+                                  g.n_head * g.v_head, lora_.r, F->lora_t, s);
+                    gf::lora_b_f32(Ly.lora_attn.b, F->lora_t, Ly.lora_attn.out, lora_.r, Ly.lora_attn.scale,
+                                   rows(S->mixer, E, i), s);
+                }
+            }
         }
 
         // ---- the FFN-side read (fused with the mixer's write), per row
@@ -409,6 +424,13 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             gf::MvJob dn = {Ly.ffn_down.q, S->dhq, nullptr, S->ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense,
                             E};
             if (!mv(&dn, 1, "dense ffn down")) return false;
+            if (Ly.lora_dense.has) {   // the adapter's delta on the dense FFN's down (per row)
+                for (int i = 0; i < n; ++i) {
+                    gf::lora_a_q8(Ly.lora_dense.a, rows_q(S->dhq, g.n_ff_dense, i), g.n_ff_dense, lora_.r, F->lora_t, s);
+                    gf::lora_b_f32(Ly.lora_dense.b, F->lora_t, Ly.lora_dense.out, lora_.r, Ly.lora_dense.scale,
+                                   rows(S->ffn, E, i), s);
+                }
+            }
         } else {
             // the router and the shared expert's gate / up for every row, then each row's routed experts (and the
             // shared expert's down, which rides their launch) through the token path's own code

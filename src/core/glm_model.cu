@@ -1825,6 +1825,11 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
                                               g.n_head, 1, g.norm_eps, A + sc_gated, nullptr);
             GM_CHECK(gm_gemv(ws_("attn_output.weight"), A + sc_gated, nullptr, 1.0f,
                                                                A + sc_mixer, g.n_embd, g.d_inner()), err);
+            if (lora_.active && lora_.attn[(size_t) il].has) {   // the adapter's delta on the KDA out projection
+                const auto& T = lora_.attn[(size_t) il];
+                strata::kernels::glmf::lora_a_f32(T.a, A + sc_gated, T.in, lora_.r, lora_.scratch, 0);
+                strata::kernels::glmf::lora_b_f32(T.b, lora_.scratch, T.out, lora_.r, T.scale, A + sc_mixer, 0);
+            }
         } else {
             // ---- the DSA mixer
             GM_CHECK(gm_gemv(ws_("attn_q_a.weight"), A + sc_x, nullptr, 1.0f,
@@ -1889,6 +1894,11 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
             }
             GM_CHECK(gm_gemv(ws_("attn_output.weight"), A + sc_attn, nullptr, 1.0f,
                              A + sc_mixer, g.n_embd, (int64_t) g.n_head * g.v_head), err);
+            if (lora_.active && lora_.attn[(size_t) il].has) {   // the adapter's delta on the DSA out projection
+                const auto& T = lora_.attn[(size_t) il];
+                strata::kernels::glmf::lora_a_f32(T.a, A + sc_attn, T.in, lora_.r, lora_.scratch, 0);
+                strata::kernels::glmf::lora_b_f32(T.b, lora_.scratch, T.out, lora_.r, T.scale, A + sc_mixer, 0);
+            }
         }
 
         // ---- hc write (ping-pong), then the FFN half
@@ -1911,6 +1921,11 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
                                               nullptr);
             GM_CHECK(gm_gemv(ws_("ffn_down.weight"), A + sc_h, nullptr, 1.0f,
                                                                A + sc_ffn, g.n_embd, g.n_ff_dense), err);
+            if (lora_.active && lora_.dense[(size_t) il].has) {   // the adapter's delta on the dense FFN's down
+                const auto& T = lora_.dense[(size_t) il];
+                strata::kernels::glmf::lora_a_f32(T.a, A + sc_h, T.in, lora_.r, lora_.scratch, 0);
+                strata::kernels::glmf::lora_b_f32(T.b, lora_.scratch, T.out, lora_.r, T.scale, A + sc_ffn, 0);
+            }
         } else {
             GM_CHECK(gm_gemv(ws_("ffn_gate_inp.weight"), A + sc_x, nullptr, 1.0f,
                                                                  A + sc_tmp, g.n_expert, g.n_embd), err);
@@ -1949,6 +1964,14 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
                     gemv_bias_kernel<<<gm_blocks(g.n_embd), GM_THREADS>>>(W("ffn_down_exps.weight") + slab * e,
                                                                        A + sc_h, nullptr, 1.0f, A + sc_dn, g.n_embd,
                                                                        g.n_ff_exp, 1);
+                    if (lora_.active && lora_.exps[(size_t) il].has) {   // the adapter's per-expert delta; the axpy
+                                                              // below scales it by rw[i] with the base
+                        const auto& E = lora_.exps[(size_t) il];
+                        strata::kernels::glmf::lora_a_f32(E.a + (size_t) e * lora_.r * E.in, A + sc_h, E.in, lora_.r,
+                                                          lora_.scratch, 0);
+                        strata::kernels::glmf::lora_b_f32(E.b + (size_t) e * (size_t) E.out * lora_.r, lora_.scratch,
+                                                          E.out, lora_.r, E.scale, A + sc_dn, 0);
+                    }
                     axpy_kernel<<<blocks(g.n_embd), GM_THREADS>>>(A + sc_moe, rw[(size_t) i], A + sc_dn, g.n_embd);
                 }
             }
@@ -1961,6 +1984,11 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
             GM_CHECK(gm_gemv(ws_("ffn_down_shexp.weight"), A + sc_h, nullptr,
                                                                1.0f, A + sc_sh, g.n_embd,
                                                                (int64_t) g.n_ff_exp * g.n_shared), err);
+            if (lora_.active && lora_.shexp[(size_t) il].has) {   // the adapter's delta on the shared expert's down
+                const auto& T = lora_.shexp[(size_t) il];
+                strata::kernels::glmf::lora_a_f32(T.a, A + sc_h, T.in, lora_.r, lora_.scratch, 0);
+                strata::kernels::glmf::lora_b_f32(T.b, lora_.scratch, T.out, lora_.r, T.scale, A + sc_sh, 0);
+            }
             add_kernel<<<blocks(g.n_embd), GM_THREADS>>>(A + sc_moe, A + sc_sh, A + sc_ffn, g.n_embd);
             cb_dump("ffn_moe_weighted-" + L, A + sc_moe, g.n_embd);
             cb_dump("ffn_shexp-" + L, A + sc_sh, g.n_embd);
@@ -2393,6 +2421,18 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     if (l0_ < 0 || l1_ > g_.n_layers || l1_ <= l0_) {
         err = "pack: bad layer range [" + std::to_string(l0_) + ", " + std::to_string(l1_) + ")";
         return false;
+    }
+    // the LoRA adapter (STRATA_GLM_LORA=<a llama.cpp LoRA GGUF>, STRATA_GLM_LORA_SCALE=<user scale>): loaded
+    // onto this part's device, keyed by ABSOLUTE layer like every per-layer array here (each part of a split
+    // loads the whole adapter - the deltas the other parts own are simply never applied)
+    if (const char* lp = getenv("STRATA_GLM_LORA"); lp != nullptr && lp[0] != '\0') {
+        lora_path_ = lp;
+        lora_scale_ = 1.0f;
+        if (const char* ls = getenv("STRATA_GLM_LORA_SCALE"); ls != nullptr && ls[0] != '\0')
+            lora_scale_ = std::atof(ls);
+        if (!lora_.load(lora_path_, g_, lora_scale_, dev_, err)) return false;
+        std::fprintf(stderr, "glm lora: %s (rank %d, alpha %.6g, user scale %.6g)\n", lora_path_.c_str(), lora_.r,
+                     lora_.alpha, lora_scale_);
     }
     // the layer split: this instance carries only ITS layers' rows (token_embd lives on the first
     // half, the head's tensors on the last); every per-layer array stays indexed by the ABSOLUTE

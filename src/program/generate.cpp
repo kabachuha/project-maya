@@ -238,6 +238,9 @@ struct Options {
     bool prefill_auto = false;
     std::string prefill_arg;           ///< `--prefill` as given (the GLM engine reads it as STRATA_GLM_PREFILL)
     std::string dflash;                ///< `--dflash`: a DFlash2 draft GGUF for the GLM engine (STRATA_GLM_DFLASH)
+    std::string lora;                  ///< `--lora`: a llama.cpp LoRA GGUF for the GLM engine (STRATA_GLM_LORA)
+    double lora_scale = 1.0;           ///< `--lora GGUF [SCALE]`: the user scale (STRATA_GLM_LORA_SCALE)
+    bool lora_scale_set = false;
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
@@ -331,6 +334,10 @@ void usage() {
                  "                       least one draft, up to 4 while the confidences' product stays at 0.9 -\n"
                  "                       STRATA_GLM_DFLASH_MIN / _CUM).  The model's\n"
                  "                       MTP block is not loaded with it.  Env: STRATA_GLM_DFLASH\n"
+                  "  --lora GGUF [SCALE]  (--glm-pack) a llama.cpp LoRA adapter GGUF (convert_lora_to_gguf.py),\n"
+                  "                       applied to the attention out / dense down / shared and routed expert downs\n"
+                  "                       it targets; SCALE is the user scale (default 1, the alpha/rank factor is\n"
+                  "                       folded in, as in llama.cpp).  Env: STRATA_GLM_LORA / STRATA_GLM_LORA_SCALE\n"
                  "  --glm-ram-resident   the pinned RAM tier holds every expert VRAM does not, and nothing is evicted\n"
                  "                       to disk. The start fails if the tier cannot hold them (raise STRATA_GLM_RAM_GB\n"
                  "                       or lower --max-context). Env: STRATA_GLM_RAM_RESIDENT=1\n"
@@ -980,6 +987,10 @@ static int glm_pack_generate(const Options& o) {
     if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
     // the DFlash2 drafter (--dflash, else STRATA_GLM_DFLASH): loaded with the model, on the device of its head
     if (!o.dflash.empty()) set_env("STRATA_GLM_DFLASH", o.dflash.c_str());
+    // the LoRA adapter (--lora GGUF [SCALE], else STRATA_GLM_LORA / STRATA_GLM_LORA_SCALE): loaded with the model
+    if (!o.lora.empty()) set_env("STRATA_GLM_LORA", o.lora.c_str());
+    if (o.lora_scale_set)
+        set_env("STRATA_GLM_LORA_SCALE", std::to_string(o.lora_scale).c_str());
     // the layer split across the visible GPUs: STRATA_GLM_SPLIT, else --layer-split (auto | K1,K2,..)
     if (!model.load_pack_env(o.glm_pack, o.max_context, err, o.layer_split)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
@@ -2948,6 +2959,16 @@ int main(int argc, char** argv) {
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
         else if (a == "--dflash") o.dflash = next("--dflash");
+        else if (a == "--lora") {
+            o.lora = next("--lora");
+            o.lora_scale = 1.0;
+            o.lora_scale_set = false;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {   // the optional scale: the next arg, if it is not a flag
+                o.lora_scale = std::atof(argv[i + 1]);
+                o.lora_scale_set = true;
+                ++i;
+            }
+        }
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;

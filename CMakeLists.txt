@@ -241,6 +241,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/cuda/glm_fast.cu
+                          src/kernels/cuda/glm_lora.cu
                           src/kernels/cuda/glm_batch.cu
                           src/kernels/cuda/exl3.cu
                           src/kernels/ngram.cpp
@@ -257,6 +258,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(exl3_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
     add_test(NAME exl3_test COMMAND exl3_test)
     set_tests_properties(exl3_test PROPERTIES TIMEOUT 120)
+    # the LoRA delta kernels against the scalar CPU reference (synthetic data, no model)
+    add_executable(glm_lora_kernels_test tests/glm_lora_kernels_test.cu)
+    target_include_directories(glm_lora_kernels_test PRIVATE third_party/ggml)
+    target_link_libraries(glm_lora_kernels_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_lora_kernels_test COMMAND glm_lora_kernels_test)
+    set_tests_properties(glm_lora_kernels_test PROPERTIES TIMEOUT 60)
   endif()
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
   # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON
@@ -323,7 +330,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
-    src/core/glm_window.cu src/core/glm_dflash.cu)
+    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_lora.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)

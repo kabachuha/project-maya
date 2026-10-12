@@ -4,7 +4,9 @@
 #pragma once
 
 #include "strata/core/glm_model.hpp"
+#include "strata/core/glm_lora.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/glm_lora.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "glm_memory.hpp"
 #include "glm_layer_graphs.hpp"
@@ -208,6 +210,7 @@ struct Glm5Model::FastState {
     float* part = nullptr;
     unsigned int* counter = nullptr;
     void* xq = nullptr;
+    float* lora_t = nullptr;   // the adapter's rank-r intermediate (device, 32 floats)
     float* proj[3] = {nullptr, nullptr, nullptr};
     float* conv[3] = {nullptr, nullptr, nullptr};
     float *fa = nullptr, *ga = nullptr, *beta = nullptr, *g1 = nullptr, *g2 = nullptr;
@@ -289,6 +292,9 @@ struct Glm5Model::FastState {
         const float* router_bias = nullptr;
         WSlot sh_gate, sh_up, sh_down;
         WSlot ffn_gate, ffn_up, ffn_down;
+        // the adapter's deltas on this layer's sites (has: false when the adapter names this layer not)
+        Glm5Lora::T lora_attn, lora_sh, lora_dense;
+        Glm5Lora::ET lora_exp;
         int gu_type = 0, d_type = 0;
         size_t blob = 0, down_off = 0, gu_bytes = 0, dn_bytes = 0;
         // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix

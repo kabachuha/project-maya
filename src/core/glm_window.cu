@@ -449,6 +449,14 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
     gf::MvJob o = cols({Ly.out.q, (const uint8_t*) W.attn_q + (size_t) t0 * W.aq_s, nullptr, W.mixer + (size_t) t0 * E,
                         nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head, E}, W.aq_s, 0, E);
     if (!gf::mv(&o, 1, s)) { err = "glm window: dsa output"; return false; }
+    if (Ly.lora_attn.has) {   // the adapter's delta on the DSA out projection (per window token)
+        for (int t = t0; t < t0 + T; ++t) {
+            gf::lora_a_q8(Ly.lora_attn.a, (const uint8_t*) W.attn_q + (size_t) t * W.aq_s, Ly.lora_attn.in,
+                          lora_.r, F->lora_t, s);
+            gf::lora_b_f32(Ly.lora_attn.b, F->lora_t, Ly.lora_attn.out, lora_.r, Ly.lora_attn.scale,
+                           W.mixer + (size_t) t * E, s);
+        }
+    }
     mark("dsa_out_mv");
     return true;
 }
@@ -561,6 +569,14 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             jd.xq_cstride = (int64_t) W.sh_hq_s;
             jd.y_cstride = E;
             if (!gf::mv(&jd, 1, s)) { err = "glm window: shared expert down"; return false; }
+            if (Ly.lora_sh.has) {   // the adapter's delta on the shared expert's down (per window token)
+                for (int t = t0; t < t0 + T; ++t) {
+                    gf::lora_a_q8(Ly.lora_sh.a, (const uint8_t*) W.sh_hq + (size_t) t * W.sh_hq_s, Ly.lora_sh.in,
+                                  lora_.r, F->lora_t, s);
+                    gf::lora_b_f32(Ly.lora_sh.b, F->lora_t, Ly.lora_sh.out, lora_.r, Ly.lora_sh.scale,
+                                   W.sh_out + (size_t) t * E, s);
+                }
+            }
             sh_out = W.sh_out + (size_t) t0 * E;
         }
         gf::MoeWin mw;
@@ -590,6 +606,14 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
                   std::to_string(Ly.d_type) + ")";
             return false;
         }
+        if (Ly.lora_exp.has) {   // the adapter's per-expert deltas on the routed experts' down (the device's part;
+                                 // the CPU lane's is added in the lane).  whq's entry (t0*8 + j) is the plan's j-th
+            constexpr int kQ8 = 36;   // bytes per q8_1 block (as win_alloc's allocation)
+            gf::lora_moe_down(W.mplan_ptr + 8 * t0, W.mplan_w + 8 * t0, W.mplan_id + 8 * t0,
+                              (const uint8_t*) W.whq + (size_t) 8 * t0 * (g.n_ff_exp / 32) * kQ8, Ly.lora_exp.a,
+                              Ly.lora_exp.b, g.n_expert, lora_.r, g.n_ff_exp, E, 8 * T, Ly.lora_exp.scale, 8,
+                              W.ffn + (size_t) t0 * E, s);
+        }
         if (prof_b) W.mark("moe_experts", s);
         if (lane)
             for (int t = t0; t < t0 + T; ++t) gf::moe_cpu_wait(tok_dev(t), E, W.ffn + (size_t) t * E, s);
@@ -613,8 +637,16 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
         gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
         gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, E, g.n_ff_exp, g.swiglu_exp, xq, F->hq, Ly.sh_down.q,
                         Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
+        if (Ly.lora_sh.has) {   // the adapter's delta on the shared expert's down
+            gf::lora_a_q8(Ly.lora_sh.a, F->sh_hq, FFs, lora_.r, F->lora_t, s);
+            gf::lora_b_f32(Ly.lora_sh.b, F->lora_t, Ly.lora_sh.out, lora_.r, Ly.lora_sh.scale, F->sh_out, s);
+        }
         gf::moe_down(Ly.d_type, md, g.n_exp_used, E, g.n_ff_exp, Ly.down_off, F->hq,
                      Ly.sh_down.q != nullptr ? F->sh_out : nullptr, ffn, s);
+        if (Ly.lora_exp.has) {   // the adapter's per-expert deltas on the routed experts' down
+            gf::lora_moe_down(md.plan_ptr, md.plan_w, md.plan_id, F->hq, Ly.lora_exp.a, Ly.lora_exp.b, g.n_expert,
+                              lora_.r, g.n_ff_exp, E, g.n_exp_used, Ly.lora_exp.scale, 0, ffn, s);
+        }
         if (lane) gf::moe_cpu_wait(md, E, ffn, s);
         if (W.uid != nullptr)
             cudaMemcpyAsync(W.uid + ((size_t) (il - l0_) * kWinMax + t) * 8, md.plan_id, 8 * sizeof(int),
@@ -716,6 +748,14 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
                            nullptr, 1.0f, Ly.out.type, DI, E};
             cols(o, n, (int64_t) W.gq_s, 0, E);
             if (!gf::mv(&o, 1, s)) { err = "glm window: kda output"; return false; }
+            if (Ly.lora_attn.has) {   // the adapter's delta on the KDA out projection (per window token)
+                for (int t = t0; t < t0 + n; ++t) {
+                    gf::lora_a_q8(Ly.lora_attn.a, (const uint8_t*) W.gated_q + (size_t) t * W.gq_s, Ly.lora_attn.in,
+                                  lora_.r, F->lora_t, s);
+                    gf::lora_b_f32(Ly.lora_attn.b, F->lora_t, Ly.lora_attn.out, lora_.r, Ly.lora_attn.scale,
+                                   W.mixer + (size_t) t * E, s);
+                }
+            }
             mark("kda_out_mv");
         } else {
             if (!fast_dsa_window(il, p0, t0, n, err)) return false;
@@ -739,6 +779,14 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
                             nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense, E};
             cols(dn, n, (int64_t) W.dhq_s, 0, E);
             if (!gf::mv(&dn, 1, s)) { err = "glm window: dense ffn down"; return false; }
+            if (Ly.lora_dense.has) {   // the adapter's delta on the dense FFN's down (per window token)
+                for (int t = t0; t < t0 + n; ++t) {
+                    gf::lora_a_q8(Ly.lora_dense.a, (const uint8_t*) W.dhq + (size_t) t * W.dhq_s, Ly.lora_dense.in,
+                                  lora_.r, F->lora_t, s);
+                    gf::lora_b_f32(Ly.lora_dense.b, F->lora_t, Ly.lora_dense.out, lora_.r, Ly.lora_dense.scale,
+                                   W.ffn + (size_t) t * E, s);
+                }
+            }
             mark("dense_ffn");
             return true;
         }

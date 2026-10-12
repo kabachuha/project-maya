@@ -319,6 +319,8 @@ struct Glm5Model::PrefillState {
     // per chunk, across layers
     float *R = nullptr, *x = nullptr, *mixer = nullptr, *ffn = nullptr;
     float *pre = nullptr, *post = nullptr, *comb = nullptr, *ss = nullptr, *mix = nullptr;
+    float* lora_t = nullptr;       // the adapter's rank-r intermediate, [sub][rank] (sub <= 4096)
+    float* lora_h = nullptr;       // the routed experts' swiglu h, [window][n_ff_exp] (saved before the down reuses it)
     uint16_t* x16 = nullptr;
     int* iota = nullptr;
     uint8_t* uni = nullptr;          // the per-layer region (KDA | DSA | dense | MoE)
@@ -568,6 +570,13 @@ bool Glm5Model::prefill_setup(std::string& err) {
         S->sub_env = std::clamp(std::atoi(v), 16, 8192);
     S->prof = getenv("STRATA_GLM_PREFILL_PROF") != nullptr;
     S->gstride = gstride;
+    if (lora_.active) {   // the adapter's delta on the F16 activations: [sub][rank] scratch (sub <= 4096)
+        if (cudaSetDevice(dev_) != cudaSuccess ||
+            cudaMalloc(&S->lora_t, (size_t) 4096 * Glm5Lora::kMaxRank * sizeof(float)) != cudaSuccess) {
+            std::fprintf(stderr, "glm prefill: the adapter's scratch did not allocate\n");
+            return false;
+        }
+    }
 
     // ---- sizes: the chunk T from the budget (per device)
     const int64_t E = g.n_embd;
@@ -702,6 +711,14 @@ bool Glm5Model::prefill_setup(std::string& err) {
         c.take<uint8_t>(S->gbuf_bytes);
         c.take<uint8_t>(S->pbuf_bytes);
         S->borrow_bytes = c.off;
+    }
+    if (lora_.active && has_moe) {   // the routed experts' swiglu h: the down reuses those rows in place, so save it
+        const size_t W = (size_t) moe_window_rows((size_t) T, g);
+        if (cudaMalloc(&S->lora_h, W * (size_t) g.n_ff_exp * sizeof(float)) != cudaSuccess) {
+            std::fprintf(stderr, "glm prefill: the adapter's h scratch did not allocate\n");
+            prefill_destroy();
+            return false;
+        }
     }
     if (cudaHostAlloc((void**) &S->emb_h, (size_t) T * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &S->h_counts, 4096 * sizeof(int), cudaHostAllocMapped) != cudaSuccess ||
@@ -1221,6 +1238,8 @@ void Glm5Model::prefill_destroy() {
     if (S->h_counts) cudaFreeHost(S->h_counts);
     if (S->h_base) cudaFreeHost(S->h_base);
     if (S->h_bounds) cudaFreeHost(S->h_bounds);
+    if (S->lora_t) cudaFree(S->lora_t);
+    if (S->lora_h) cudaFree(S->lora_h);
     delete S;
     pf_ = nullptr;
 }
@@ -1631,7 +1650,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta,
                             state_ + kda_S_[(size_t) il], B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
                 S->mark("kda_rec", s);
-                if (!skip_output) hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
+                if (!skip_output) {
+                    hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
+                    if (lora_.active && lora_.attn[(size_t) il].has) {   // the adapter's delta on the KDA out projection
+                        const auto& T = lora_.attn[(size_t) il];
+                        strata::kernels::glmf::lora_a_f16(T.a, B.out16, T.in, tn, lora_.r, S->lora_t, s);
+                        strata::kernels::glmf::lora_b_f32_rows(T.b, S->lora_t, T.out, tn, lora_.r, T.scale, mixer, s);
+                    }
+                }
             } else {
                 Carve c{S->uni};
                 DsaBufs B = carve_dsa(c, (size_t) tn, g, S->max_pools);
@@ -1752,8 +1778,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         "mla out");
                 }
                 gb::f32_to_f16(B.attn, B.attn16, (int64_t) tn * g.n_head * g.v_head, s);
-                if (!skip_output)
+                if (!skip_output) {
                     hgemm_q(Ly.out, E, g.n_head * g.v_head, B.attn16, g.n_head * g.v_head, mixer, E, tn, 0.0f);
+                    if (lora_.active && lora_.attn[(size_t) il].has) {   // the adapter's delta on the DSA out projection
+                        const auto& T = lora_.attn[(size_t) il];
+                        strata::kernels::glmf::lora_a_f16(T.a, B.attn16, T.in, tn, lora_.r, S->lora_t, s);
+                        strata::kernels::glmf::lora_b_f32_rows(T.b, S->lora_t, T.out, tn, lora_.r, T.scale, mixer, s);
+                    }
+                }
                 if (t0 + tn == T) {
                     const std::string Ls = std::to_string(il);
                     dump_row("dsa_qr-" + Ls, B.qr, g.q_lora, tn - 1);
@@ -1799,6 +1831,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 hgemm_q(Ly.ffn_up, g.n_ff_dense, E, x16, E, B.du, g.n_ff_dense, tn, 0.0f);
                 gb::swiglu_f16(B.dg, B.du, B.dh16, (int64_t) tn * g.n_ff_dense, g.swiglu_shexp, s);
                 hgemm_q(Ly.ffn_down, E, g.n_ff_dense, B.dh16, g.n_ff_dense, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
+                if (lora_.active && lora_.dense[(size_t) il].has) {   // the adapter's delta on the dense FFN's down
+                    const auto& T = lora_.dense[(size_t) il];
+                    strata::kernels::glmf::lora_a_f16(T.a, B.dh16, T.in, tn, lora_.r, S->lora_t, s);
+                    strata::kernels::glmf::lora_b_f32_rows(T.b, S->lora_t, T.out, tn, lora_.r, T.scale,
+                                                           S->ffn + (size_t) t0 * E, s);
+                }
             }
             S->mark("dense_ffn", s);
             dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
@@ -1816,6 +1854,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             hgemm_q(Ly.sh_up, FF, E, x16, E, M.sh_u, FF, tn, 0.0f);
             gb::swiglu_f16(M.sh_g, M.sh_u, M.sh16, (int64_t) tn * FF, g.swiglu_shexp, s);
             hgemm_q(Ly.sh_down, E, FF, M.sh16, FF, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
+            if (lora_.active && lora_.shexp[(size_t) il].has) {   // the adapter's delta on the shared expert's down
+                const auto& T = lora_.shexp[(size_t) il];
+                strata::kernels::glmf::lora_a_f16(T.a, M.sh16, T.in, tn, lora_.r, S->lora_t, s);
+                strata::kernels::glmf::lora_b_f32_rows(T.b, S->lora_t, T.out, tn, lora_.r, T.scale,
+                                                       S->ffn + (size_t) t0 * E, s);
+            }
         }
         S->mark("shexp", s);
         sgemm_bf16(Ly.router, NE, E, S->x, E, M.logits, NE, T, 1.0f);
@@ -2124,6 +2168,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     gu.ld_dst = 2 * nff;
                     S->mq->run(gu, s);
                     gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);   // (in place: no T x K x n_ff buffer)
+                    const bool lora_on = lora_.active && lora_.exps[(size_t) il].has && S->lora_h != nullptr;
+                    if (lora_on)
+                        strata::kernels::glmf::lora_copy_h(GU, 2 * nff, nrows, nff, S->lora_h, s);   // the down reuses GU
                     mmq::quantize(GU, nullptr, M.Hq, Ly.d_type, nff, 2 * nff, nrows, s);
                     mmq::Product dn;
                     dn.w = wbase + (size_t) i0 * stride + Ly.down_off;
@@ -2140,6 +2187,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     dn.dst = M.OUTP + (size_t) (o - a) * E;
                     dn.ld_dst = E;
                     S->mq->run(dn, s);
+                    if (lora_on) {   // the adapter's per-expert delta; the combine below weights it with the route's
+                        const auto& ET = lora_.exps[(size_t) il];
+                        for (int i = i0; i < i1; ++i) {
+                            const int lo = hb[i] - a, hi = hb[i + 1] - a;
+                            if (hi <= lo) continue;
+                            strata::kernels::glmf::lora_down_rows_f32(
+                                ET.a + (size_t) i * lora_.r * ET.in, ET.b + (size_t) i * (size_t) ET.out * lora_.r,
+                                S->lora_h + (size_t) lo * ET.in, hi - lo, lora_.r, ET.in, ET.out, ET.scale,
+                                M.OUTP + (size_t) (o + lo) * E, s);
+                        }
+                    }
                 }
                 i0 = i1;
             }

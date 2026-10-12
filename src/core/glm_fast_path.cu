@@ -735,10 +735,25 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.ffn_up = q("ffn_up.weight");
             Ly.ffn_down = q("ffn_down.weight");
         }
+        // the adapter's deltas on this layer's sites (no-op when the adapter names this layer not)
+        if (lora_.active) {
+            Ly.lora_attn = lora_.attn[(size_t) il];
+            Ly.lora_sh = lora_.shexp[(size_t) il];
+            Ly.lora_dense = lora_.dense[(size_t) il];
+            Ly.lora_exp = lora_.exps[(size_t) il];
+        }
     }
     if (!missing.empty()) {
         err = "glm fast: unresolved weights: " + missing.substr(0, 600);
         return false;
+    }
+    if (exl3_ && lora_.active) {
+        for (int il = l0_; il < lt_; ++il)
+            if (lora_.exps[(size_t) il].has) {
+                err = "glm fast: the adapter's blk." + std::to_string(il) + ".ffn_down_exps target is not supported on "
+                      "an EXL3 pack (the lane's h rows are not q8_1 there)";
+                return false;
+            }
     }
 
     // ---- the activation arena
@@ -750,7 +765,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         // generous upper bound, carved below
         need = (size_t) (4 * E + 64 + 32 * 26 + 128 + 6 * DI + 4 * 128 + 2 * DI + 2 * g.q_lora + 2 * g.kv_lora +
                          4 * g.idx_key + 64 + (int64_t) g.n_head * g.qk_nope + (int64_t) g.idx_heads * g.idx_key +
-                         max_pools + g.n_sel_max() + 2 * g.n_expert + 2 * FF + 2 * g.n_ff_dense + 2 * E + 64) *
+                         max_pools + g.n_sel_max() + 2 * g.n_expert + 2 * FF + 2 * g.n_ff_dense + 2 * E + 64 +
+                          Glm5Lora::kMaxRank) *
                    sizeof(float);
         need += (size_t) (E + DI + g.q_lora + (int64_t) g.n_head * g.v_head + FF + 8 * g.n_ff_exp + g.n_ff_dense + E) /
                 32 * q8;
@@ -766,6 +782,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->arena_bytes = need;
     uint8_t* at = (uint8_t*) F->arena;
     F->x = fa_take(at, E);
+    F->lora_t = fa_take(at, Glm5Lora::kMaxRank);
     F->mixer = fa_take(at, E);
     F->ffn = fa_take(at, E);
     F->pre = fa_take(at, 8);
@@ -1560,12 +1577,36 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
 // lane's own rows; a verify window's second lane: its pool and rows) - each row's dot is one job's, so the answer is
 // the same bit for bit whatever the pool
 void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, float* ff, float* dn, int il, int ne,
-                             const uint8_t* const* blob, const float* w, const float* x, float* out) {
+                             const uint8_t* const* blob, const int* ids, const float* w, const float* x, float* out) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
     const auto& nf = F->cpu_fmt[(size_t) il];
     namespace kc = strata::kernels::cpu;
+    // the adapter's per-expert delta on the lane's own rows (out += w[i] * scale * B_e (A_e h_i), h_i the lane's
+    // swiglu row): the lane's experts are RAM-tier, so the host computes it from the host table (ids: nullptr
+    // skips it - calibration runs and the merged window's jobs, which carry no plan ids)
+    const auto lora_part = [&](const float* h_row, int i) {
+        if (ids == nullptr || !Ly.lora_exp.has) return;
+        const Glm5Lora::ET& Et = Ly.lora_exp;
+        const int e = ids[i];
+        if (e < 0 || e >= Et.n_exp) return;
+        const int rr = lora_.r;
+        const float* ae = Et.a_h + ((size_t) e * rr) * (size_t) Et.in;
+        const float* be = Et.b_h + ((size_t) e * (size_t) Et.out) * rr;
+        float t[Glm5Lora::kMaxRank];
+        for (int j = 0; j < rr; ++j) {
+            float s2 = 0.f;
+            for (int c = 0; c < Et.in; ++c) s2 += ae[(size_t) j * Et.in + c] * h_row[c];
+            t[j] = s2;
+        }
+        const float ww = w[i] * Et.scale;
+        for (int o = 0; o < Et.out; ++o) {
+            float acc = 0.f;
+            for (int j = 0; j < rr; ++j) acc += be[(size_t) o * rr + j] * t[j];
+            out[o] += ww * acc;
+        }
+    };
     const int n_ff = g.n_ff_exp, n_embd = g.n_embd;
     // one job per pool thread: a contiguous run of the call's rows, the experts' gate/up rows end to end (then the
     // down rows likewise), the weighted sum after.  Each thread streams its share in one piece - 2-socket Xeon, 5
@@ -1651,6 +1692,7 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
             for (int i = 0; i < ne; ++i) m += w[i] * dn(i)[r];
             out[r] = m;
         }
+        for (int i = 0; i < ne; ++i) lora_part(xd(i), i);
         return;
     }
     const int threads = pool.active();
@@ -1685,6 +1727,7 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
         for (int i = 0; i < ne; ++i) m += w[i] * dn[(size_t) i * n_embd + r];
         out[r] = m;
     }
+    for (int i = 0; i < ne; ++i) lora_part(ff + (size_t) i * n_ff, i);
 }
 
 // A verify window's CPU lane (FastState::win_lane): the routes the service thread hands it, each run on the lane's pool
@@ -1694,6 +1737,7 @@ struct Glm5Model::FastState::WinLane {
     struct Job {
         int il = 0, ne = 0;
         const uint8_t* blob[8] = {};
+        int ids[8] = {};   // the plan's expert ids, in blob order (the adapter's delta: -1 skips)
         float w[8] = {};
         const float* x = nullptr;
         gf::CpuAnswer* ans = nullptr;
@@ -1903,7 +1947,7 @@ void Glm5Model::win_lanes_make(std::shared_ptr<glmfast::Workers> p0, std::shared
                 }
                 const auto c0 = std::chrono::steady_clock::now();
                 lane_experts(*L->pool, L->act.data(), L->hq.data(), L->ff.data(), L->dn.data(), j.il, j.ne,
-                             j.blob, j.w, j.x, j.ans->part);
+                             j.blob, j.ids, j.w, j.x, j.ans->part);
                 std::atomic_thread_fence(std::memory_order_release);
                 j.ans->seq = j.seq;
                 F->cpu_experts.fetch_add((uint64_t) j.ne, std::memory_order_relaxed);
@@ -1933,15 +1977,16 @@ void Glm5Model::win_lanes_stop() {
         }
 }
 
-void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out) {
+void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const int* ids, const float* w,
+                                 const float* x, float* out) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
     const auto& nf = F->cpu_fmt[(size_t) il];
     namespace kc = strata::kernels::cpu;
     const int n_ff = g.n_ff_exp, n_embd = g.n_embd;
-    lane_experts(*F->cpu_pool, F->cpu_act.data(), F->cpu_hq.data(), F->cpu_ff.data(), F->cpu_dn.data(), il, ne, blob, w,
-                 x, out);
+    lane_experts(*F->cpu_pool, F->cpu_act.data(), F->cpu_hq.data(), F->cpu_ff.data(), F->cpu_dn.data(), il, ne, blob,
+                 ids, w, x, out);
     // STRATA_GLM_CPU_LANE_VERIFY=1 (debug, slow): the same experts in double precision from ggml's dequantised rows;
     // the relative L2 distance of the lane's sum, accumulated and printed every 16 calls
     static const bool verify = getenv("STRATA_GLM_CPU_LANE_VERIFY") != nullptr;
@@ -2309,7 +2354,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     const auto busy = [&](int ms) {
         for (const auto tw = std::chrono::steady_clock::now();
              std::chrono::steady_clock::now() - tw < std::chrono::milliseconds(ms);)
-            fast_cpu_experts(il_cal, n_cal, cal_set(set++), w4, x.data(), out.data());
+            fast_cpu_experts(il_cal, n_cal, cal_set(set++), nullptr, w4, x.data(), out.data());
     };
     busy(100);
     std::array<double, 16> runs{};
@@ -2319,7 +2364,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         for (int rep = 0; rep < 16; ++rep) {
             const uint8_t* const* cals = cal_set(set++);
             const auto t0 = std::chrono::steady_clock::now();
-            fast_cpu_experts(il_cal, n_cal, cals, w4, x.data(), out.data());
+            fast_cpu_experts(il_cal, n_cal, cals, nullptr, w4, x.data(), out.data());
             runs[(size_t) rep] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         }
         const double med = median16(runs);
@@ -2465,7 +2510,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         x3::moe_down(xa, nullptr, nullptr, dout, F->cs);
         cudaMemcpyAsync(og.data(), dout, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
         cudaStreamSynchronize(F->cs);
-        fast_cpu_experts(il_cal, 1, &cal, &one, xc.data(), oc.data());
+        fast_cpu_experts(il_cal, 1, &cal, nullptr, &one, xc.data(), oc.data());
         // the reference
         const auto ref_mv = [&](int r, const float* in, float* o) {
             const int k = r < 2 ? E : FFE, n = r < 2 ? FFE : E;
@@ -2523,7 +2568,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         cudaMemcpyAsync(xc.data(), dx, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
         cudaMemcpyAsync(og.data(), dout, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
         cudaStreamSynchronize(F->cs);
-        fast_cpu_experts(il_cal, 1, &cal, &one, xc.data(), oc.data());
+        fast_cpu_experts(il_cal, 1, &cal, nullptr, &one, xc.data(), oc.data());
         // the reference: rows dequantised by ggml, dots in double
         const ggml_type_traits* tg = ggml_get_type_traits((ggml_type) Ly.gu_type);
         const ggml_type_traits* td = ggml_get_type_traits((ggml_type) Ly.d_type);
@@ -3441,10 +3486,12 @@ void Glm5Model::fast_service() {
             const unsigned int cm = rq->cpu_mask;
             int ne = 0;
             const uint8_t* blob[8];
+            int ids[8];
             float w[8];
             for (int i = 0; i < g.n_exp_used; ++i)
                 if ((cm >> i) & 1u) {
                     blob[ne] = (const uint8_t*) rq->cpu_src[i];
+                    ids[ne] = rq->ids[i];   // the plan's expert id: the adapter's delta on the lane's part
                     w[ne++] = rq->w[i];
                 }
             // a verify window's token answers into its own slot (the device waits for them at the layer's end)
@@ -3456,13 +3503,13 @@ void Glm5Model::fast_service() {
                 FastState::WinLane::Job j;
                 j.il = rq->layer;
                 j.ne = ne;
-                for (int i = 0; i < ne; ++i) j.blob[i] = blob[i], j.w[i] = w[i];
+                for (int i = 0; i < ne; ++i) j.blob[i] = blob[i], j.ids[i] = ids[i], j.w[i] = w[i];
                 j.x = rq->x;
                 j.ans = ans;
                 j.seq = next;
                 F->win_lane[rq->win & 1]->push(j);
             } else {
-                fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part);
+                fast_cpu_experts(rq->layer, ne, blob, ids, w, rq->x, ans->part);
                 std::atomic_thread_fence(std::memory_order_release);
                 ans->seq = next;
                 F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
@@ -4220,6 +4267,10 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
                    g.n_head * g.v_head, g.n_embd};
     if (!gf::mv(&o, 1, s)) { err = "glm fast: dsa output"; return false; }
     if (F->prof_on) F->mark("dsa_out_mv");
+    if (Ly.lora_attn.has) {   // the adapter's delta on the DSA out projection
+        gf::lora_a_q8(Ly.lora_attn.a, F->attn_q, g.n_head * g.v_head, lora_.r, F->lora_t, s);
+        gf::lora_b_f32(Ly.lora_attn.b, F->lora_t, g.n_embd, lora_.r, Ly.lora_attn.scale, F->mixer, s);
+    }
     return true;
 }
 
@@ -4361,6 +4412,10 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
                                   g.n_embd};
             if (!gf::mv(&sd, 1, s)) { err = "glm fast: shared expert down"; return false; }
         }
+        if (Ly.lora_sh.has) {   // the adapter's delta on the shared expert's down
+            gf::lora_a_q8(Ly.lora_sh.a, F->sh_hq, FFs, lora_.r, F->lora_t, s);
+            gf::lora_b_f32(Ly.lora_sh.b, F->lora_t, g.n_embd, lora_.r, Ly.lora_sh.scale, F->sh_out, s);
+        }
         strata::kernels::exl3::MoeArgs xa;
         xa.plan_ptr = md.plan_ptr;
         xa.plan_w = md.plan_w;
@@ -4380,9 +4435,19 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, io.xq, F->hq, Ly.sh_down.q,
                     Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
     if (F->prof_on) F->mark("moe_gate_up");
+    if (Ly.lora_sh.has) {   // the adapter's delta on the shared expert's down
+        gf::lora_a_q8(Ly.lora_sh.a, F->sh_hq, FFs, lora_.r, F->lora_t, s);
+        gf::lora_b_f32(Ly.lora_sh.b, F->lora_t, g.n_embd, lora_.r, Ly.lora_sh.scale, F->sh_out, s);
+    }
     gf::moe_down(Ly.d_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, Ly.down_off, F->hq,
                  Ly.sh_down.q != nullptr ? F->sh_out : nullptr, io.ffn, s);
     if (F->prof_on) F->mark("moe_down");
+    if (Ly.lora_exp.has) {   // the adapter's per-expert deltas on the routed experts' down (the device's part;
+                             // the CPU lane's part is added in fast_cpu_experts)
+        gf::lora_moe_down(md.plan_ptr, md.plan_w, md.plan_id, F->hq, Ly.lora_exp.a, Ly.lora_exp.b, g.n_expert,
+                          lora_.r, g.n_ff_exp, g.n_embd, g.n_exp_used, Ly.lora_exp.scale, 0, io.ffn, s);
+        if (F->prof_on) F->mark("lora_moe_down");
+    }
     }
     // the CPU lane's experts last: the device's own down rows ran while the CPU worked
     if (lane) {
@@ -4494,6 +4559,10 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             gf::MvJob o = {Ly.out.q, F->gated_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type, DI, g.n_embd};
             if (!gf::mv(&o, 1, s)) { err = "glm fast: kda output"; return false; }
             if (F->prof_on) F->mark("kda_out_mv");
+            if (Ly.lora_attn.has) {   // the adapter's delta on the KDA out projection
+                gf::lora_a_q8(Ly.lora_attn.a, F->gated_q, DI, lora_.r, F->lora_t, s);
+                gf::lora_b_f32(Ly.lora_attn.b, F->lora_t, g.n_embd, lora_.r, Ly.lora_attn.scale, F->mixer, s);
+            }
         } else {
             if (!fast_dsa(il, p, err)) return false;
         }
@@ -4528,6 +4597,10 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
                             g.n_embd};
             if (!gf::mv(&dn, 1, s)) { err = "glm fast: dense ffn down"; return false; }
             if (F->prof_on) F->mark("dense_down_mv");
+            if (Ly.lora_dense.has) {   // the adapter's delta on the dense FFN's down
+                gf::lora_a_q8(Ly.lora_dense.a, F->dhq, g.n_ff_dense, lora_.r, F->lora_t, s);
+                gf::lora_b_f32(Ly.lora_dense.b, F->lora_t, g.n_embd, lora_.r, Ly.lora_dense.scale, F->ffn, s);
+            }
         } else {
             if (!fast_moe(il, pf_pending, err)) return false;
         }
@@ -4621,6 +4694,17 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     if (!gf::mv(&o, 1, FT->cs)) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
+    }
+    // GLM_DUMP_L=<file> (debug): append this position's final logits (n_vocab floats), as the head just wrote them
+    static const char* dl = std::getenv("GLM_DUMP_L");
+    if (dl != nullptr && dl[0]) {
+        cudaStreamSynchronize(FT->cs);
+        std::vector<float> lg((size_t) g.n_vocab);
+        cudaMemcpy(lg.data(), tail->sc_ + tail->sc_logits, lg.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        if (FILE* f = std::fopen(dl, "ab")) {
+            std::fwrite(lg.data(), sizeof(float), lg.size(), f);
+            std::fclose(f);
+        }
     }
     gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok, FT->cs);
     cudaMemcpyAsync(FT->tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);

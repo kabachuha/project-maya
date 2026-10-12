@@ -21,6 +21,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/glm_dflash.hpp"
+#include "strata/core/glm_lora.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -454,10 +455,11 @@ public:
     std::string pack_dir_;
     bool fast_warm(std::string& err);                      // load-time: stream every expert into the tiers
     bool fast_cpu_lane_setup(std::string& err);            // STRATA_GLM_CPU_LANE: the pool, its calibration, the split
-    void fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out);
+    void fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const int* ids, const float* w, const float* x,
+                          float* out);
     // the same on `pool` with the rows act / hq / ff / dn (a verify window's CPU lanes: FastState::win_lane)
     void lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, float* ff, float* dn, int il, int ne,
-                      const uint8_t* const* blob, const float* w, const float* x, float* out);
+                      const uint8_t* const* blob, const int* ids, const float* w, const float* x, float* out);
     void win_lanes_stop();
     void win_lanes_make(std::shared_ptr<glmfast::Workers> p0, std::shared_ptr<glmfast::Workers> p1,
                         const std::vector<int>& c0, const std::vector<int>& c1);
@@ -477,6 +479,7 @@ public:
     int mtp_draft(int32_t next_tok, std::string& err);
     bool has_mtp() const;
     bool kv_int8() const { return lat_q8_; }   // the latent cache in INT8 (STRATA_GLM_KV_INT8=1)
+    const Glm5Lora& lora() const { return lora_; }   // the bound adapter (active: false when none)
     /// Images (the vision path): rows of n_embd floats that stand in for the token embeddings at these absolute
     /// positions - the prompt's <|image|> tokens, in order; an empty call clears them.  Read wherever a token is
     /// embedded (the prompt path and the token path); the draft block keeps the token embedding (drafts only).
@@ -622,6 +625,11 @@ public:
     bool window_commit(int n_keep, std::string& err);
     bool win_reserve(std::string& err);                    // the window's buffers and state backup, before the pool
     void win_prof_report();                                // STRATA_GLM_WIN_PROF: each part's window time, then reset
+    // ---- the LoRA adapter (src/core/glm_lora.cu): a llama.cpp-format LoRA GGUF applied to every
+    //      path's attn_output / ffn_down sites; empty when none is named (STRATA_GLM_LORA)
+    Glm5Lora lora_;
+    std::string lora_path_;                                 // STRATA_GLM_LORA: its GGUF (every part knows it)
+    float lora_scale_ = 1.0f;                               // STRATA_GLM_LORA_SCALE: the user's scale
     // ---- the DFlash drafter (src/core/glm_dflash.cu): the part with the head holds it, on its device
     std::unique_ptr<GlmDflash> dflash_;
     std::string dflash_path_;                              // STRATA_GLM_DFLASH: its GGUF (every part knows it)
