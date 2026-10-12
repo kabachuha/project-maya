@@ -16,6 +16,7 @@
 // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
 // resident experts are excluded, and every other layer's slots are untouched.
 #include "glm_fast_state.hpp"
+#include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -1032,10 +1033,22 @@ bool Glm5Model::fast_setup(std::string& err) {
                                      "encoder\n", dev_, per, vb >> 20);
             }
         }
-        // the slots PER LAYER: uniform, or - with the pack's expert_counts.txt (tools/glm_expert_prior.py) - by routing
-        // share: every layer gets a floor, then each further slot goes to the layer whose next-most-routed expert serves
-        // the largest share of its lookups (early layers spread their routing wide and gain the most).
-        // STRATA_GLM_UNIFORM_SLOTS=1 keeps the uniform split (A/B).
+        // the expert profile (--expert-profile, Strata's profile.bin): read once per half, before the split below
+        if (!profile_path_.empty() && profile_.empty()) {
+            int64_t pslots = 0;
+            std::string perr;
+            if (!read_expert_profile(profile_path_, profile_layers(), g.n_expert, profile_, pslots, perr)) {
+                err = "glm fast: --expert-profile: " + perr;
+                return false;
+            }
+            if (l0_ == 0)
+                std::fprintf(stderr, "glm fast: the expert profile %s ranks %zu (layer, expert) pairs\n",
+                             profile_path_.c_str(), profile_.size());
+        }
+        // the slots PER LAYER: uniform, or - with the expert profile, else the pack's expert_counts.txt
+        // (tools/glm_expert_prior.py) - by routing share: every layer gets a floor, then each further slot goes to the
+        // layer whose next-most-routed expert serves the largest share of its lookups (early layers spread their
+        // routing wide and gain the most).  STRATA_GLM_UNIFORM_SLOTS=1 keeps the uniform split (A/B).
         std::vector<int> nsl((size_t) NL, 0);
         for (int il = l0_; il < lt_; ++il)
             if (F->L[(size_t) il].moe) nsl[(size_t) il] = per;
@@ -1043,7 +1056,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         // layer rather than spending the capped budget on uneven partitions/spares.
         if (getenv("STRATA_GLM_UNIFORM_SLOTS") == nullptr && !(F->unified_memory && per == g.n_expert)) {
             std::vector<std::vector<double>> share((size_t) NL);
-            std::ifstream cf(pack_dir_ + "/expert_counts.txt");
+            // a profile's ranking as shares: each layer's experts in profile order, valued 1 / (1 + their rank in
+            // the whole profile) - the split below then gives the next slot to the layer whose next expert ranks
+            // highest, so VRAM fills in the profile's order (Strata's --expert-profile), above the floors
+            for (size_t r = 0; r < profile_.size(); ++r) {
+                const int il = profile_[r].first;
+                if (il >= l0_ && il < lt_ && F->L[(size_t) il].moe) share[(size_t) il].push_back(1.0 / (1.0 + (double) r));
+            }
+            std::ifstream cf(profile_.empty() ? pack_dir_ + "/expert_counts.txt" : std::string());
             std::string line;
             while (std::getline(cf, line)) {
                 std::istringstream ss(line);
@@ -1093,6 +1113,14 @@ bool Glm5Model::fast_setup(std::string& err) {
                         nsl[(size_t) il] = fl;
                         used += (size_t) fl * slot_stride(il);
                     }
+                // the draft layer (the NextN block, loaded on a split's last part) runs on every drafted token, so a
+                // miss there holds up each draft: it keeps at least the per-layer equal share, whatever its share of
+                // the routes (2x V100, Maya-S: the shipped profile left it 56 slots against 154-206 for the layers
+                // around it, decode 29.8 -> 28.6 tok/s).  The others hold the floor, so the budget has room for it.
+                if (mtp_il_ >= l0_ && mtp_il_ < lt_ && F->L[(size_t) mtp_il_].moe && per > fl) {
+                    used += (size_t) (per - fl) * slot_stride(mtp_il_);
+                    nsl[(size_t) mtp_il_] = per;
+                }
                 // the value of layer l's next slot: the routing share of its next expert (spares past the 288th serve none)
                 const auto gain = [&](int il) {
                     const auto& sh = share[(size_t) il];
@@ -1205,8 +1233,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->cnt.assign((size_t) NL * g.n_expert, 0);
         F->usage.assign((size_t) NL * g.n_expert, 0);
         F->pred_of.assign((size_t) NL, std::array<int, 8>{-1, -1, -1, -1, -1, -1, -1, -1});
-        std::fprintf(stderr, "glm fast: CUDA%d layers [%d,%d) expert pool %.2f GB, %d-%d slots/layer (%lld total)\n",
-                     dev_, l0_, l1_, (double) tot / 1073741824.0, nmin, nmax, (long long) F->pool_slots);
+        const std::string draft_sl = mtp_il_ >= l0_ && mtp_il_ < lt_ && F->L[(size_t) mtp_il_].moe
+                                         ? ", the draft layer " + std::to_string(nsl[(size_t) mtp_il_])
+                                         : std::string();
+        std::fprintf(stderr, "glm fast: CUDA%d layers [%d,%d) expert pool %.2f GB, %d-%d slots/layer%s (%lld total)\n",
+                     dev_, l0_, l1_, (double) tot / 1073741824.0, nmin, nmax, draft_sl.c_str(),
+                     (long long) F->pool_slots);
         if (getenv("STRATA_GLM_TIMING") != nullptr) {
             std::string sl;
             for (int il = l0_; il < lt_; ++il)
@@ -1473,6 +1505,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->upd_gen.assign(F->upd_at.size(), 0u);
         // disk reads: three slices per expert in parallel, through the staging above when the RAM tier has no free slot
         F->workers.reset(new Workers(8));
+        // STRATA_GLM_DISK_SKIP_FROM=<n>: a trunk expert at route rank >= n that is in neither VRAM nor the RAM tier is
+        // left out of the token instead of read from the disk (an approximation: off by default).  Where the experts do
+        // not fit in VRAM + RAM the disk reads are most of a token (a 3090 + 60 GB RAM beside one SATA SSD: ~13 reads,
+        // 155 of 190 ms) and they fall on the low ranks (ranks 4-7 held 63% of them in a chat).
+        if (const char* v = getenv("STRATA_GLM_DISK_SKIP_FROM")) F->disk_skip_from = std::max(0, std::min(8, std::atoi(v)));
+        // STRATA_GLM_DISK_SKIP_W=<share>: also, at any rank, a disk-only expert whose share of the route's weights is
+        // below this (the route's rank follows score + bias, the weight the score alone)
+        if (const char* v = getenv("STRATA_GLM_DISK_SKIP_W")) F->disk_skip_w = (float) std::max(0.0, std::atof(v));
         // LOOKAHEAD: the predictions per layer, a load state per RAM slot, and the reader threads
         if (const char* ah = getenv("STRATA_GLM_AHEAD")) F->n_ahead = std::max(0, std::min(gf::kAhead, std::atoi(ah)));
         if (g.n_expert > 512) F->n_ahead = 0;
@@ -2612,13 +2652,15 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
 }
 
 // ---------------------------------------------------------------- the usage profile
-// Where this machine's expert usage is kept between sessions: STRATA_GLM_USAGE=<file> (0: none), else
-// expert_usage.txt in the pack's folder.
-std::string Glm5Model::usage_path() const {
+// Where this machine's expert usage is kept between sessions: only STRATA_GLM_USAGE=<file> (opt-in; unset or 0: none).
+// As in Strata, a start goes by the expert profile and nothing else is learned across starts unless asked for
+// (--expert-profile-save).
+std::string glmfast::usage_file() {
     const char* u = getenv("STRATA_GLM_USAGE");
-    if (u != nullptr) return std::string(u) == "0" ? std::string() : std::string(u);
-    return pack_dir_.empty() ? std::string() : pack_dir_ + "/expert_usage.txt";
+    return u == nullptr || std::string(u) == "0" ? std::string() : std::string(u);
 }
+
+std::string Glm5Model::usage_path() const { return glmfast::usage_file(); }
 
 // Every half's long-memory routes ("layer e:count ..."), one file, written whole and renamed into place.
 bool Glm5Model::save_usage() {
@@ -2657,19 +2699,77 @@ bool Glm5Model::save_usage() {
     return std::rename(tmp.c_str(), up.c_str()) == 0;
 }
 
+// ---------------------------------------------------------------- the expert profile and the routing trace
+namespace glmfast {
+namespace {
+std::mutex g_route_mu;
+std::FILE* g_route_file = nullptr;
+}  // namespace
+bool route_dumping() { return g_route_file != nullptr; }
+void route_dump(int layer, int k, const int* ids, const float* w) {
+    const int32_t rec[2] = {(int32_t) layer, (int32_t) k};
+    std::lock_guard<std::mutex> lk(g_route_mu);
+    if (g_route_file == nullptr) return;
+    std::fwrite(rec, sizeof rec, 1, g_route_file);
+    std::fwrite(ids, sizeof(int32_t), (size_t) k, g_route_file);
+    std::fwrite(w, sizeof(float), (size_t) k, g_route_file);
+}
+}  // namespace glmfast
+
+bool Glm5Model::set_routing_dump(const std::string& path, std::string& err) {
+    std::lock_guard<std::mutex> lk(glmfast::g_route_mu);
+    if (glmfast::g_route_file != nullptr) std::fclose(glmfast::g_route_file);
+    glmfast::g_route_file = path.empty() ? nullptr : std::fopen(path.c_str(), "wb");
+    if (!path.empty() && glmfast::g_route_file == nullptr) {
+        err = "cannot write the routing trace " + path;
+        return false;
+    }
+    return true;
+}
+
+// What the tiers learned, as a profile: every half's experts in VRAM now (a fetch in flight counts: it lands), the
+// routes this run counted (and the usage file's, when STRATA_GLM_USAGE keeps one), then the profile this run started
+// from.
+bool Glm5Model::save_expert_profile(const std::string& path, std::string& err) {
+    if (fast_ == nullptr) {
+        err = "the expert profile needs the fast path";
+        return false;
+    }
+    const int64_t NL = profile_layers(), NE = g_.n_expert;
+    std::vector<uint8_t> resident((size_t) (NL * NE), 0);
+    std::vector<double> heat((size_t) (NL * NE), 0.0);
+    const std::vector<std::pair<int32_t, int32_t>>* prior = &profile_;   // (a half without MoE layers reads none)
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (prior->empty()) prior = &m->profile_;
+        FastState* F = m->fast_;
+        if (F == nullptr) continue;
+        std::lock_guard<std::mutex> lk(F->mu);
+        for (int il = m->l0_; il < m->lt_ && il < NL; ++il)
+            for (int64_t e = 0; e < NE; ++e) {
+                const size_t key = (size_t) (il * NE + e);
+                if (key < F->slot_of.size() && F->slot_of[key] >= 0) resident[key] = 1;
+                if (key < F->usage.size()) heat[key] = (double) F->usage[key];
+            }
+    }
+    return write_expert_profile(path, NL, NE, rank_learned_profile(NL, NE, resident, heat, *prior), err);
+}
+
 // ---------------------------------------------------------------- load-time warm-up
 // VRAM and the pinned RAM tier together hold (nearly) every routed expert, so the whole model is streamed from the
-// shards ONCE at load: each layer's most frequently routed experts (the pack's expert_prior.txt, written by
-// tools/glm_expert_prior.py from routing traces; id order without it) fill its VRAM slots - all but the spares - and
-// the rest fill the RAM tier (a few slots per class stay free for disk reads).  The first request then runs warm and
-// the disk is touched again only for experts that fit nowhere.  STRATA_GLM_WARM=0 skips it (the tiers fill on demand).
+// shards ONCE at load: each layer's experts in the expert profile's order (--expert-profile; without one the pack's
+// expert_prior.txt, written by tools/glm_expert_prior.py from routing traces; id order without either) fill its VRAM
+// slots - all but the spares - and the rest fill the RAM tier (a few slots per class stay free for disk reads).  The
+// first request then runs warm and the disk is touched again only for experts that fit nowhere.  STRATA_GLM_WARM=0
+// skips it (the tiers fill on demand).
 bool Glm5Model::fast_warm(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto t0 = std::chrono::steady_clock::now();
     const int NL = g.n_layers + 1;
     std::vector<std::vector<int>> order((size_t) NL);
-    {
+    for (const auto& [il, e] : profile_)
+        if (il >= 0 && il < NL && e >= 0 && e < g.n_expert) order[(size_t) il].push_back(e);
+    if (profile_.empty()) {
         std::ifstream pf(pack_dir_ + "/expert_prior.txt");
         std::string line;
         while (std::getline(pf, line)) {
@@ -2681,8 +2781,9 @@ bool Glm5Model::fast_warm(std::string& err) {
                 if (e >= 0 && e < g.n_expert) order[(size_t) il].push_back(e);
         }
     }
-    // THIS user's experts first: the usage profile of earlier sessions (save_usage) leads each layer's order, its
-    // counts become the long memory again, and the LFU counts start from them scaled to at most 32 (enough to keep
+    // With a usage file (STRATA_GLM_USAGE, opt-in) THIS user's experts first: the usage of earlier sessions
+    // (save_usage) leads each layer's order, ahead of the expert profile's, its counts become the long memory
+    // again, and the LFU counts start from them scaled to at most 32 (enough to keep
     // the profile's experts against one-off routes, little enough that a new task takes over within ~100 tokens;
     // a restart then hits ~75% instead of ~67% over the first 50 tokens on one V100, simulated)
     // the routing profile's counts per expert id (expert_counts.txt), for the blend below
@@ -3110,6 +3211,7 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
         s.miss_layers += F->miss_layers.load();
         s.ram_hits += F->ram_hits.load();
         s.disk_reads += F->disk_reads.load();
+        s.disk_skips += F->disk_skips.load();
         s.promotions += F->promotions.load();
         s.cpu_experts += F->cpu_experts.load();
         s.cpu_ms += (double) F->cpu_us.load() / 1000.0;
@@ -3245,11 +3347,14 @@ void Glm5Model::fast_service() {
             const int il = rq->layer;
             const unsigned int miss = rq->miss_mask, fetch = rq->fetch_mask, promo = rq->promo_mask;
             const unsigned int cpu = rq->cpu_mask;   // the CPU lane's experts: not in VRAM, computed below
+            const unsigned int skip = rq->skip_mask;   // DISK SKIP: left out of this token (neither hit nor read)
+            if (skip != 0u) F->disk_skips.fetch_add((uint64_t) std::popcount(skip), std::memory_order_relaxed);
             auto& P = F->lp[(size_t) il];
             auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
             ++F->clock;
             int ids[8];
             for (int i = 0; i < K; ++i) ids[i] = rq->ids[i];
+            if (glmfast::route_dumping()) glmfast::route_dump(il, K, ids, rq->w);   // --dump-routing
             // STRATA_GLM_ROUTE_LOG=<prefix>: "layer e0 .. e7 tier-mask" per route into <prefix>.<device> (cache studies)
             // - the tier masks are fetch, miss and cpu (bits over e0..e7), then " | n0 .. n15": the near misses, the
             //   route's next ranks after the top k, best first
@@ -3270,7 +3375,7 @@ void Glm5Model::fast_service() {
                 if (F->cnt[(size_t) key] < (1u << 24)) ++F->cnt[(size_t) key];
                 if (++F->usage[(size_t) key] >= (1u << 30))
                     for (auto& u : F->usage) u >>= 1;
-                const bool resident = (((miss | fetch | cpu) >> i) & 1u) == 0;
+                const bool resident = (((miss | fetch | cpu | skip) >> i) & 1u) == 0;
                 if (resident) {
                     const int s = F->slot_of[(size_t) key];
                     if (s >= 0) P.tick[(size_t) s] = F->clock;
@@ -3644,7 +3749,8 @@ void Glm5Model::fast_ahead_route(int il, const int* ids, unsigned int miss, cons
         if (ahead[d][0] < 0 || la >= (int) F->layer_rc.size() || F->layer_rc[(size_t) la] < 0) continue;
         const int cls = F->layer_rc[(size_t) la];
         auto& R = F->rc[(size_t) cls];
-        for (int i = 0; i < K; ++i) {
+        // (with DISK SKIP only the ranks a route would wait for: the lower ones are left out when not held)
+        for (int i = 0; i < std::min(K, F->disk_skip_from); ++i) {
             const int e = ahead[d][i];
             if (e < 0) continue;
             const int key = la * g.n_expert + e;
@@ -4374,7 +4480,8 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
                   pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
                   pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
                   il == mtp_il_ ? mtp_skip_from() : trunk_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min,
-                  pf_rank, near_n);
+                  pf_rank, near_n, 0, nullptr, 0, il == mtp_il_ ? 8 : F->disk_skip_from,
+                  il == mtp_il_ ? 0.0f : F->disk_skip_w);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
     // the side stream copies the next layer's predicted experts while this layer computes.  STRATA_GLM_PREFETCH_AT:

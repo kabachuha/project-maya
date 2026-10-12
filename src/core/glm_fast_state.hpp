@@ -191,6 +191,16 @@ inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
 // so the RAM-free measurements add it.  0 without ZFS and elsewhere.
 int64_t zfs_arc_reclaimable();
 
+// --dump-routing (Glm5Model::set_routing_dump): whether a trace file is open, and one route appended to it as
+// Strata's trace record (int32 layer, int32 k, then k int32 expert ids and k float weights), under a lock - the
+// decode's CPU-lane threads (one per half) and the prompt path write to the same file
+bool route_dumping();
+void route_dump(int layer, int k, const int* ids, const float* w);
+
+// The expert usage file (opt-in, as Strata keeps nothing between starts but --expert-profile-save's profile):
+// STRATA_GLM_USAGE=<file>; unset or 0, none - the warm-up and the split search then go by the expert profile
+std::string usage_file();
+
 }  // namespace glmfast
 
 namespace gf = strata::kernels::glmf;
@@ -546,6 +556,9 @@ struct Glm5Model::FastState {
     std::atomic<uint64_t> processed{0};  // ... and the service thread has consumed
     // stats (written by the service thread, read by anyone)
     std::atomic<uint64_t> hits{0}, misses{0}, miss_layers{0}, ram_hits{0}, disk_reads{0}, promotions{0};
+    std::atomic<uint64_t> disk_skips{0};   // STRATA_GLM_DISK_SKIP_W / _FROM: disk-only experts left out
+    int disk_skip_from = 8;                // ... at route rank >= this (8: none)
+    float disk_skip_w = 0.0f;              // ... or of a smaller weight share than this (0: none)
     std::atomic<uint64_t> scratch_uses{0}, demotions{0}, drops{0};
     std::atomic<uint64_t> miss_us{0}, disk_us{0};
     uint64_t tokens = 0;
