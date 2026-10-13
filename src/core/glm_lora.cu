@@ -67,8 +67,9 @@ bool Glm5Lora::load(const std::string& path, const Glm5Geometry& g, float us, in
     user_scale = us;
     GgufFile gf(path);   // throws a std::runtime_error with the file's fault on a bad header
     const MetaValue* arch = gf.get("general.architecture");
-    if (arch == nullptr || arch->type != MetaType::STRING || arch->s != "glm5next") {
-        err = "lora: " + path + ": general.architecture must be \"glm5next\" (this is a glm5-next adapter)";
+    // the model's own name is "glm5-next"; the older heretic adapters write it "glm5next" - both are accepted
+    if (arch == nullptr || arch->type != MetaType::STRING || (arch->s != "glm5-next" && arch->s != "glm5next")) {
+        err = "lora: " + path + ": general.architecture must be \"glm5-next\" (or the older adapters' \"glm5next\")";
         return false;
     }
     const MetaValue* at = gf.get("adapter.type");
