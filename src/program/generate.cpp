@@ -150,6 +150,7 @@ struct Options {
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
+    std::string kv_streaming;          ///< --kv-streaming on|off: streaming with kv_resident's window (32768 if none)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -237,6 +238,9 @@ struct Options {
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
+    bool vram_reserve_given = false;   ///< --vram-reserve-mib on the command line (--glm-pack: a small card's default gives way)
+    /// `--vram-reserve-later-mib N` (--glm-pack): the reserve on a layer split's later GPUs (-1: --vram-reserve-mib's)
+    int vram_reserve_later_mib = -1;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
@@ -340,6 +344,13 @@ void usage() {
                  "                       least one draft, up to 4 while the confidences' product stays at 0.9 -\n"
                  "                       STRATA_GLM_DFLASH_MIN / _CUM).  The model's\n"
                  "                       MTP block is not loaded with it.  Env: STRATA_GLM_DFLASH\n"
+                 "  --expert-cache auto|N  (--glm-pack) the expert pool in VRAM: auto (the default) takes the free\n"
+                 "                       VRAM less the reserve and checks it again once written; N caps the first\n"
+                 "                       GPU's at N of its largest experts.  Env: STRATA_GLM_EXPERT_CACHE\n"
+                 "  --vram-reserve-mib N (--glm-pack) VRAM kept free beside the expert pool (default 700; a small\n"
+                 "                       card's gives way to the pool's floor).  Env: STRATA_GLM_RESERVE_MB\n"
+                 "  --vram-reserve-later-mib N  (--glm-pack) the same on a split's later GPUs (default: the above).\n"
+                 "                       Env: STRATA_GLM_RESERVE_LATER_MB\n"
                   "  --lora GGUF [SCALE]  (--glm-pack) a llama.cpp LoRA adapter GGUF (convert_lora_to_gguf.py),\n"
                   "                       applied to the attention out / dense down / shared and routed expert downs\n"
                   "                       it targets; SCALE is the user scale (default 1, the alpha/rank factor is\n"
@@ -365,12 +376,17 @@ void usage() {
                  "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
                  "                       VRAM; default fp16 until gate G-C accepts int8\n"
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
-                 "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
+                 "                       slightly lower precision\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
                  "                       (vs int8's 1,056); not with --kv-resident\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
-                 "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
+                 "                       all of it in VRAM. A context of N cells or fewer is not streamed. With\n"
+                 "                       --glm-pack: N positions of each DSA layer's latent cache\n"
+                 "                       (STRATA_GLM_KV_RESIDENT)\n"
+                 "  --kv-streaming on|off  KV streaming as a switch (the setup writes `on` into the config): on keeps\n"
+                 "                       --kv-resident's N cells in VRAM, 32768 when it gives none; off keeps all\n"
+                 "                       of the KV in VRAM whatever --kv-resident says\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
@@ -1020,13 +1036,25 @@ static int glm_pack_generate(const Options& o) {
         // INFO facts for the server's Monitor tab (strata app): the expert tiers this engine runs with
         const auto st = model.fast_stats();
         // (+ the CPU lane setup's calibration reads: its threads and its PCIe share, as the engine started)
-        std::printf("INFO context=%lld kv=%s expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast experts=%d "
-                    "vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d vision_lend=%zu cpu_threads=%d "
-                    "pcie_share=%.2f\n",
-                    (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) st.pool_slots,
+        std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast "
+                    "experts=%d vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d vision_lend=%zu "
+                    "cpu_threads=%d pcie_share=%.2f logit_bias=1\n",
+                    (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) model.kv_resident(),
+                    (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
                     model.dflash_ready() ? 1 : 0, model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share());
+        // the Monitor's map of each GPU: what each part holds on its card, in bytes (Glm5Model::VramReport) - the
+        // server finds the card NVML numbers by its PCI address and adds what NVML sees besides
+        for (const auto& r : model.vram_report())
+            std::printf("VRAM dev=%d pci=%s total=%llu free=%llu weights=%llu kv=%llu kv_ram=%llu act=%llu drafter=%llu "
+                        "window=%llu pool=%llu tail=%llu borrow=%llu vision=%llu slots=%lld ctx=%lld layers=%d-%d\n",
+                        r.dev, r.pci.empty() ? "-" : r.pci.c_str(), (unsigned long long) r.total,
+                        (unsigned long long) r.free, (unsigned long long) r.weights, (unsigned long long) r.kv,
+                        (unsigned long long) r.kv_ram, (unsigned long long) r.act, (unsigned long long) r.drafter,
+                        (unsigned long long) r.window, (unsigned long long) r.pool, (unsigned long long) r.tail,
+                        (unsigned long long) r.borrow, (unsigned long long) r.vision, (long long) r.slots,
+                        (long long) r.ctx, r.l0, r.l1);
     }
 
     strata::kernels::SamplerParams sp;
@@ -1122,6 +1150,7 @@ static int glm_pack_generate(const Options& o) {
     }
     const auto next_line = [&](std::string& out) -> bool {
         model.lane_drift_check();
+        model.lane_retime();
         std::unique_lock<std::mutex> lk(in_mu);
         in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof || quit_req.load(); });
         if (in_lines.empty()) return false;   // EOF or QUIT with nothing queued behind it
@@ -1140,6 +1169,8 @@ static int glm_pack_generate(const Options& o) {
     // in the same decode
     int64_t req_think_budget = 0;
     int32_t req_think_end = -1;
+    // the request's logit_bias (GEN key logit_bias=<id>:<bias>,...): added to its logits before every sample
+    std::vector<std::pair<int32_t, float>> req_bias;
     uint64_t snap_img_hash = 1469598103934665603ull;
     const auto img_hash = [&](size_t len) {
         uint64_t h = 1469598103934665603ull;   // FNV-1a over the positions and rows inside [0, len)
@@ -1164,6 +1195,9 @@ static int glm_pack_generate(const Options& o) {
         // a paused request's prompt (PAUSE keep): the next turn of that chat continues it, not the written answer
         // (its history drops the reasoning), so its own continuations do not supersede it until it is taken back
         bool anchor = false;
+        // the end of a system prompt (slot_prefix): other chats start with it, so its conversation's later states
+        // never supersede it - it goes only as the least recently used (#179)
+        bool prefix = false;
     };
     // (static: the multi path's Ctx, a local struct, uses it as a default member value - MSVC accepts that of a static
     // only, and a local constant left Ctx without a default constructor: "std::construct_at: no matching function")
@@ -1321,7 +1355,7 @@ static int glm_pack_generate(const Options& o) {
     const auto slot_put = [&](const char* why) {
         if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min || snap_img_hash != kNoImages) return;
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
-            if (!slots[i].anchor && slots[i].tokens.size() <= snap_tokens.size() &&
+            if (!slots[i].anchor && !slots[i].prefix && slots[i].tokens.size() <= snap_tokens.size() &&
                 std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), snap_tokens.begin()))
                 slot_drop(i);
         while (!slots.empty() && slots.size() >= (size_t) slot_max) slot_drop(slot_lru(SIZE_MAX));
@@ -1411,20 +1445,161 @@ static int glm_pack_generate(const Options& o) {
     // state saved before the last token and the first sample's logits on the tail.  0, or 1 after an ERR line.
     // `tag` prefixes the PP / ERR lines ("<rid> " with several conversations at once).
     std::string tag;
+    // CONVERSATION CHECKPOINTS (Glm5Model::ckpt_save): besides the snapshot (the last prompt but its last token), up to
+    // STRATA_GLM_CKPTS (4; 0 = none) states of the conversation in the model at earlier positions, in host RAM (~150 MB
+    // each with GLM-5.3-Flash): at the end of the system prompt (the first user turn's marker), at the start of the
+    // prompt's last turn (its last user or tool-result marker) and every STRATA_GLM_CKPT_EVERY (16384) fresh prompt
+    // tokens - only where at least 512 fresh tokens lie before.  A prompt that leaves the conversation before the
+    // snapshot's position - an edited or replaced last message, another chat with the same system prompt and tools, a
+    // client that rewrote an older turn - restores the longest checkpoint it starts with and reads only the rest,
+    // where it read everything from token 0.  One conversation at a time (not the several-conversation scheduler) and
+    // text prompts only; STRATA_GLM_NO_REUSE turns it off with the rest of the reuse.
+    struct Ckpt {
+        std::vector<int32_t> tokens;   // the conversation's first tokens the checkpoint holds the state after (empty: free)
+        uint64_t used = 0;
+    };
+    std::vector<Ckpt> ckpts;
+    uint64_t ckpt_clock = 0;
+    const int ckpt_max = model.fast() && model.seq_count() <= 1 && getenv("STRATA_GLM_NO_REUSE") == nullptr
+                             ? std::max(0, std::min(16, (int) env_num("STRATA_GLM_CKPTS", 4)))
+                             : 0;
+    const int64_t ckpt_every = std::max<int64_t>(0, (int64_t) env_num("STRATA_GLM_CKPT_EVERY", 16384));
+    // a prompt writes the state from position `from` on: the checkpoints past it no longer hold this conversation
+    const auto ckpt_drop_past = [&](size_t from) {
+        for (auto& c : ckpts)
+            if (c.tokens.size() > from) c.tokens.clear();
+    };
+    // the positions in [from + 512, end) a prompt read from `from` keeps checkpoints at (see above), ascending
+    const auto ckpt_marks = [&](const std::vector<int32_t>& prompt, size_t from, size_t end) {
+        constexpr int32_t kUserTok = 154827, kObsTok = 154829;   // <|user|>, <|observation|>
+        std::vector<size_t> at;
+        if (ckpt_max <= 0 || !cur_img_pos.empty() || end <= from + 512) return at;
+        size_t first = 0, last = 0;
+        for (size_t i = 1; i < end; ++i)
+            if (prompt[i] == kUserTok || prompt[i] == kObsTok) {
+                if (first == 0 && prompt[i] == kUserTok) first = i;
+                last = i;
+            }
+        std::vector<size_t> turns;
+        for (const size_t p : {first, last})
+            if (p >= from + 512 && p < end) turns.push_back(p);
+        at = turns;
+        // the periodic ones, but none within 512 tokens of a turn boundary (that one holds the same state, more useful)
+        if (ckpt_every > 0)
+            for (size_t p = from + (size_t) ckpt_every; p < end; p += (size_t) ckpt_every) {
+                bool by_turn = false;   // (not `near`: Windows' headers define it away)
+                for (const size_t t : turns) by_turn = by_turn || (p + 512 > t && t + 512 > p);
+                if (!by_turn) at.push_back(p);
+            }
+        std::sort(at.begin(), at.end());
+        at.erase(std::unique(at.begin(), at.end()), at.end());
+        // at most ckpt_max a prompt, the latest kept (the turn's start, then the ones before it)
+        if ((int) at.size() > ckpt_max) at.erase(at.begin(), at.end() - ckpt_max);
+        // every prompt-path call between them must reach its minimum (STRATA_GLM_PREFILL_MIN, 32: fewer go through the
+        // token path, one token at a time): only the piece after the last one may be shorter
+        std::vector<size_t> kept;
+        for (const size_t p : at)
+            if (p >= (kept.empty() ? from : kept.back()) + 64) kept.push_back(p);
+        return kept;
+    };
+    // ... and with the disk slots on, the state at the end of the system prompt (p) also into a slot of its own: the
+    // checkpoints live with the model's state, so an unrelated conversation in between drops them, and another chat
+    // with this system prompt read it all again (#179); the slot outlives that.  Once per system prompt.
+    const auto slot_prefix = [&](const std::vector<int32_t>& prompt, size_t p) {
+        if (slot_max <= 0 || p < slot_min || !cur_img_pos.empty()) return;
+        for (auto& sl : slots)
+            if (sl.prefix && sl.tokens.size() == p && std::equal(sl.tokens.begin(), sl.tokens.end(), prompt.begin())) {
+                sl.used = ++slot_clock;
+                return;
+            }
+        if (!model.snapshot_save()) return;
+        snap_tokens.assign(prompt.begin(), prompt.begin() + (long) p);
+        snap_img_hash = img_hash(p);
+        snap_in_slot = false;
+        slot_put(" (its system prompt, for other chats that start with it)");
+        if (snap_in_slot && !slots.empty() && slots.back().tokens.size() == p) slots.back().prefix = true;
+    };
+    // the state now (after prompt[0, p)) into a free or the least recently used checkpoint
+    const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p) {
+        if ((int) ckpts.size() < ckpt_max) ckpts.emplace_back();
+        size_t c = 0;
+        for (size_t i = 0; i < ckpts.size(); ++i) {
+            if (ckpts[i].tokens.empty()) { c = i; break; }
+            if (ckpts[i].used < ckpts[c].used) c = i;
+        }
+        std::string e;
+        ckpts[c].tokens.clear();
+        if (!model.ckpt_save((int) c, e)) {
+            std::fprintf(stderr, "glm checkpoints: not kept at %zu (%s)\n", p, e.c_str());
+            return;
+        }
+        ckpts[c].tokens.assign(prompt.begin(), prompt.begin() + (long) p);
+        ckpts[c].used = ++ckpt_clock;
+    };
+    // A route that found a non-finite score (or an expert id out of range) means a NaN or an infinity in the state the
+    // request ran on: its conversation must not be served again.  The kept snapshot and every slot this prompt
+    // extends (one may have been the poisoned state's source) are dropped and the model is reset, so the server's
+    // retry reads the prompt from token 0.  The ERR line names it "non-finite" (Glm5Model::route_ok's words).
+    const auto drop_if_poisoned = [&](const std::vector<int32_t>& prompt, const std::string& why) {
+        if (why.find("non-finite") == std::string::npos) return;
+        snap_tokens.clear();
+        snap_in_slot = false;
+        ckpt_drop_past(0);
+        for (size_t i = slots.size(); i-- > 0;) {
+            const auto& t = slots[i].tokens;
+            if (t.size() <= prompt.size() && std::equal(t.begin(), t.end(), prompt.begin())) slot_drop(i);
+        }
+        model.reset();
+        std::fprintf(stderr, "glm nan guard: %s - this conversation's state is dropped; it is read again from token 0\n",
+                     why.c_str());
+    };
     const auto prep_prompt = [&](const std::vector<int32_t>& prompt, size_t& reuse, const char*& finish,
                                  std::chrono::steady_clock::time_point& t0) -> int {
         // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
         // restored when this prompt extends it - a chat's next turn reads only what is new
         strata::core::progress_at("the request: restoring a conversation");
-        if (model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
-            std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
-            img_hash(snap_tokens.size()) == snap_img_hash &&
-            getenv("STRATA_GLM_NO_REUSE") == nullptr && model.snapshot_restore())
-            reuse = snap_tokens.size();
+        const bool snap_ok = model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
+                             std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
+                             img_hash(snap_tokens.size()) == snap_img_hash && getenv("STRATA_GLM_NO_REUSE") == nullptr;
+        // the longest checkpoint this prompt starts with (it holds less than the snapshot when both match)
+        int ck = -1;
+        if (ckpt_max > 0 && cur_img_pos.empty())
+            for (int c = 0; c < (int) ckpts.size(); ++c) {
+                const auto& t = ckpts[(size_t) c].tokens;
+                if (!t.empty() && t.size() < prompt.size() && (ck < 0 || t.size() > ckpts[(size_t) ck].tokens.size()) &&
+                    std::equal(t.begin(), t.end(), prompt.begin()))
+                    ck = c;
+            }
+        const size_t ck_len = ck >= 0 ? ckpts[(size_t) ck].tokens.size() : 0;
+        bool from_ckpt = false;
+        if (snap_ok && snap_tokens.size() >= ck_len && model.snapshot_restore()) reuse = snap_tokens.size();
+        if (reuse == 0 && ck >= 0) {
+            slot_put("");              // the conversation in the model goes on differently past the checkpoint: kept
+            size_t slot_len = 0;       // a slot that holds more of this prompt is taken instead (below)
+            if (slot_max > 0)
+                for (const auto& sl : slots)
+                    if (sl.tokens.size() > slot_len && sl.tokens.size() < prompt.size() &&
+                        std::equal(sl.tokens.begin(), sl.tokens.end(), prompt.begin()))
+                        slot_len = sl.tokens.size();
+            std::string ce;
+            if (slot_len > ck_len) {
+            } else if (model.ckpt_restore(ck, ce)) {
+                reuse = ck_len;
+                from_ckpt = true;
+                ckpts[(size_t) ck].used = ++ckpt_clock;
+                snap_tokens.clear();   // the snapshot's position lies past the checkpoint: overwritten from here on
+                std::fprintf(stderr, "glm checkpoints: %zu of the prompt's %zu tokens from a checkpoint\n", reuse,
+                             prompt.size());
+            } else {
+                std::fprintf(stderr, "glm checkpoints: %s\n", ce.c_str());
+                ckpts[(size_t) ck].tokens.clear();
+            }
+        }
         if (reuse == 0 && slot_max > 0) {
             slot_put("");              // the conversation in the model, before this prompt overwrites it
             reuse = slot_take(prompt);
-        } else if (reuse > 0 && slot_max > 0 && getenv("STRATA_GLM_SLOT_ROUNDTRIP") != nullptr) {
+            if (reuse > 0) ckpt_drop_past(0);   // another conversation's state now
+        } else if (reuse > 0 && !from_ckpt && slot_max > 0 && getenv("STRATA_GLM_SLOT_ROUNDTRIP") != nullptr) {
             // a test: the restored state goes through a slot file and back - the same tokens must follow
             snap_in_slot = false;
             slot_put("");
@@ -1435,6 +1610,7 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         if (reuse == 0) model.reset();
+        ckpt_drop_past(reuse);   // this prompt writes the state from `reuse` on (all of it after a reset)
         std::vector<float> lg;
         t0 = std::chrono::steady_clock::now();
         // the prompt one CHUNK at a time (PP reports per chunk: the server shows it and counts it as a heartbeat);
@@ -1446,34 +1622,55 @@ static int glm_pack_generate(const Options& o) {
         size_t i_first = reuse;
         if (pchunk > 0 && prompt.size() - reuse > 1) {
             // one call for everything but the last token: the two halves of a split pipeline the chunks; PP lines
-            // (the server's progress and heartbeat) come from the progress callback, possibly on the tail's thread
-            std::vector<int32_t> part(prompt.begin() + (long) reuse, prompt.end() - 1);
+            // (the server's progress and heartbeat) come from the progress callback, possibly on the tail's thread.
+            // A checkpoint position (ckpt_marks) ends a call: the state there is kept, and the next call goes on.
             std::mutex pp_mu;
             const auto pp_line = [&](size_t done) {
                 if (!o.serve) return;
                 std::lock_guard<std::mutex> lk(pp_mu);
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                std::printf("PP %s%zu %zu %.1f %.1f\n", tag.c_str(), reuse + done, prompt.size(), ms,
-                            (double) done / (ms / 1000.0 + 1e-9));
+                std::printf("PP %s%zu %zu %.1f %.1f %zu\n", tag.c_str(), reuse + done, prompt.size(), ms,
+                            (double) done / (ms / 1000.0 + 1e-9), reuse);
                 std::fflush(stdout);
             };
-            model.prefill_progress = [&](int64_t done, int64_t total) {
-                (void) total;
-                pp_line((size_t) done);
-                return !stop_req.load();
-            };
-            const bool pok = model.prefill(part, err, prompt.back());   // (the NextN block's caches read it)
-            model.prefill_progress = nullptr;
+            const std::vector<size_t> marks = ckpt_marks(prompt, reuse, prompt.size() - 1);
+            size_t sys_end = 0;  // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
+            for (size_t i = 1; i < prompt.size() && sys_end == 0; ++i)
+                if (prompt[i] == 154827) sys_end = i;   // <|user|>
+            size_t at = reuse;   // the next token the prompt path reads
+            bool pok = true;
+            for (size_t si = 0; si <= marks.size() && pok; ++si) {
+                const size_t end = si < marks.size() ? marks[si] : prompt.size() - 1;
+                const std::vector<int32_t> part(prompt.begin() + (long) at, prompt.begin() + (long) end);
+                const size_t base = at - reuse;
+                model.prefill_progress = [&](int64_t done, int64_t total) {
+                    (void) total;
+                    pp_line(base + (size_t) done);
+                    return !stop_req.load();
+                };
+                pok = model.prefill(part, err, prompt[end]);   // (the NextN block's caches read the next token)
+                model.prefill_progress = nullptr;
+                if (pok) {
+                    at = end;
+                    if (si < marks.size()) ckpt_keep(prompt, end);
+                    if (si < marks.size() && end == sys_end) slot_prefix(prompt, end);
+                }
+            }
+            // a call the prompt path did not take (fewer tokens than STRATA_GLM_PREFILL_MIN: false, no error) leaves the
+            // rest to the token path below - from where the prompt path stopped, not from `reuse`
+            i_first = at;
             if (pok) {
                 i_first = prompt.size() - 1;
-                pp_line(part.size());
+                pp_line(prompt.size() - 1 - reuse);
             } else if (err == "cancelled") {
                 snap_tokens.clear();
                 model.reset();
+                ckpt_drop_past(0);
                 finish = "cancel";
                 i_first = prompt.size();
             } else if (!err.empty()) {
                 snap_tokens.clear();
+                drop_if_poisoned(prompt, err);
                 std::printf("ERR %s%s\n", tag.c_str(), err.c_str());
                 return 1;
             }
@@ -1497,14 +1694,15 @@ static int glm_pack_generate(const Options& o) {
             const bool ok = model.forward(part, lg, err);
             if (!ok) {
                 snap_tokens.clear();
+                drop_if_poisoned(prompt, err);
                 std::printf("ERR %s%s\n", tag.c_str(), err.c_str());
                 return 1;
             }
             i += chunk;
             if (o.serve) {
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                std::printf("PP %s%zu %zu %.1f %.1f\n", tag.c_str(), i, prompt.size(), ms,
-                            (double) (i - reuse) / (ms / 1000.0 + 1e-9));
+                std::printf("PP %s%zu %zu %.1f %.1f %zu\n", tag.c_str(), i, prompt.size(), ms,
+                            (double) (i - reuse) / (ms / 1000.0 + 1e-9), reuse);
             }
             if (stop_req.load()) { finish = "cancel"; break; }
         }
@@ -1689,14 +1887,37 @@ static int glm_pack_generate(const Options& o) {
                                                                            : -1.0f;
             if (!model.decode_dflash(sp, max_new, n_max, p_min, on_token, n_spec, err, req_spec_n_min,
                                      req_spec_cum >= 0.0 && req_spec_cum <= 1.0 ? (float) req_spec_cum : -1.0f)) {
+                drop_if_poisoned(prompt, err);
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.mtp_ready() && req_spec != 1) {
+            // the one-GPU MTP decode (glm_mtp.cu; by default on the Strix / Gorgon Halo APUs): the NextN block drafts,
+            // one verify window checks the drafts (same tokens as the loop below for the same samples)
+            int64_t n_spec = 0;
+            const uint64_t rounds0 = model.mtp_rounds_;
+            uint64_t len0[9];
+            std::copy(model.mtp_round_n_, model.mtp_round_n_ + 9, len0);
+            if (!model.decode_mtp(sp, max_new, on_token, n_spec, err)) {
+                drop_if_poisoned(prompt, err);
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
+            if (model.mtp_rounds_ > rounds0) {
+                std::string lens;
+                for (int i = 0; i < 9; ++i)
+                    if (model.mtp_round_n_[i] > len0[i])
+                        lens += " " + std::to_string(i) + ":" + std::to_string(model.mtp_round_n_[i] - len0[i]);
+                std::fprintf(stderr, "glm mtp: %llu rounds, %.2f tokens a round | rounds by draft length%s\n",
+                             (unsigned long long) (model.mtp_rounds_ - rounds0),
+                             (double) n_spec / (double) (model.mtp_rounds_ - rounds0), lens.c_str());
             }
         } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
             // running the NextN block's draft (same tokens as the loop below)
             int64_t n_spec = 0;
             if (!model.decode_spec(sp, max_new, on_token, n_spec, err)) {
+                drop_if_poisoned(prompt, err);
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -1708,6 +1929,7 @@ static int glm_pack_generate(const Options& o) {
                 }
                 int tok = model.sample_token(sp, err);
                 if (tok < 0) {
+                    drop_if_poisoned(prompt, err);
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
@@ -1715,6 +1937,7 @@ static int glm_pack_generate(const Options& o) {
                 sp.counter += 1;
                 if (!on_token(tok)) break;
                 if (!model.forward({(int32_t) tok}, lg, err)) {
+                    drop_if_poisoned(prompt, err);
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
@@ -1756,6 +1979,16 @@ static int glm_pack_generate(const Options& o) {
                              (unsigned long long) (model.spec_hits_ - hits0),
                              (unsigned long long) (model.spec_steps_ - spec0),
                              100.0 * (double) (model.spec_hits_ - hits0) / (double) (model.spec_steps_ - spec0));
+            if (model.kv_resident() > 0) {
+                // KV streaming, cumulative over the process: the blocks the decode's selections named, and those
+                // read from RAM (every part summed)
+                const auto kv = model.kv_stream_stats();
+                std::fprintf(stderr, "glm kv: KV streaming: %.2f%% of %llu block reads hit VRAM, %.1f MiB read from RAM%s\n",
+                             kv.lookups ? 100.0 * (double) (kv.lookups - kv.misses) / (double) kv.lookups : 100.0,
+                             (unsigned long long) kv.lookups,
+                             (double) kv.misses * kv.block_bytes / 1048576.0,
+                             kv.overflow ? " - OVERFLOW (too few resident positions)" : "");
+            }
         }
         return 0;
     };
@@ -1820,6 +2053,7 @@ static int glm_pack_generate(const Options& o) {
     };
     std::vector<std::unique_ptr<Gen>> gens;
     std::deque<Gen*> flight;     // issued, oldest first
+    std::deque<int> flight_groups;   // split rows: the sizes of the issued groups, oldest first
     // a request no idle context can hold yet (its prompt needs the large first context, which is busy): it waits
     // here with what its GEN line said, and is admitted when one frees
     struct Pending {
@@ -1831,6 +2065,7 @@ static int glm_pack_generate(const Options& o) {
         int32_t think_end;
         std::vector<int64_t> img_pos;
         std::vector<float> img_rows;
+        std::vector<std::pair<int32_t, float>> bias;
     };
     std::deque<Pending> pending;
     // the room a context must leave for the answer (at most what the request asked for): a long prompt goes to a
@@ -1838,6 +2073,20 @@ static int glm_pack_generate(const Options& o) {
     static const int64_t multi_room = (int64_t) env_num("STRATA_GLM_MULTI_ROOM", 16384);
     static const int multi_boundary_every = (int) env_num("STRATA_GLM_MULTI_BOUNDARY", 32);
     static const bool multi_spec = env_num("STRATA_GLM_MULTI_SPEC", 1) != 0;
+    static const int split_rows = std::clamp((int) env_num("STRATA_GLM_SPLIT_ROWS", 0), 0,
+                                             strata::core::Glm5Model::rows_max());
+    // Reuse split-row scheduler buffers; allocating vectors for each decode group defeats part of the batching gain.
+    std::vector<Gen*> split_group;
+    std::vector<int> split_seqs;
+    std::vector<int32_t> split_toks;
+    std::vector<strata::kernels::SamplerParams> split_sps;
+    if (split_rows > 0) {
+        const size_t cap = (size_t) split_rows;
+        split_group.reserve(cap);
+        split_seqs.reserve(cap);
+        split_toks.reserve(cap);
+        split_sps.reserve(cap);
+    }
     int since_boundary = 0;
     uint64_t multi_n = 0;        // tokens since the engine last had nothing to do (the STAT lines' rate)
     std::chrono::steady_clock::time_point multi_t1;
@@ -2008,6 +2257,7 @@ static int glm_pack_generate(const Options& o) {
             if (tok < 0) return false;
             gen_took(g, tok);
         }
+        flight_groups.clear();
         return true;
     };
     // a just-admitted request's first token, while the tail's logits are still its own
@@ -2028,11 +2278,18 @@ static int glm_pack_generate(const Options& o) {
     const auto multi_fail = [&](const std::string& why) {
         for (auto& gp : gens) {
             if (gp->done) continue;
+            if (why.find("non-finite") != std::string::npos)   // the slots it may have come from (drop_if_poisoned)
+                for (size_t i = slots.size(); i-- > 0;) {
+                    const auto& t = slots[i].tokens;
+                    if (t.size() <= gp->prompt.size() && std::equal(t.begin(), t.end(), gp->prompt.begin()))
+                        slot_drop(i);
+                }
             std::printf("ERR %d %s\n", gp->rid, why.c_str());
             ctxs[(size_t) gp->ctx].busy = false;
             gp->done = true;
         }
         flight.clear();
+        flight_groups.clear();
         for (int c = 0; c < (int) ctxs.size(); ++c) {
             bind_ctx(c);
             snap_tokens.clear();
@@ -2093,12 +2350,21 @@ static int glm_pack_generate(const Options& o) {
                             g->prompt.size());
                 return;
             }
-            pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows});
+            pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows,
+                               req_bias});
             std::fprintf(stderr, "glm multi: request %d waits for a context that holds %lld tokens\n", rid,
                          (long long) want);
             return;
         }
         g->max_new = std::min<int64_t>(max_new, model.seq_max_ctx(best) - (int64_t) g->prompt.size() - 8);
+        {   // its logit_bias: the table of the context it runs in (no earlier request's sample reads it any more)
+            std::string be;
+            g->sp.logit_bias = model.logit_bias_table(best, req_bias, be);
+            if (!be.empty()) {
+                std::printf("ERR %d %s\n", rid, be.c_str());
+                return;
+            }
+        }
         if (gens.empty()) stop_req.store(false);
         bind_ctx(best);
         model.set_image_rows(cur_img_pos, cur_img_rows);
@@ -2165,6 +2431,7 @@ static int glm_pack_generate(const Options& o) {
             pending.erase(pending.begin() + (long) i);
             req_think_budget = w2.think_budget;
             req_think_end = w2.think_end;
+            req_bias = std::move(w2.bias);
             cur_img_pos = std::move(w2.img_pos);
             cur_img_rows = std::move(w2.img_rows);
             gen_admit(w2.rid, w2.ids, w2.max_new, w2.rq);
@@ -2254,6 +2521,57 @@ static int glm_pack_generate(const Options& o) {
             gen_sweep();
             return;
         }
+        if (split_rows > 0 && model.split_rows_ok()) {
+            split_group.clear();
+            const auto issue = [&]() -> bool {          // one batched step of the gathered group
+                if (split_group.empty()) return true;
+                split_seqs.clear();
+                split_toks.clear();
+                split_sps.clear();
+                for (Gen* gp : split_group) {
+                    split_seqs.push_back(gp->ctx);
+                    split_toks.push_back(gp->pending);
+                    split_sps.push_back(gp->sp);
+                }
+                if (!model.multi_issue_rows(split_seqs.data(), split_toks.data(), split_sps.data(),
+                                           (int) split_group.size(), err))
+                    return false;
+                for (Gen* gp : split_group) {
+                    gp->sp.counter += 1;
+                    gp->pending = -1;
+                    gp->inflight = true;
+                    flight.push_back(gp);
+                }
+                flight_groups.push_back((int) split_group.size());
+                split_group.clear();
+                return true;
+            };
+            for (auto& gp : gens) {
+                if (gp->done || gp->inflight || gp->pending < 0) continue;
+                split_group.push_back(gp.get());
+                if ((int) split_group.size() == split_rows && !issue()) { multi_fail(err); return; }
+            }
+            if (!issue()) { multi_fail(err); return; }
+            if (flight.empty()) { gen_sweep(); return; }
+            const int k = flight_groups.front();   // the oldest group, all of it
+            flight_groups.pop_front();
+            for (int j = 0; j < k; ++j) {
+                Gen& g = *flight.front();
+                flight.pop_front();
+                const int tok = model.multi_take(g.ctx, err);
+                g.inflight = false;
+                if (tok < 0) { multi_fail(err); return; }
+                gen_took(g, tok);
+            }
+            since_boundary += k;
+            if (multi_boundary_every > 0 &&
+                since_boundary >= multi_boundary_every * (int) std::max<size_t>(1, gens.size())) {
+                since_boundary = 0;
+                if (!multi_drain() || !model.multi_boundary(err)) { multi_fail(err); return; }
+            }
+            gen_sweep();
+            return;
+        }
         for (auto& gp : gens) {
             Gen& g = *gp;
             if (g.done || g.inflight || g.pending < 0) continue;
@@ -2291,7 +2609,7 @@ static int glm_pack_generate(const Options& o) {
 
     // STRATA_GLM_MULTI_BENCH=<n>,<prompt>,<gen>[,<boundary rounds>] (needs STRATA_GLM_SEQS >= n): n synthetic
     // prompts of <prompt> tokens, then <gen> greedy tokens each - sequence 0 alone through the token path first (the
-    // reference), then all n at once through the pipelined decode; prints both rates and whether sequence 0 wrote the
+    // reference), then all n through the selected together, split-rows or pipelined path; prints both rates and whether
     // same tokens both ways.
     if (const char* mb = getenv("STRATA_GLM_MULTI_BENCH")) {
         int n = 2, L = 512, G = 256, K = 32, same_prompt = 0;
@@ -2373,6 +2691,8 @@ static int glm_pack_generate(const Options& o) {
         const auto t0 = now();
         int since = 0, boundaries = 0;
         const bool rows = model.rows_ok();   // one GPU: all n together, one step per token of each
+        const bool srows = !rows && split_rows > 0 && model.split_rows_ok();
+        const char* path = rows ? "together" : srows ? "split-rows" : "pipelined";
         if (rows) {
             std::vector<int> seqs((size_t) n), next((size_t) n);
             std::vector<int32_t> toks((size_t) n);
@@ -2385,9 +2705,70 @@ static int glm_pack_generate(const Options& o) {
                 ++boundaries;   // (one before every step, in the step itself)
             }
         }
-        for (int s = 0; s < n && !rows; ++s) {
+        for (int s = 0; s < n && !rows && !srows; ++s) {
             if (!model.multi_issue(s, out[(size_t) s].back(), g0, err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
             q.push_back(s);
+        }
+        if (srows) {
+            std::deque<int> qg;
+            const auto issue_rows = [&](const std::vector<int>& seqs) -> bool {
+                for (size_t first = 0; first < seqs.size(); first += (size_t) split_rows) {
+                    const int k = std::min(split_rows, (int) (seqs.size() - first));
+                    std::vector<int> group_seqs;
+                    std::vector<int32_t> toks;
+                    std::vector<strata::kernels::SamplerParams> sps((size_t) k, g0);
+                    for (int j = 0; j < k; ++j) {
+                        const int s = seqs[first + (size_t) j];
+                        group_seqs.push_back(s);
+                        toks.push_back((int32_t) out[(size_t) s].back());
+                    }
+                    if (!model.multi_issue_rows(group_seqs.data(), toks.data(), sps.data(), k, err)) {
+                        std::fprintf(stderr, "multi bench: %s\n", err.c_str());
+                        return false;
+                    }
+                    for (const int s : group_seqs) q.push_back(s);
+                    qg.push_back(k);
+                }
+                return true;
+            };
+            std::vector<int> initial((size_t) n);
+            for (int s = 0; s < n; ++s) initial[(size_t) s] = s;
+            if (!issue_rows(initial)) return 1;
+            while (!qg.empty()) {
+                std::vector<int> again;
+                const auto take_group = [&](int k) -> bool {
+                    for (int j = 0; j < k; ++j) {
+                        const int s = q.front();
+                        q.pop_front();
+                        const int tok = model.multi_take(s, err);
+                        if (tok < 0) {
+                            std::fprintf(stderr, "multi bench: %s\n", err.c_str());
+                            return false;
+                        }
+                        out[(size_t) s].push_back(tok);
+                        if ((int) out[(size_t) s].size() < G) again.push_back(s);
+                    }
+                    return true;
+                };
+                const int k = qg.front();
+                qg.pop_front();
+                if (!take_group(k)) return 1;
+                since += k;
+                if (K > 0 && since >= K * n) {
+                    while (!qg.empty()) {
+                        const int k2 = qg.front();
+                        qg.pop_front();
+                        if (!take_group(k2)) return 1;
+                    }
+                    if (!model.multi_boundary(err)) {
+                        std::fprintf(stderr, "multi bench: %s\n", err.c_str());
+                        return 1;
+                    }
+                    ++boundaries;
+                    since = 0;
+                }
+                if (!issue_rows(again)) return 1;
+            }
         }
         while (!q.empty()) {
             const int s = q.front();
@@ -2418,7 +2799,7 @@ static int glm_pack_generate(const Options& o) {
         const double multi_s = secs(t0, now());
         st_b = model.fast_stats();
         tiers("solo", solo_a, solo_b, G);
-        tiers(model.rows_ok() ? "together" : "pipelined", st_a, st_b, n * G);
+        tiers(path, st_a, st_b, n * G);
         const auto agree = [](const std::vector<int>& a, const std::vector<int>& b) {
             size_t k = 0;
             while (k < a.size() && k < b.size() && a[k] == b[k]) ++k;
@@ -2431,7 +2812,7 @@ static int glm_pack_generate(const Options& o) {
                         agree(out[(size_t) s], solo));
         std::printf("MULTI BENCH %d seqs, prompt %d, %d tokens each: solo %.1f tok/s | %s %.1f tok/s total, "
                     "%.1f per sequence (%d boundaries) | sequence 0 same tokens: %zu of %zu\n", n, L, G,
-                    (G - 1) / solo_s, rows ? "together" : "pipelined", (double) n * (G - 1) / multi_s,
+                    (G - 1) / solo_s, path, (double) n * (G - 1) / multi_s,
                     (G - 1) / multi_s, boundaries, same, solo.size());
         for (int s = 0; s < n; ++s) {
             std::printf("  seq %d:", s);
@@ -2569,6 +2950,45 @@ static int glm_pack_generate(const Options& o) {
     // server's own stall check counts a spinning thread as work.  A prompt layer or a token is the heartbeat; a big
     // chunk's layer on a slow PC takes seconds, so three minutes of none is a hang.
     start_serve_watchdog(180);
+    // the VRAM left on every GPU once everything is loaded.  Below ~256 MiB (a split's later GPUs: 512 - their verify
+    // windows' graphs are captured on first use) a later allocation fails, and under Windows' WDDM the driver pages GPU
+    // memory to system RAM instead: decode falls to a few tok/s and a request can stall for good.  Said, never changed:
+    // the line names the setting that leaves room (--vram-reserve-mib is deducted before the expert pool is sized).
+    const auto pools = model.fast() ? model.pool_vram() : std::vector<strata::core::Glm5Model::PoolVram>();
+    const auto free_mib_on = [](int dev) -> int64_t {
+        int cur = 0;
+        cudaGetDevice(&cur);
+        cudaSetDevice(dev);
+        size_t fb = 0, tb = 0;
+        const bool ok = cudaMemGetInfo(&fb, &tb) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+        cudaSetDevice(cur);
+        return ok ? (int64_t) (fb >> 20) : -1;
+    };
+    for (size_t i = 0; i < pools.size(); ++i) {
+        const auto& pv = pools[i];
+        const int64_t fm = free_mib_on(pv.dev);
+        if (fm < 0) continue;
+        const int64_t ok_mib = i == 0 ? 256 : 512;
+        if (fm >= ok_mib) {
+            std::fprintf(stderr, "maya serve: CUDA%d: %lld MiB of VRAM free with everything loaded\n", pv.dev, (long long) fm);
+        } else if (pv.adapted) {
+            std::fprintf(stderr, "maya serve: WARNING: CUDA%d: %lld MiB of VRAM free with everything loaded - this card "
+                                 "only just fits the model (the VRAM reserve was lowered to %d MiB so the expert pool "
+                                 "fits): requests may stall. Close other programs that use the GPU, or lower "
+                                 "--max-context\n", pv.dev, (long long) fm, pv.reserve_mib);
+        } else {
+            std::fprintf(stderr, "maya serve: CUDA%d: %lld MiB of VRAM free with everything loaded - LOW: requests may "
+                                 "stall; add %s %lld to the config's args (or lower --max-context)\n", pv.dev,
+                         (long long) fm, i == 0 ? "--vram-reserve-mib" : "--vram-reserve-later-mib",
+                         (long long) (pv.reserve_mib + (i == 0 ? 512 : 768) - fm));
+            // a number of the user's own (--expert-cache N) is not checked against the VRAM once written (auto is)
+            if (pv.fixed > 0)
+                std::fprintf(stderr, "maya serve: the expert pool was set with --expert-cache %lld: a smaller one - or "
+                                     "--expert-cache auto, which checks the free VRAM once the pool is written - leaves "
+                                     "room\n", (long long) pv.fixed);
+        }
+    }
     // the serve wire contract (serve/server.py): READY <max_context> [stop] once, then GEN <max_new>
     // [<key>=<value> ...] <id,id,...> lines - the sampling keys are per request and the ids are the LAST
     // token.  "stop" is NOT advertised: a request runs to its end (no mid-request cancel in M3.1).
@@ -2659,6 +3079,7 @@ static int glm_pack_generate(const Options& o) {
             }
             std::vector<int32_t> t(t64.begin(), t64.end());
             snap_tokens.clear();                  // the saved state is LOGP's now, not a conversation's
+            ckpt_drop_past(0);                    // ... and so are the caches the checkpoints stood on
             model.set_host_logits(true);
             const std::vector<int32_t> ctx(t.begin(), t.begin() + n_ctx);
             bool ok = true;
@@ -2718,6 +3139,8 @@ static int glm_pack_generate(const Options& o) {
             req_spec_min_p = -1.0;
             req_spec_n_min = -1;
             req_spec_cum = -1.0;
+            req_bias.clear();
+            std::string bias_err;
             std::string tok2, ids, emb_path;
             while (ss >> tok2) {
                 const size_t eq = tok2.find('=');
@@ -2746,10 +3169,44 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "spec_min_p") { req_spec_min_p = std::atof(v.c_str()); }
                 else if (k == "spec_n_min") { req_spec_n_min = std::atoi(v.c_str()); }
                 else if (k == "spec_cum") { req_spec_cum = std::atof(v.c_str()); }
+                else if (k == "logit_bias") {   // <id>:<bias>,... - -100 or below bans the token
+                    for (size_t at = 0; at < v.size() && bias_err.empty();) {
+                        size_t end = v.find(',', at);
+                        if (end == std::string::npos) end = v.size();
+                        const std::string e1 = v.substr(at, end - at);
+                        const size_t colon = e1.find(':');
+                        char* p1 = nullptr;
+                        char* p2 = nullptr;
+                        const long id = colon == std::string::npos ? -1 : std::strtol(e1.c_str(), &p1, 10);
+                        const float b = colon == std::string::npos ? 0.0f : std::strtof(e1.c_str() + colon + 1, &p2);
+                        if (id < 0 || id >= n_vocab || p1 != e1.c_str() + colon || p2 == nullptr || *p2 != '\0' ||
+                            !std::isfinite(b))
+                            bias_err = "malformed logit_bias entry '" + e1 + "'";
+                        else
+                            req_bias.emplace_back((int32_t) id, b <= -100.0f ? -INFINITY : b);
+                        at = end + 1;
+                    }
+                }
                 // penalty_* need machinery this mode does not have (history rows): ignored rather than approximated
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
             if (greedy_req) rq.greedy = true;
+            if (!bias_err.empty()) {
+                if (multi && req_rid >= 0) std::printf("ERR %d %s\n", req_rid, bias_err.c_str());
+                else std::printf("ERR %s\n", bias_err.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            if (!req_bias.empty() && (rq.greedy || rq.temperature <= 0.0f)) {
+                // greedy with a bias: the sampled path's top_k = 1 is the same argmax (ties to the lower id) over the
+                // biased logits - the greedy shortcuts (the argmax at the end of a forward, the windows' argmax) read
+                // the unbiased ones
+                rq.greedy = false;
+                rq.temperature = 1.0f;
+                rq.top_k = 1;
+                rq.top_p = 1.0f;
+                rq.min_p = 0.0f;
+            }
             // the CPU lane for this request: what it names, else what the engine started with
             model.set_pcie_share(req_pcie >= 0.0 && req_pcie <= 1.0 ? req_pcie : -1.0);
             model.set_cpu_lane_threads(req_threads > 0 ? req_threads : 0);
@@ -2805,6 +3262,15 @@ static int glm_pack_generate(const Options& o) {
                 else gen_admit(req_rid, toks, max_new, rq);
                 continue;
             }
+            {
+                std::string be;
+                rq.logit_bias = model.logit_bias_table(0, req_bias, be);
+                if (!be.empty()) {
+                    std::printf("ERR %s\n", be.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
+            }
             model.set_image_rows(cur_img_pos, cur_img_rows);
             run_request(toks, max_new, rq);
             model.set_image_rows({}, {});
@@ -2854,6 +3320,21 @@ int main(int argc, char** argv) {
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
 #endif
     }
+#if defined(_WIN32)
+    // Windows' power throttling (EcoQoS) runs a process whose windows are all in the background on a hybrid CPU's
+    // efficiency cores at low clocks, and the CPU lane crawled there - an i7-13700: decode 9-12 tok/s with Maya's
+    // window focused, ~2 tok/s behind other windows, the same either way once `powercfg /powerthrottling disable`
+    // named the engine (#114).  The engine opts out itself.  Resolved at runtime as PrefetchVirtualMemory is
+    // (expert_source.cpp): the struct is PROCESS_POWER_THROTTLING_STATE (version 1; EXECUTION_SPEED managed, and off)
+    // and 4 is ProcessPowerThrottling - a Windows without them refuses the call and nothing changes
+    {
+        struct Throttle { ULONG version, control, state; } off{1u, 0x1u, 0u};
+        using SetInfoFn = BOOL (WINAPI*)(HANDLE, int, LPVOID, DWORD);
+        const HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        const SetInfoFn set_info = k32 ? reinterpret_cast<SetInfoFn>(GetProcAddress(k32, "SetProcessInformation")) : nullptr;
+        if (set_info != nullptr) set_info(GetCurrentProcess(), 4, &off, (DWORD) sizeof off);
+    }
+#endif
     Options o;
     bool have_tokens = false;
     bool have_logits_stride = false;
@@ -2933,6 +3414,7 @@ int main(int argc, char** argv) {
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
+        else if (a == "--kv-streaming") o.kv_streaming = next("--kv-streaming");
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
         else if (a == "--gr-fp32-activations") o.gr_fp32_activations = true;
@@ -2970,7 +3452,11 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-device3") o.expert_cache_remote[2] = std::atoi(next("--expert-cache-device3"));
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
-        else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
+        else if (a == "--vram-reserve-mib") {
+            o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
+            o.vram_reserve_given = true;
+        }
+        else if (a == "--vram-reserve-later-mib") o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_arg = v;
@@ -3088,9 +3574,45 @@ int main(int argc, char** argv) {
     // session/graph machinery is qwen4exp's; a GLM pack runs the verified Glm5Model runner instead,
     // see glm_pack_generate).  --glm-pack with an explicit non-default --pack is almost certainly a
     // mistake worth saying out loud.
+    // --kv-streaming on|off: on streams with --kv-resident's window (32768 when it gives none), off keeps every cell in
+    // VRAM whatever --kv-resident says
+    if (!o.kv_streaming.empty()) {
+        if (o.kv_streaming == "on") {
+            if (o.kv_resident <= 0) o.kv_resident = 32768;
+        } else if (o.kv_streaming == "off") {
+            o.kv_resident = 0;
+        } else {
+            std::fprintf(stderr, "maya generate: --kv-streaming takes on or off (not %s)\n", o.kv_streaming.c_str());
+            return 2;
+        }
+    }
     if (!o.glm_pack.empty()) {
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
         if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
+        // --kv-resident N: KV streaming of the DSA latent cache (Glm5Model::kv_resident_cells, read at load)
+        if (o.kv_resident < 0) {
+            std::fprintf(stderr, "maya generate: --kv-resident must be 0 or more\n");
+            return 2;
+        }
+        if (o.kv_resident > 0 && std::getenv("STRATA_GLM_KV_RESIDENT") == nullptr)
+            set_env("STRATA_GLM_KV_RESIDENT", std::to_string(o.kv_resident).c_str());
+        if (o.kv_streaming == "off") set_env("STRATA_GLM_KV_RESIDENT", "0");   // (off whatever the environment says)
+        // the expert pool's size, set in the config's args (the engine reads them as STRATA_GLM_EXPERT_CACHE,
+        // STRATA_GLM_RESERVE_MB and STRATA_GLM_RESERVE_LATER_MB; given here, they win over the environment):
+        // --expert-cache auto | N (0 = auto), --vram-reserve-mib N, --vram-reserve-later-mib N
+        if (o.expert_cache < -1) {
+            std::fprintf(stderr, "maya generate: --expert-cache takes auto or a number of experts\n");
+            return 2;
+        }
+        if ((o.vram_reserve_given && o.vram_reserve_mib < 0) || o.vram_reserve_later_mib < -1) {
+            std::fprintf(stderr, "maya generate: --vram-reserve-mib and --vram-reserve-later-mib take 0 or more MiB\n");
+            return 2;
+        }
+        if (o.expert_cache != 0)
+            set_env("STRATA_GLM_EXPERT_CACHE", o.expert_cache < 0 ? "auto" : std::to_string(o.expert_cache).c_str());
+        if (o.vram_reserve_given) set_env("STRATA_GLM_RESERVE_MB", std::to_string(o.vram_reserve_mib).c_str());
+        if (o.vram_reserve_later_mib >= 0)
+            set_env("STRATA_GLM_RESERVE_LATER_MB", std::to_string(o.vram_reserve_later_mib).c_str());
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }
@@ -3157,7 +3679,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
         return 2;
     }
-    // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
+    // the helper-GPU expert caches (--expert-cache-remote): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
     int remote_dev[3] = {1, 2, 3};
     if (multi_gpu) {
@@ -3821,16 +4343,14 @@ int main(int argc, char** argv) {
         // A rate under ~0.2 GiB/s is not the hardware.  Task Scheduler / service contexts throttle this
         // read+fill about 24x (measured 0.05 vs 1.42 GiB/s for the same binary, args and cache state; the
         // scheduler's defaults - Below normal priority and a least-privilege token - were the only
-        // difference between the runs).  Say so instead of letting the user blame the disk; see
-        // docs/DETAILS.md, "Running it at startup (Task Scheduler)".
+        // difference between the runs).  Say so instead of letting the user blame the disk.
 #ifdef _WIN32   // a Windows launch context; elsewhere a load this slow is the disk
         if (arena_src.load_gib_per_second() > 0.0 && arena_src.load_gib_per_second() < 0.2) {
             std::fprintf(stderr,
                          "maya generate: hint: ~24x below what this hardware streams from a normal "
                          "launch. If Maya is started by Task Scheduler or a service, register the task "
                          "with Priority 4 (Normal) and 'Run with highest privileges' - the scheduler's "
-                         "defaults (Below normal + a least-privilege token) throttle the load. See "
-                         "docs/DETAILS.md ('Running it at startup').\n");
+                         "defaults (Below normal + a least-privilege token) throttle the load.\n");
         }
 #endif
         srcp = &arena_src;
@@ -4157,8 +4677,7 @@ int main(int argc, char** argv) {
         // (on - off = -0.005 +- 0.005 nats). Neither output is more correct than the other.
         std::fprintf(stderr,
                      "maya generate: the GPU computes the experts in the cache; it rounds differently from the CPU,\n"
-                     "                 so a reply can differ slightly from a run without the cache (same quality:\n"
-                     "                 bench/results/2026-09-27-cache-parity).\n");
+                     "                 so a reply can differ slightly from a run without the cache (the same quality).\n");
         if (o.expert_cache_per_layer) {
             int64_t lo = 0, hi = 0;
             xcache.layer_slot_range(0, lo, hi);
@@ -5301,8 +5820,8 @@ int main(int argc, char** argv) {
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
-            std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
-                        ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
+            std::printf("PP %lld %lld %.0f %.1f %lld\n", (long long) done, (long long) pp_total, ms,
+                        ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0, (long long) pp_from);
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
             std::fflush(stdout);
@@ -5866,8 +6385,8 @@ int main(int argc, char** argv) {
                     q += T;
                 }
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
-                std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
-                            ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
+                std::printf("PP %lld %lld %.0f %.1f %lld\n", (long long) b, (long long) pp_total, ms,
+                            ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0, (long long) pp_from);
                 strata::core::progress_beat();
                 std::fflush(stdout);
                 return true;

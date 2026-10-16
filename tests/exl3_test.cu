@@ -11,6 +11,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -371,6 +372,67 @@ void test_recon(int k, int n, int K, int cb) {
     }
 }
 
+// the prompt path's rotated product: W' alone in the row layout (exact), the inputs rotated (rows_rot_f16, gathered
+// by index), the GEMM on the host, the outputs rotated (rows_rot_out) - against the reference's x W
+void test_rot_rows(int k, int n, int K, int cb) {
+    HostMat h = make_mat(k, n, K, cb);
+    ex::Mat m;
+    m.trellis = dev_copy(h.tr);
+    m.suh = dev_copy(h.suh);
+    m.svh = dev_copy(h.svh);
+    m.k = k;
+    m.n = n;
+    m.K = K;
+    m.cb = cb;
+    std::vector<float> w((size_t) k * n);
+    cpu::exl3_inner(h.tr.data(), n / 16, k, n, K, cb, w.data());
+    uint16_t* d_w = nullptr;
+    CK(cudaMalloc(&d_w, (size_t) k * n * 2));
+    ex::reconstruct_inner_rows(m, d_w, 0);
+    CK(cudaDeviceSynchronize());
+    const std::vector<uint16_t> wt = host_copy(d_w, (size_t) k * n);   // [n][k]
+    size_t bad = 0;
+    for (int c = 0; c < n; ++c)
+        for (int r = 0; r < k; ++r) bad += f32_from_f16(wt[(size_t) c * k + r]) != w[(size_t) r * n + c];
+    const std::string sh = " k" + std::to_string(k) + " n" + std::to_string(n) + " K" + std::to_string(K) + " cb" +
+                           std::to_string(cb);
+    std::printf("  %-44s %zu of %zu differ  %s\n", ("inner rows" + sh).c_str(), bad, wt.size(), bad ? "FAIL" : "ok");
+    if (bad) ++g_fail;
+    // 3 rows gathered from 5 by index
+    const int rows = 3;
+    const std::vector<int> idx = {4, 0, 2};
+    std::vector<float> x = rand_x(5 * k, 2.0f);
+    float* d_x = dev_copy(x);
+    int* d_idx = dev_copy(idx);
+    uint16_t* d_xr = nullptr;
+    CK(cudaMalloc(&d_xr, (size_t) rows * k * 2));
+    ex::rows_rot_f16(d_x, k, d_idx, rows, k, m.suh, d_xr, 0);
+    CK(cudaDeviceSynchronize());
+    const std::vector<uint16_t> xr = host_copy(d_xr, (size_t) rows * k);
+    std::vector<float> y((size_t) rows * n), ref((size_t) rows * n);
+    for (int i = 0; i < rows; ++i) {
+        for (int c = 0; c < n; ++c) {
+            double s = 0.0;
+            for (int r = 0; r < k; ++r) s += (double) f32_from_f16(xr[(size_t) i * k + r]) * f32_from_f16(wt[(size_t) c * k + r]);
+            y[(size_t) i * n + c] = (float) s;
+        }
+        cpu::exl3_mv(w.data(), h.suh.data(), h.svh.data(), k, n, x.data() + (size_t) idx[(size_t) i] * k,
+                     ref.data() + (size_t) i * n);
+    }
+    float* d_y = dev_copy(y);
+    ex::rows_rot_out(d_y, n, rows, n, m.svh, 0);
+    CK(cudaDeviceSynchronize());
+    close(("rotated product" + sh).c_str(), host_copy(d_y, (size_t) rows * n), ref, 2e-3);
+    cudaFree((void*) m.trellis);
+    cudaFree((void*) m.suh);
+    cudaFree((void*) m.svh);
+    cudaFree(d_w);
+    cudaFree(d_x);
+    cudaFree(d_idx);
+    cudaFree(d_xr);
+    cudaFree(d_y);
+}
+
 // the prompt path's tensor-core GEMM over FP16 rows against the reference, beta = 0 and 1
 void test_gemm_rows(int k, int n, int K, int cb, int rows) {
     if (!ex::mma_supported()) {
@@ -498,6 +560,431 @@ void test_set(int K, int cb) {
           host_copy(d_out, ref.size()), ref, 3e-3);
 }
 
+// mv with several activations (a verify window's tokens) against one mv job per activation: the same bits
+void test_mv_n(int k, int n, int K, int cb, bool q8, int ncol) {
+    HostMat h = make_mat(k, n, K, cb);
+    ex::Mat m;
+    m.trellis = dev_copy(h.tr);
+    m.suh = dev_copy(h.suh);
+    m.svh = dev_copy(h.svh);
+    m.k = k;
+    m.n = n;
+    m.K = K;
+    m.cb = cb;
+    // activations k + 128 floats (and q8_1 blocks) apart, outputs n + 64 apart: the strides are the job's
+    const size_t xs = (size_t) k + 128, ys = (size_t) n + 64, qs = xs / 32 * 36;
+    std::vector<float> x((size_t) ncol * xs), bias = rand_x(n);
+    std::vector<uint8_t> xq((size_t) ncol * qs);
+    for (int c = 0; c < ncol; ++c) {
+        std::vector<float> xc = rand_x(k, 2.0f), deq;
+        std::vector<uint8_t> qc;
+        std::copy(xc.begin(), xc.end(), x.begin() + (std::ptrdiff_t) (c * xs));
+        q8_1(xc, qc, deq);
+        std::copy(qc.begin(), qc.end(), xq.begin() + (std::ptrdiff_t) (c * qs));
+    }
+    float* d_x = dev_copy(x);
+    uint8_t* d_xq = dev_copy(xq);
+    float* d_bias = dev_copy(bias);
+    float *d_y1 = nullptr, *d_yn = nullptr;
+    CK(cudaMalloc(&d_y1, (size_t) ncol * ys * sizeof(float)));
+    CK(cudaMalloc(&d_yn, (size_t) ncol * ys * sizeof(float)));
+    CK(cudaMemset(d_y1, 0, (size_t) ncol * ys * sizeof(float)));
+    CK(cudaMemset(d_yn, 0, (size_t) ncol * ys * sizeof(float)));
+    for (int c = 0; c < ncol; ++c) {
+        ex::MvJob j;
+        j.m = &m;
+        j.xf = q8 ? nullptr : d_x + c * xs;
+        j.xq = q8 ? (const void*) (d_xq + c * qs) : nullptr;
+        j.y = d_y1 + c * ys;
+        j.bias = d_bias;
+        j.alpha = 0.75f;
+        if (!ex::mv(&j, 1, 0)) ++g_fail;
+    }
+    ex::MvJob j;
+    j.m = &m;
+    j.xf = q8 ? nullptr : d_x;
+    j.xq = q8 ? (const void*) d_xq : nullptr;
+    j.y = d_yn;
+    j.bias = d_bias;
+    j.alpha = 0.75f;
+    j.ncol = ncol;
+    j.xf_cs = xs;
+    j.xq_cs = qs;
+    j.y_cs = ys;
+    for (int rep = 0; rep < 2; ++rep)   // twice: the split's counters must come back to zero
+        if (!ex::mv(&j, 1, 0)) ++g_fail;
+    CK(cudaDeviceSynchronize());
+    const std::vector<float> a = host_copy(d_y1, (size_t) ncol * ys), b = host_copy(d_yn, (size_t) ncol * ys);
+    size_t diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) diff += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
+    const std::string what = "mv x" + std::to_string(ncol) + " k" + std::to_string(k) + " n" + std::to_string(n) +
+                             " K" + std::to_string(K) + " cb" + std::to_string(cb) + (q8 ? " q8_1" : " f32");
+    std::printf("  %-44s %zu of %zu differ from one job each  %s\n", what.c_str(), diff, a.size(),
+                diff == 0 ? "ok" : "FAIL");
+    if (diff != 0) ++g_fail;
+    cudaFree((void*) m.trellis);
+    cudaFree((void*) m.suh);
+    cudaFree((void*) m.svh);
+    cudaFree(d_x);
+    cudaFree(d_xq);
+    cudaFree(d_bias);
+    cudaFree(d_y1);
+    cudaFree(d_yn);
+}
+
+// a verify window's routed experts (win_experts: each distinct expert once for its tokens) against each token's
+// moe_gate_up + moe_down: the same bits.  T tokens, k plan entries each over a few experts (shared ones, a skipped
+// entry, a token whose CPU-lane flag is off)
+void test_win(int K, int cb, int T) {
+    const int E = 512, F = 384, k = 4, NX = 5;
+    const float limit = 1.5f;
+    ex::ExpertLayout lay;
+    lay.cb = cb;
+    std::vector<uint8_t*> d_blob((size_t) NX);
+    for (int e = 0; e < NX; ++e) {
+        std::vector<uint8_t> b;
+        size_t at = 0;
+        for (int r = 0; r < 3; ++r) {
+            const HostMat p = r < 2 ? make_mat(E, F, K, cb) : make_mat(F, E, K, cb);
+            const size_t o_suh = at, o_svh = o_suh + p.suh.size() * 2, o_tr = o_svh + p.svh.size() * 2 + 4;
+            at = o_tr + p.tr.size() * 4;
+            b.resize(at);
+            std::memcpy(&b[o_suh], p.suh.data(), p.suh.size() * 2);
+            std::memcpy(&b[o_svh], p.svh.data(), p.svh.size() * 2);
+            std::memcpy(&b[o_tr], p.tr.data(), p.tr.size() * 4);
+            lay.suh[r] = o_suh;
+            lay.svh[r] = o_svh;
+            lay.trellis[r] = o_tr;
+            lay.K[r] = K;
+        }
+        d_blob[(size_t) e] = dev_copy(b);
+    }
+    // plans [T][8]: entry i of token t on expert (t + 2 i) % NX, entry 1 of every third token skipped
+    std::vector<unsigned long long> plan((size_t) T * 8, 0ull);
+    std::vector<float> pw((size_t) T * 8, 0.0f);
+    std::uniform_real_distribution<float> uw(0.05f, 0.5f);
+    for (int t = 0; t < T; ++t)
+        for (int i = 0; i < k; ++i) {
+            if (i == 1 && t % 3 == 0) continue;
+            plan[(size_t) t * 8 + i] = (unsigned long long) d_blob[(size_t) ((t + 2 * i) % NX)];
+            pw[(size_t) t * 8 + i] = uw(g_rng);
+        }
+    // the groups, as glmf::moe_win_group makes them (expert order of first appearance, entries in order)
+    std::vector<unsigned long long> gp;
+    std::vector<std::vector<int>> members;
+    for (int e = 0; e < T * 8; ++e) {
+        if (e % 8 >= k || plan[(size_t) e] == 0ull) continue;
+        size_t g = 0;
+        while (g < gp.size() && gp[g] != plan[(size_t) e]) ++g;
+        if (g == gp.size()) {
+            gp.push_back(plan[(size_t) e]);
+            members.emplace_back();
+        }
+        members[g].push_back(e);
+    }
+    std::vector<int> gstart(1, 0), gent;
+    for (auto& mm : members) {
+        for (int e : mm) gent.push_back(e);
+        gstart.push_back((int) gent.size());
+    }
+    std::vector<int> ng = {(int) gp.size()}, flag((size_t) T);
+    for (int t = 0; t < T; ++t) flag[(size_t) t] = t % 2;
+    std::vector<float> x = rand_x(T * E), cpu = rand_x(T * E), sh = rand_x(T * E);
+    auto* d_plan = dev_copy(plan);
+    float* d_pw = dev_copy(pw);
+    float* d_x = dev_copy(x);
+    float* d_cpu = dev_copy(cpu);
+    float* d_sh = dev_copy(sh);
+    int* d_flag = dev_copy(flag);
+    auto* d_gp = dev_copy(gp);
+    int* d_gs = dev_copy(gstart);
+    int* d_ge = dev_copy(gent);
+    int* d_ng = dev_copy(ng);
+    float *d_h = nullptr, *d_part = nullptr, *d_o1 = nullptr, *d_on = nullptr;
+    CK(cudaMalloc(&d_h, (size_t) T * 8 * F * sizeof(float)));
+    CK(cudaMalloc(&d_part, (size_t) T * 8 * E * sizeof(float)));
+    CK(cudaMalloc(&d_o1, (size_t) T * E * sizeof(float)));
+    CK(cudaMalloc(&d_on, (size_t) T * E * sizeof(float)));
+    for (int t = 0; t < T; ++t) {
+        ex::MoeArgs a;
+        a.plan_ptr = d_plan + t * 8;
+        a.plan_w = d_pw + t * 8;
+        a.cpu_part = d_cpu + (size_t) t * E;
+        a.cpu_flag = d_flag + t;
+        a.lay = lay;
+        a.k = k;
+        a.n_embd = E;
+        a.n_ff = F;
+        a.limit = limit;
+        ex::moe_gate_up(a, d_x + (size_t) t * E, nullptr, 0);
+        ex::moe_down(a, nullptr, d_sh + (size_t) t * E, d_o1 + (size_t) t * E, 0);
+    }
+    ex::WinArgs w;
+    w.grp_ptr = d_gp;
+    w.grp_start = d_gs;
+    w.grp_ent = d_ge;
+    w.n_groups = d_ng;
+    w.plan_ptr = d_plan;
+    w.plan_w = d_pw;
+    w.cpu_part = d_cpu;
+    w.cpu_flag = d_flag;
+    w.x = d_x;
+    w.x_stride = E;
+    w.h = d_h;
+    w.part = d_part;
+    w.sh_out = d_sh;
+    w.out = d_on;
+    w.out_stride = E;
+    w.lay = lay;
+    w.T = T;
+    w.k = k;
+    w.n_embd = E;
+    w.n_ff = F;
+    w.limit = limit;
+    if (!ex::win_experts(w, 0)) ++g_fail;
+    CK(cudaDeviceSynchronize());
+    const std::vector<float> a = host_copy(d_o1, (size_t) T * E), b = host_copy(d_on, (size_t) T * E);
+    size_t diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) diff += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
+    const std::string what = "win K" + std::to_string(K) + " cb" + std::to_string(cb) + " " + std::to_string(T) +
+                             " tokens, " + std::to_string(gp.size()) + " experts";
+    std::printf("  %-44s %zu of %zu differ from the token path  %s\n", what.c_str(), diff, a.size(),
+                diff == 0 ? "ok" : "FAIL");
+    if (diff != 0) ++g_fail;
+    for (auto* p : d_blob) cudaFree(p);
+    for (void* p : {(void*) d_plan, (void*) d_pw, (void*) d_x, (void*) d_cpu, (void*) d_sh, (void*) d_flag,
+                    (void*) d_gp, (void*) d_gs, (void*) d_ge, (void*) d_ng, (void*) d_h, (void*) d_part, (void*) d_o1,
+                    (void*) d_on})
+        cudaFree(p);
+}
+
+// the CPU lane's kernel for several activations at once against one call each: the same bits
+void test_cpu_n(int k, int n, int K) {
+    HostMat h = make_mat(k, n, K, 2);
+    cpu::Exl3Part m;
+    m.trellis = h.tr.data();
+    m.suh = h.suh.data();
+    m.svh = h.svh.data();
+    m.k = k;
+    m.n = n;
+    m.K = K;
+    constexpr int NT = 11;   // past kExl3CpuMaxN: two runs
+    std::vector<std::vector<float>> xh;
+    const float* xp[NT];
+    for (int i = 0; i < NT; ++i) xh.push_back(rand_x(k));
+    for (int i = 0; i < NT; ++i) xp[i] = xh[(size_t) i].data();
+    std::vector<float> one((size_t) NT * 128), all((size_t) NT * 128);
+    float* ap[NT];
+    for (int i = 0; i < NT; ++i) ap[i] = all.data() + (size_t) i * 128;
+    size_t diff = 0;
+    for (int c0 = 0; c0 < n; c0 += 128)
+        for (int nt = 2; nt <= NT; ++nt) {
+            const int ks0 = c0 == 0 ? 0 : 3, ks1 = k / 16 - (nt % 2);
+            for (int i = 0; i < nt; ++i) cpu::exl3_cpu_band_acc(m, xp[i], c0, ks0, ks1, one.data() + (size_t) i * 128);
+            cpu::exl3_cpu_band_acc_n(m, xp, nt, c0, ks0, ks1, ap);
+            for (size_t i = 0; i < (size_t) nt * 128; ++i) diff += std::memcmp(&one[i], &all[i], sizeof(float)) != 0;
+        }
+    const std::string what = "cpu x2..11 k" + std::to_string(k) + " n" + std::to_string(n) + " K" + std::to_string(K);
+    std::printf("  %-44s %zu differ from one call each  %s\n", what.c_str(), diff, diff == 0 ? "ok" : "FAIL");
+    if (diff != 0) ++g_fail;
+}
+
+// the CPU lane's split-K pieces (every column, slices [ks0, ks1)) against the bands over the same slices, and for
+// several activations at once against one call each: the same bits
+void test_cpu_rows(int k, int n, int K) {
+    HostMat h = make_mat(k, n, K, 2);
+    cpu::Exl3Part m;
+    m.trellis = h.tr.data();
+    m.suh = h.suh.data();
+    m.svh = h.svh.data();
+    m.k = k;
+    m.n = n;
+    m.K = K;
+    constexpr int NT = 11;
+    std::vector<std::vector<float>> xh;
+    const float* xp[NT];
+    for (int i = 0; i < NT; ++i) xh.push_back(rand_x(k));
+    for (int i = 0; i < NT; ++i) xp[i] = xh[(size_t) i].data();
+    std::vector<float> band(128), one((size_t) NT * n), all((size_t) NT * n);
+    float* ap[NT];
+    for (int i = 0; i < NT; ++i) ap[i] = all.data() + (size_t) i * n;
+    size_t diff = 0;
+    for (int nt = 1; nt <= NT; ++nt) {
+        const int ks0 = nt % 3, ks1 = k / 16 - (nt % 2);
+        for (int i = 0; i < nt; ++i) {
+            cpu::exl3_cpu_rows_acc(m, xp[i], ks0, ks1, one.data() + (size_t) i * n);
+            for (int c0 = 0; c0 < n; c0 += 128) {
+                cpu::exl3_cpu_band_acc(m, xp[i], c0, ks0, ks1, band.data());
+                for (int j = 0; j < 128; ++j)
+                    diff += std::memcmp(&band[(size_t) j], &one[(size_t) i * n + c0 + j], sizeof(float)) != 0;
+            }
+        }
+        if (nt > 1) {
+            cpu::exl3_cpu_rows_acc_n(m, xp, nt, ks0, ks1, ap);
+            for (size_t i = 0; i < (size_t) nt * n; ++i) diff += std::memcmp(&one[i], &all[i], sizeof(float)) != 0;
+        }
+    }
+    const std::string what = "cpu rows x1..11 k" + std::to_string(k) + " n" + std::to_string(n) + " K" + std::to_string(K);
+    std::printf("  %-44s %zu differ from the bands / one call each  %s\n", what.c_str(), diff, diff == 0 ? "ok" : "FAIL");
+    if (diff != 0) ++g_fail;
+}
+
+// the CPU lane's input block (x * suh, the 128-point transform) against the scalar transform: the same bits
+void test_cpu_had() {
+    size_t diff = 0;
+    for (int rep = 0; rep < 64; ++rep) {
+        std::vector<float> x = rand_x(128, 3.0f), want(128), got(128);
+        std::vector<uint16_t> suh(128);
+        for (int i = 0; i < 128; ++i) suh[(size_t) i] = (uint16_t) (0x3800 + (rep * 131 + i * 37) % 0x800);   // [0.5, 1)
+        for (int i = 0; i < 128; ++i) want[(size_t) i] = x[(size_t) i] * strata::kernels::f32_from_f16(suh[(size_t) i]);
+        for (int h = 1; h < 128; h <<= 1)
+            for (int i = 0; i < 128; i += 2 * h)
+                for (int j = i; j < i + h; ++j) {
+                    const float a = want[(size_t) j], b = want[(size_t) (j + h)];
+                    want[(size_t) j] = a + b;
+                    want[(size_t) (j + h)] = a - b;
+                }
+        for (int i = 0; i < 128; ++i) want[(size_t) i] *= 0.088388347648f;
+        cpu::exl3_cpu_prepare_block(suh.data(), x.data(), got.data());
+        for (int i = 0; i < 128; ++i) diff += std::memcmp(&want[(size_t) i], &got[(size_t) i], sizeof(float)) != 0;
+    }
+    std::printf("  %-44s %zu of 8192 differ from the scalar transform  %s\n", "cpu input blocks (128-point transform)",
+                diff, diff == 0 ? "ok" : "FAIL");
+    if (diff != 0) ++g_fail;
+}
+
+// the prompt path's CPU GEMM (a band decoded once for many activations) against the band kernel: the same sums up to
+// F32 rounding (another order)
+void test_cpu_gemm(int k, int n, int K) {
+    HostMat h = make_mat(k, n, K, 2);
+    cpu::Exl3Part m;
+    m.trellis = h.tr.data();
+    m.suh = h.suh.data();
+    m.svh = h.svh.data();
+    m.k = k;
+    m.n = n;
+    m.K = K;
+    constexpr int NT = 21;   // 3 tiles of 6 and 3 left over
+    std::vector<std::vector<float>> xh;
+    const float* xp[NT];
+    for (int i = 0; i < NT; ++i) xh.push_back(rand_x(k));
+    for (int i = 0; i < NT; ++i) xp[i] = xh[(size_t) i].data();
+    std::vector<float> one(128), all((size_t) NT * 128), wc(cpu::exl3_cpu_gemm_scratch() + 16);
+    float* const w64 = (float*) (((uintptr_t) wc.data() + 63) & ~(uintptr_t) 63);
+    float* ap[NT];
+    for (int i = 0; i < NT; ++i) ap[i] = all.data() + (size_t) i * 128;
+    double worst = 0.0;
+    for (int nb : {1, 2}) {
+        all.assign((size_t) NT * 128 * nb, 0.0f);
+        for (int i = 0; i < NT; ++i) ap[i] = all.data() + (size_t) i * 128 * nb;
+        for (int c0 = 0; c0 + 128 * nb <= n; c0 += 128 * nb) {
+            cpu::exl3_cpu_band_gemm(m, xp, NT, c0, nb, ap, w64);
+            for (int i = 0; i < NT; ++i)
+                for (int b = 0; b < nb; ++b) {
+                    cpu::exl3_cpu_band_acc(m, xp[i], c0 + 128 * b, 0, k / 16, one.data());
+                    double mx = 0.0, d = 0.0;
+                    for (int j = 0; j < 128; ++j) {
+                        mx = std::max(mx, (double) std::fabs(one[(size_t) j]));
+                        d = std::max(d, (double) std::fabs(one[(size_t) j] - ap[i][128 * b + j]));
+                    }
+                    worst = std::max(worst, d / std::max(mx, 1e-30));
+                }
+        }
+    }
+    const std::string what = "cpu gemm x21 nb1,2 k" + std::to_string(k) + " n" + std::to_string(n) + " K" + std::to_string(K);
+    const bool ok = worst < 1e-5;
+    std::printf("  %-44s worst %.2e of the band's largest  %s\n", what.c_str(), worst, ok ? "ok" : "FAIL");
+    if (!ok) ++g_fail;
+}
+
+const char* cpu_tier_name(int tier) { return tier == 2 ? "avx512" : tier == 1 ? "avx2" : "scalar"; }
+
+// The vector tiers' arithmetic, written out on its own: column c's state at row r is the 16-bit window that ends at
+// bit (p + 1 + 256) K of the tile's MSB-first bit ring (p: the tile's step at (r, c) - row (p/8 % 4) 2 + (p & 1) +
+// 8 (p/2 & 1), column p/32 + 8 (p/4 & 1)), read bit by bit; its mul1 byte sum s; and one fma(s, xh, acc) a weight in
+// (slice, row) order
+float exact_band_col(const cpu::Exl3Part& m, const float* xh, int col, int ks0, int ks1) {
+    static int step[16][16];
+    static bool init = false;
+    if (!init) {
+        for (int p = 0; p < 256; ++p) step[(p / 8 % 4) * 2 + (p & 1) + 8 * (p / 2 & 1)][p / 32 + 8 * (p / 4 & 1)] = p;
+        init = true;
+    }
+    const int bits = 256 * m.K, t = col / 16, c = col % 16;
+    float a = 0.0f;
+    for (int ks = ks0; ks < ks1; ++ks) {
+        const uint32_t* tile = m.trellis + ((size_t) ks * (m.n / 16) + t) * 8 * m.K;
+        for (int r = 0; r < 16; ++r) {
+            const int end = (step[r][c] + 1 + 256) * m.K;
+            uint32_t st = 0;
+            for (int q = end - 16; q < end; ++q) {
+                const int b = q % bits;
+                st = (st << 1) | ((tile[b >> 5] >> (31 - (b & 31))) & 1u);
+            }
+            const uint32_t x = st * 0x83DCD12Du;
+            const int s = (int) ((x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) + (x >> 24));
+            a = std::fma((float) s, xh[ks * 16 + r], a);
+        }
+    }
+    return a;
+}
+
+// every tier this CPU runs against that model: the vector tiers bit for bit (so on an AVX-512 host AVX2 and AVX-512
+// against each other too), the scalar tier (no FMA) within rounding; every band, the whole slice range and partial
+// ones, 1..11 activations at once (past kExl3CpuMaxN)
+void test_cpu_exact(int k, int n, int K) {
+    HostMat h = make_mat(k, n, K, 2);
+    cpu::Exl3Part m;
+    m.trellis = h.tr.data();
+    m.suh = h.suh.data();
+    m.svh = h.svh.data();
+    m.k = k;
+    m.n = n;
+    m.K = K;
+    constexpr int NT = 11;
+    std::vector<std::vector<float>> xh;
+    const float* xp[NT];
+    for (int i = 0; i < NT; ++i) xh.push_back(rand_x(k));
+    for (int i = 0; i < NT; ++i) xp[i] = xh[(size_t) i].data();
+    std::vector<float> want((size_t) NT * 128), got((size_t) NT * 128);
+    float* gp[NT];
+    for (int i = 0; i < NT; ++i) gp[i] = got.data() + (size_t) i * 128;
+    const int S = k / 16;
+    const int ranges[3][2] = {{0, S}, {3, S - 1}, {S / 2, S / 2 + 1}};
+    size_t diff[3] = {0, 0, 0}, cmp[3] = {0, 0, 0};
+    double se = 0.0, sr = 0.0;
+    for (int c0 = 0; c0 < n; c0 += 128)
+        for (const auto& rg : ranges) {
+            for (int i = 0; i < NT; ++i)
+                for (int j = 0; j < 128; ++j) want[(size_t) i * 128 + j] = exact_band_col(m, xp[i], c0 + j, rg[0], rg[1]);
+            for (int tier = 0; tier <= 2; ++tier)
+                for (int nt : {1, 2, 3, 5, 8, 11}) {
+                    if (!cpu::exl3_cpu_band_acc_on(tier, m, xp, nt, c0, rg[0], rg[1], gp)) break;
+                    for (size_t i = 0; i < (size_t) nt * 128; ++i) {
+                        ++cmp[tier];
+                        diff[tier] += std::memcmp(&got[i], &want[i], sizeof(float)) != 0;
+                        if (tier == 0) {
+                            se += ((double) got[i] - want[i]) * ((double) got[i] - want[i]);
+                            sr += (double) want[i] * want[i];
+                        }
+                    }
+                }
+        }
+    for (int tier = 1; tier <= 2; ++tier) {
+        if (cmp[tier] == 0) continue;
+        const std::string what = std::string("cpu exact ") + cpu_tier_name(tier) + " k" + std::to_string(k) + " n" +
+                                 std::to_string(n) + " K" + std::to_string(K);
+        std::printf("  %-44s %zu of %zu differ from the model  %s\n", what.c_str(), diff[tier], cmp[tier],
+                    diff[tier] == 0 ? "ok" : "FAIL");
+        if (diff[tier] != 0) ++g_fail;
+    }
+    const double rel = std::sqrt(se / std::max(sr, 1e-30));
+    const std::string what = "cpu exact scalar k" + std::to_string(k) + " n" + std::to_string(n) + " K" + std::to_string(K);
+    const bool ok = cmp[0] > 0 && rel <= 1e-5;
+    std::printf("  %-44s rel %.2e to the model  %s\n", what.c_str(), rel, ok ? "ok" : "FAIL");
+    if (!ok) ++g_fail;
+}
+
 // the CPU lane's kernel (mul1) against the reference: every band of a k x n matrix
 void test_cpu(int k, int n, int K) {
     HostMat h = make_mat(k, n, K, 2);
@@ -513,7 +1000,7 @@ void test_cpu(int k, int n, int K) {
     m.K = K;
     const float xs = cpu::exl3_cpu_prepare(m, x.data(), xh.data());
     for (int c0 = 0; c0 < n; c0 += 128) cpu::exl3_cpu_band(m, xh.data(), xs, c0, got.data() + c0);
-    close(("cpu " + std::string(cpu::exl3_cpu_vector() ? "avx512" : "scalar") + " k" + std::to_string(k) + " n" +
+    close(("cpu " + std::string(cpu_tier_name(cpu::exl3_cpu_tier())) + " k" + std::to_string(k) + " n" +
            std::to_string(n) + " K" + std::to_string(K)).c_str(), got, ref, 2e-3);
 }
 
@@ -537,6 +1024,8 @@ int main() {
     test_moe(3, 1);
     for (int K : {2, 5}) test_recon(256, 384, K, 2);
     test_recon(256, 256, 3, 0);
+    for (int K = 1; K <= 8; ++K) test_rot_rows(256, 384, K, 2);
+    test_rot_rows(512, 256, 4, 1);
     for (int K : {2, 3, 5, 8}) test_gemm_rows(512, 384, K, 2, 45);
     test_gemm_rows(4096, 256, 3, 1, 100);
     test_gemm_rows(1024, 128, 4, 0, 7);
@@ -544,6 +1033,23 @@ int main() {
     for (int K = 1; K <= 8; ++K) test_cpu(512, 256, K);
     test_cpu(4096, 2048, 3);
     test_cpu(2048, 4096, 3);
+    // several activations at once (a verify window): the same bits as one at a time
+    for (int K = 1; K <= 8; ++K) test_mv_n(512, 256, K, 2, false, 3);
+    for (int cb = 0; cb <= 1; ++cb) test_mv_n(256, 384, 4, cb, false, 5);
+    for (int nc : {2, 4, 7, 16}) test_mv_n(4096, 512, 3, 2, false, nc);   // occupancy split
+    test_mv_n(12288, 256, 6, 2, false, 6);                                  // k > 4096
+    test_mv_n(2048, 4096, 5, 2, true, 8);                                   // q8_1 input
+    for (int K : {2, 3, 4, 8}) test_win(K, 2, 7);
+    test_win(3, 1, 2);
+    test_win(3, 2, 16);
+    for (int K : {1, 3, 6, 8}) test_cpu_n(512, 256, K);
+    for (int K : {2, 3, 4, 5, 8}) test_cpu_rows(512, 384, K);
+    for (int K : {3, 4, 6}) test_cpu_gemm(768, 256, K);
+    test_cpu_had();
+    // the CPU tiers against an exact model of their arithmetic (odd slice counts too: 37 slices)
+    for (int K = 1; K <= 8; ++K) test_cpu_exact(512, 256, K);
+    test_cpu_exact(592, 384, 3);
+    test_cpu_exact(592, 256, 4);
     std::printf("exl3_test: %s (%d failures, %d launch errors)\n", g_fail ? "FAIL" : "ok", g_fail,
                 ex::launch_errors());
     return g_fail || ex::launch_errors() ? 1 : 0;
