@@ -188,8 +188,8 @@
         </div>
         <div class="tierlegend">
           <div class="tierlegend__item"><i class="dot dot--vram"></i><span>VRAM</span><b id="tier-vram-text">&ndash;</b></div>
-          <div class="tierlegend__item"><i class="dot dot--ram"></i><span>Pinned RAM</span><b id="tier-ram-text">&ndash;</b></div>
-          <div class="tierlegend__item"><i class="dot dot--disk"></i><span>SSD only</span><b id="tier-disk-text">&ndash;</b></div>
+          <div class="tierlegend__item"><i class="dot dot--ram"></i><span id="tier-ram-label">Pinned RAM</span><b id="tier-ram-text">&ndash;</b></div>
+          <div class="tierlegend__item" id="tier-disk-item"><i class="dot dot--disk"></i><span>SSD only</span><b id="tier-disk-text">&ndash;</b></div>
         </div>
         <div class="metrics metrics--tiers" id="tiers"></div>
         <p class="tier-advice muted small" id="tier-advice" hidden></p>
@@ -300,6 +300,12 @@
       <input class="st-slider" type="range" id="s-ctx" min="0" max="10" step="1">
       <span class="muted small" id="ctx-est">How much text the model holds at once: the chat, files, tool output.</span>
       <span class="ctx-warn small" id="ctx-warn" hidden></span>
+    </div>
+    <div class="st-field" id="port-field" hidden>
+      <label class="st-label" for="s-port">Port <output id="o-port"></output></label>
+      <input class="st-input" type="number" id="s-port" min="1024" max="65535" step="1" inputmode="numeric">
+      <span class="muted small" id="port-est">Where this page and the API listen (http://this-pc:<b>port</b>/).</span>
+      <span class="ctx-warn small" id="port-warn" hidden></span>
     </div>
 
     <div class="drawer-section">This chat</div>

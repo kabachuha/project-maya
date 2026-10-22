@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Project Maya - set up and start GLM-5.3-Flash on your own GPU(s).
-CUDA: Linux; Windows (experimental). HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not validated), Linux and
-Windows, text only.
+"""Project Maya - set up and start GLM-5.3-Flash or DeepSeek-V4.1-Flash-1017 on your own GPU(s).
+GLM-5.3-Flash: CUDA on Linux and Windows (experimental); HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not
+validated), Linux and Windows, text only.  DeepSeek-V4.1-Flash-1017: CUDA on Linux, RTX 30 / A100 or newer.
 
     ./maya.sh                 the first run sets everything up and starts the dashboard; later runs just start it
     ./maya.sh --setup         set up again (other GPUs, another context length, another model folder)
@@ -17,21 +17,25 @@ Monitor's numbers from the engine's GET /metrics), its server's output, Ctrl+C s
 with Maya (third_party/wheels) and goes into .venv from there - nothing is downloaded.  --plain or a pipe: plain text,
 and Maya in the terminal as before; --yes: the setup in plain text.
 
-What the first run does (each step is skipped when it is already done):
+What the first run does (each step is skipped when it is already done) - first it asks which model: GLM-5.3-Flash
+(the steps below) or DeepSeek-V4.1-Flash-1017 (the same steps for its own engine, build/maya-ds4: LibertAIDAI's EXL3
+quant at 2.9 bits, 211 GB, and its two Engram tables from DeepSeek's base repo, 203 GB; its pack is tools/ds4/pack.py's;
+its vision tower runs in the engine - a GGUF's comes from DeepSeek's own checkpoint, 0.97 GB, shown and asked first;
+no tuning step - it balances its own split):
 
   1. checks the PC: NVIDIA GPU(s) of compute capability 7.0+ (6.x, Pascal: experimental), driver, CUDA toolkit (nvcc),
-     the C++ compiler (g++; on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD
-     gfx1100/gfx1201/gfx1151 and ROCm 7 instead
+     the C++ compiler (g++; on Windows Visual Studio's Build Tools - 2019/2022 always, 2026 with CUDA 13.2+), CMake,
+     RAM, CPU; HIP checks AMD gfx1100/gfx1201/gfx1151 and ROCm 7 instead
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (Maya-S,
      Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits, experimental
      and NVIDIA only)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
-  4. compiles the engine (`build/strata`, or `build-hip/strata`) for your GPU(s): 10-30 minutes, once
+  4. compiles the engine (`build/maya`, or `build-hip/maya`) for your GPU(s): 10-30 minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
      and the size - and starts only after you answer y (or pass --download-model)
   6. builds the pack (the engine's index of the model files) inside the model folder
-  7. images: compiles the vision encoder (`build-vision/bin/strata-vision`) and fetches the model's vision files
+  7. images: compiles the vision encoder (`build-vision/bin/maya-vision`) and fetches the model's vision files
      (1.1 GB, shown and asked first like the model; --no-vision and HIP skip it)
   8. writes maya-<model>.json and run-maya-<model>.sh (.bat on Windows) - with the settings tuned for this PC
      earlier, or it offers the tuning (./maya.sh --calibrate does it any time) - and starts the dashboard on
@@ -42,7 +46,10 @@ experts between the CPU and the PCIe link, with fewer CPU threads, and - when pa
 with smaller disk reads, in one engine run (~10-15 minutes, the model loads first); a setting is kept when it is more
 than 3% faster than the engine's own choice.  The result goes into the config's "env" (STRATA_GLM_PCIE_SHARE,
 STRATA_GLM_CPU_LANE, STRATA_GLM_READ_CHUNKS) and into ~/.config/project-maya/calibration.json for this PC, model and
-context, so a setup again keeps it.
+context, so a setup again keeps it.  DeepSeek-V4.1-Flash-1017's (tools/calibrate_ds4_tp.py, ./maya.sh --calibrate only):
+decode speed with each --tp that groups the GPUs differently and with fewer CPU threads, an engine start each (~25-40
+minutes on 9 GPUs); a setting is kept when it is more than 5% faster and still reads a long prompt at 60% of the
+config's own speed.  The result goes into the config's args (--tp, --cpu-threads) and into calibration.json.
 
 Nothing is installed system-wide: a missing tool is reported with the command that installs it.
 """
@@ -65,18 +72,22 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "tools"))
 import setup as S  # noqa: E402  Strata's installer: PC checks, pip, llama.cpp, downloads (nothing runs on import)
 from setup import ask, fail, ok, run, say, step, warn  # noqa: E402
+import maya_names as N  # noqa: E402  the settings' names users see (MAYA_*) and the older ones the code reads
 import calibrate_glm as CAL  # noqa: E402  the CPU lane's tuning for this PC (./maya.sh --calibrate)
+import calibrate_ds4_tp as CAL4  # noqa: E402  DeepSeek's: --tp and the CPU threads (./maya.sh --calibrate)
 import calibrate_draft as CD  # noqa: E402  the speed calibration: DFlash2 or the MTP block on this PC
+import calibrate_ds4 as CDS  # noqa: E402  DeepSeek's: the DSpark drafter or none, on this PC
 
 WIN = S.WIN
 ME = "START-MAYA.bat" if WIN else "./maya.sh"      # how this is started, for the messages
 UPDATE_EXIT = 75                                   # the server's exit after the dashboard updated Maya (serve/update.py)
+RESTART_EXIT = 76                                  # ... after it saved a new port: start again on the saved one
 ROOT = S.ROOT
 BUILD = ROOT / "build"
-EXE = BUILD / ("strata.exe" if WIN else "strata")
+EXE = BUILD / ("maya.exe" if WIN else "maya")
 STAMP = BUILD / "MAYA-BUILD.json"                  # what the engine in build/ was compiled from and for
 VBUILD = ROOT / "build-vision"
-VEXE = VBUILD / "bin" / ("strata-vision.exe" if WIN else "strata-vision")  # the image encoder (llama.cpp's mtmd)
+VEXE = VBUILD / "bin" / ("maya-vision.exe" if WIN else "maya-vision")  # the image encoder (llama.cpp's mtmd)
 VSTAMP = VBUILD / "MAYA-BUILD.json"
 MIN_CC = 60                                        # Pascal and newer (the GLM path; see arch_setting) ...
 VALIDATED_CC = 70                                  # ... Volta (V100) and newer validated, Pascal experimental (#212)
@@ -85,6 +96,8 @@ HIP_ARCHS = ("gfx1100", "gfx1201", "gfx1151")        # Maya also supports Strix 
 HIP_ARCHS_UNVALIDATED = ("gfx1030",)               # RDNA 2 (RX 6800 / 6900, Radeon PRO V620 / W6800), experimental: not
                                                    # validated on a card; no matrix cores, the portable kernels; compiled
                                                    # only when such a GPU is chosen
+HIP_ARCHS_WAVE64 = ("gfx908",)                      # CDNA 1 (AMD Instinct MI100): wave64, runs through the hip_compat
+                                                   # layer's logical-32-lane half-wavefront warp mapping; experimental
 PY_PACKAGES = list(S.PY_PACKAGES)                  # (pillow: pictures in formats other than JPEG/PNG/BMP/GIF)
 CONTEXTS = [8192, 32768, 65536, 131072]
 DEFAULT_CONTEXT = 32768
@@ -400,11 +413,63 @@ DFLASH = {"repo": "Anbeeld/GLM-5.3-Flash-DFlash2-GGUF", "revision": "f3569acb7f9
           "sha256": "f4158ffb805b26c4fe439669c2009908a80ea89e1576ecea4d03eaded18f017c",
           "license": "CC BY-NC-ND 4.0"}   # (the repo's: non-commercial use only, shown wherever it is offered)
 DRAFTS = ("mtp", "dflash2")                        # the setup's drafting choices; MTP the default
+# DeepSeek-V4.1-Flash-1017: its own engine (src/ds4, build/maya-ds4) reads LibertAIDAI's EXL3 quant at 2.9 bits in
+# place from its safetensors; its two Engram tables come from DeepSeek's base repo.  Every file is pinned and checked
+# (tools/ds4/download.json).  Linux and NVIDIA RTX 30 / A100 or newer only: its vision tower's BF16 GEMMs, the CPU
+# lane's NUMA memory.  Tensor parallel across pairs of equal GPUs (--tp 2; ./maya.sh --calibrate measures the others),
+# the rest of the experts in RAM.
+DS4 = "DeepSeek-V4.1-Flash-1017"
+DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
+DS4_MANIFEST = ROOT / "tools" / "ds4" / "download.json"
+DS4_PACK_TOOLS = ("tools/ds4/pack.py", "tools/ds4/engram_hash.py", "tools/ds4/st.py", "tools/ds4/chat_template.jinja")
+DS4_MIN_CC = 70                                    # (V100 on: the experts' kernels before sm_80 since v1.1.20)
+DS4_VISION_MIN_CC = 80                             # the vision tower's BF16 GEMMs: RTX 30 / A100 or newer
+# ... or unsloth's GGUFs (tools/ds4/download_gguf.json, packed by tools/ds4/pack_gguf.py): dense weights BF16 (UD-Q8_K_XL)
+# or Q8_0 (UD-Q4_K_XL), routed experts MXFP4, read in place - the experts VRAM does not hold come from RAM or, through
+# the OS page cache, from the SSD, so it runs whatever the memory; Volta or newer.  The DSpark drafter and the vision
+# tower, which the GGUFs leave out, come from DeepSeek's own checkpoint (download_gguf.json's "drafter" and "vision").
+# Maya's own quants of it (download_gguf.json's "maya": Maya-S, the experts in 2-3 bits; Maya-M once published) are
+# each one GGUF split with everything in it, the two Engram tables in Q6_K (made from DeepSeek's released weights).
+# Files of an earlier layout are used as they are when a folder holds them whole (ds4_earlier): v1.1.16's Maya-S (4
+# shards + unsloth's MXFP8 shard of the Engram tables in <...-GGUF>/Engram), unsloth's GGUFs before their re-shard.
+DS4_GGUF_MANIFEST = ROOT / "tools" / "ds4" / "download_gguf.json"
+DS4_GGUF_PACK_TOOLS = ("tools/ds4/pack_gguf.py", "tools/ds4/chat_template.jinja")
+DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M", "maya-xs": "Maya-XS",
+              "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw"}
+DS4_MAYA = ("maya-s", "maya-m", "maya-xs")
+DS4_DEFAULT_QUANT = "gguf-q8"
+DS4_GGUF_MIN_CC = 70
+DS4_CONTEXTS = [32768, 65536, 131072, 262144]
+DS4_DEFAULT_CONTEXT = 65536
+DS4_MODEL_NAME = "deepseek-v4.1-flash"
+DS4_SAMPLING = {"temperature": 1.0, "top_p": 1.0}   # DeepSeek's own
+DS4_EFFORT = "high"                                 # (encoding.py's default: a reasoning effort of 75)
+DS4_MEMORY_GB = 230                                 # VRAM + RAM that hold it all (211 GB of weights, the pinned
+                                                    # tables); with less the engine reads experts from the SSD
+DS4_35 = DS4 + "-3.5bpw"                            # the same model in LibertAIDAI's EXL3 quant at 3.5 bits
+# LibertAIDAI's EXL3 quants: each one's manifest, the GB of its weights, the VRAM + RAM that hold all of it and its folder
+# (<models>/<dir>) - their card: perplexity over the unquantized model's on held-out code / prose +1.8% / +0.4% at 2.9
+# bits, +0.8% / +0.1% at 3.5
+DS4_EXL3 = {"exl3": {"bits": "2.9", "manifest": DS4_MANIFEST, "weights_gb": 211, "memory_gb": DS4_MEMORY_GB, "dir": DS4},
+            "exl3-3.5": {"bits": "3.5", "manifest": ROOT / "tools" / "ds4" / "download-3.5bpw.json", "weights_gb": 258,
+                         "memory_gb": 280, "dir": DS4_35}}
+FAMILIES = ("glm", "deepseek")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+
+
+def exe_for_target(target: str) -> Path:
+    """The engine binary for a build target name ("maya" or "maya-ds4"; EXE's and DS4_EXE's own stems) - resolved
+    fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
+    return {"maya": EXE, "maya-ds4": DS4_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 # the expert profile setup passes to every GLM config (tools/make_profile.py --glm):
 # its ranking of every (layer, expert) pair decides each layer's VRAM slots and which experts start there
 PROFILE = ROOT / "data" / "expert-profile-glm.bin"
+# DeepSeek's starting expert profile (tools/ds4/profile.py): a pack without a profile of its own starts from it - the
+# engine reads it to place the most-routed experts in VRAM and read the next ones ahead, then adds this PC's routing to
+# it and saves it in the pack (<pack>/expert-profile.bin); its counts are scaled to a few thousand tokens' worth, so
+# what this PC routes soon outweighs it
+DS4_PROFILE = ROOT / "data" / "expert-profile-ds4.bin"
 PACK_FILES = ("index.txt", "native_experts.txt", "dense.bin", "tokenizer/vocab.json", "tokenizer/merges.txt",
               "tokenizer/token_type.json", "tokenizer/chat_template.jinja")
 
@@ -417,7 +482,7 @@ def hf_url(repo: str, revision: str, folder: str, file: str) -> str:
 
 def read_json(path: Path) -> dict:
     try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
+        return N.env_in(json.loads(path.read_text(encoding="utf-8-sig")))   # (a config's settings: see maya_names)
     except (OSError, ValueError):
         return {}
 
@@ -524,11 +589,57 @@ def gpu_label(g) -> str:
     return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB)"
 
 
+# v1.1.16 named the programs after Maya: the ones an earlier version compiled are renamed in place (nothing compiled
+# again), their build stamps and the configs' paths follow (rename_programs, fix_config_names)
+OLD_NAMES = {"strata": "maya", "strata-ds4": "maya-ds4", "strata-vision": "maya-vision"}
+
+
+def rename_programs() -> None:
+    ext = ".exe" if WIN else ""
+    pairs = [(ROOT / d / (old + ext), ROOT / d / (new + ext)) for d in ("build", "build-hip")
+             for old, new in (("strata", "maya"), ("strata-ds4", "maya-ds4"))]
+    pairs.append((VBUILD / "bin" / ("strata-vision" + ext), VBUILD / "bin" / ("maya-vision" + ext)))
+    for old, new in pairs:
+        if old.exists() and not new.exists():
+            try:
+                os.replace(old, new)
+            except OSError as e:   # (in use: a server still running; the next start renames it)
+                warn(f"could not rename {old} to {new.name} ({e})")
+    for d in ("build", "build-hip"):
+        stamp = ROOT / d / "MAYA-BUILD.json"
+        meta = read_json(stamp)
+        targets = meta.get("targets") or (["strata"] if meta else [])
+        if any(t in OLD_NAMES for t in targets):
+            meta["targets"] = sorted({OLD_NAMES.get(t, t) for t in targets})
+            stamp.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+
+
+def fix_config_names(cfg: dict) -> bool:
+    """A config written before v1.1.16 names the programs by their old names: True when it was changed.  A path moves to
+    the new name only when the program is there under it (rename_programs renames Maya's own builds; a program
+    elsewhere keeps its path)."""
+    def renamed(p: str) -> str:
+        q = Path(p)
+        stem, ext = (q.name[:-4], ".exe") if q.name.endswith(".exe") else (q.name, "")
+        if stem not in OLD_NAMES:
+            return p
+        new = q.with_name(OLD_NAMES[stem] + ext)
+        return str(new) if (new if new.is_absolute() else ROOT / new).exists() else p
+    done = False
+    if cfg.get("exe") and renamed(cfg["exe"]) != cfg["exe"]:
+        cfg["exe"], done = renamed(cfg["exe"]), True
+    v = cfg.get("vision")
+    if isinstance(v, dict) and v.get("exe") and renamed(v["exe"]) != v["exe"]:
+        v["exe"], done = renamed(v["exe"]), True
+    return done
+
+
 def select_build_backend(backend: str) -> None:
     """Separate build folders and stamps prevent reusing a binary from the other backend."""
-    global BUILD, EXE, STAMP
+    global BUILD, EXE, STAMP, DS4_EXE
     BUILD = ROOT / ("build-hip" if backend == "hip" else "build")
-    EXE = BUILD / ("strata.exe" if WIN else "strata")
+    EXE = BUILD / ("maya.exe" if WIN else "maya")
+    DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
     STAMP = BUILD / "MAYA-BUILD.json"
 
 
@@ -539,11 +650,22 @@ def hip_unified_memory(g) -> bool:
         re.search(r"Ryzen AI Max|Radeon(?:\s*\(TM\))?\s+80[4-6]\dS", g.get("name", ""), re.I))
 
 
+def hip_reserve_mib(gpus) -> int:
+    """The VRAM (MiB) an engine on these AMD GPUs leaves free on each: the desktop runs on them and allocates after
+    the engine has filled its expert pool - 3072, but 1024 on a Linux APU (its pool is sized from the RAM it shares;
+    Windows draws its desktop from the APU's carve-out too)."""
+    if any(hip_unified_memory(g) for g in gpus) and not WIN:
+        return 1024
+    return 3072
+
+
 def hip_clang(root: Path) -> Path | None:
-    """ROCm's clang++: <root>/llvm/bin (a system ROCm on Linux), <root>/lib/llvm/bin (TheRock's wheels), or <root>/bin
-    (AMD's HIP SDK for Windows)."""
+    """ROCm's clang++: <root>/llvm/bin (a system ROCm on Linux), <root>/lib/llvm/bin (TheRock's wheels),
+    <root>/lib64/rocm/llvm/bin (a distribution's own ROCm packages under /usr, e.g. Fedora's), or <root>/bin (AMD's HIP
+    SDK for Windows)."""
     exe = "clang++.exe" if WIN else "clang++"
-    return next((p for p in (root / "llvm" / "bin" / exe, root / "lib" / "llvm" / "bin" / exe, root / "bin" / exe)
+    return next((p for p in (root / "llvm" / "bin" / exe, root / "lib" / "llvm" / "bin" / exe,
+                             root / "lib64" / "rocm" / "llvm" / "bin" / exe, root / "bin" / exe)
                  if p.exists()), None)
 
 
@@ -644,7 +766,7 @@ def check_hip_pc(a, installed=False) -> dict:
     root, bindir = windows_rocm() if WIN else (None, None)
     hipinfo = hip_info(bindir) if WIN else None
     found = S.amd_gpus(hipinfo) if WIN else S.amd_gpus()
-    usable = [g for g in found if g["arch"] in HIP_ARCHS + HIP_ARCHS_UNVALIDATED]
+    usable = [g for g in found if g["arch"] in HIP_ARCHS + HIP_ARCHS_UNVALIDATED + HIP_ARCHS_WAVE64]
     for g in found:
         say(f"    {gpu_label(g)} - " + ("can be used" if g in usable else "not supported by Maya's HIP build"))
     if not usable:
@@ -658,14 +780,14 @@ def check_hip_pc(a, installed=False) -> dict:
     elif WIN and len(found) > 1 and any(g.get("source") == "registry" for g in found):
         warn("these GPU numbers are Windows' order (ROCm's hipInfo was not found): HIP's own can differ")
     if a.gpus:
-        # two cards split the layers (each caches the experts of its own half); the larger card goes first, as it
-        # takes the bigger first half - the order measured on an R9700 + RX 7900 XT
+        # two or more cards split the layers (each caches the experts of its own portion); the larger card goes first, as it
+        # takes the bigger first portion - the order measured on an R9700 + RX 7900 XT
         try:
             want = [int(x) for x in str(a.gpus).split(",") if x.strip()]
         except ValueError:
-            fail(f"--gpus takes two GPU numbers as --check shows them, e.g. --gpus 0,1, not {a.gpus!r}")
-        if len(want) != 2 or want[0] == want[1]:
-            fail("Maya's HIP port runs on one GPU or splits the model across two: --gpu 0, or --gpus 0,1")
+            fail(f"--gpus takes GPU numbers as --check shows them, e.g. --gpus 0,1, not {a.gpus!r}")
+        if not 2 <= len(want) <= MAX_GPUS or len(set(want)) != len(want):
+            fail("Maya's HIP port runs on one GPU or splits the model across two or more: --gpu 0, or --gpus 0,1,2,3")
         picked = [next((g for g in usable if g["index"] == i), None) for i in want]
         for i, g in zip(want, picked):
             if g is None:
@@ -705,8 +827,12 @@ def check_hip_pc(a, installed=False) -> dict:
                               key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)])
             if versions:
                 root = versions[-1]
+            elif (Path("/usr/bin/hipcc").exists() and hip_clang(Path("/usr")) is not None):
+                root = Path("/usr")   # a distribution's own ROCm packages (Fedora's: /usr/lib64/rocm/llvm, lib64)
         root = root.resolve()
-        if not (root / "llvm/bin/clang++").exists() or not list((root / "lib").glob("libhipblas.so*")):
+        clang = hip_clang(root)
+        if (clang is None or clang.parent == root / "bin"
+                or not any(list((root / d).glob("libhipblas.so*")) for d in ("lib", "lib64"))):
             fail("ROCm's HIP compiler and hipBLAS are required", "install ROCm 7, or set ROCM_PATH to its root")
         if tool_version(str(root / "bin/hipcc")) < (7, 0):
             fail("Maya's HIP port requires ROCm 7 or newer")
@@ -716,8 +842,8 @@ def check_hip_pc(a, installed=False) -> dict:
     if not avx2:
         fail(f"the CPU ({cpu}) needs AVX2 for the expert lane")
     total, avail = mem_gb()
-    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, "
-       f"{'two GPUs (layer split)' if len(chosen) == 2 else 'one GPU'}, text only")
+    split = f"{len(chosen)} GPUs (layer split)" if len(chosen) > 1 else "one GPU"
+    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, {split}, text only")
     ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'})")
     ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
     if any(hip_unified_memory(g) for g in chosen) and WIN:
@@ -730,6 +856,22 @@ def check_hip_pc(a, installed=False) -> dict:
             warn(f"the GPU has {vram:.0f} GB and Windows {total:.0f} GB: set Variable Graphics Memory higher (AMD "
                  "Software: Performance > Tuning, or the iGPU memory size in the BIOS), e.g. 96 GB on a 128 GB PC, "
                  "and restart - the experts on the GPU are the fastest")
+        # Windows charges every allocation on the APU's GPU to its commit (RAM + page file), though the carve-out is
+        # not RAM it counts (a Radeon 8065S: the free commit fell by each one): the engine fills the GPU's share, the
+        # RAM holds Windows and the other programs, so the page file needs the GPU's share and the margin both
+        # engines keep free for the others, max(8 GB, 10% of the RAM) - with less, experts stay off the GPU or the
+        # other programs run out of memory while the model runs (docs/AMD_MAYA.md, "The page file on a Windows APU")
+        pf = S.page_file_gb()
+        need_pf = math.ceil(vram + max(8.0, 0.1 * total))
+        if pf is not None and pf < need_pf:
+            warn(f"Windows' page file is {pf:.0f} GB: set it to at least {need_pf} GB ({need_pf * 1024} MB, with that "
+                 f"much free disk). Windows charges all of the GPU's memory ({vram:.0f} GB, as HIP reports it) to its "
+                 "commit (RAM + page file), so with a smaller one fewer experts fit on the GPU (slower answers) or "
+                 "other programs run out of memory while the model runs - "
+                 "System > About > Advanced system settings > Performance > Settings > Advanced > Virtual memory > "
+                 "Change: a custom size (initial and maximum), then restart Windows")
+        elif pf is not None:
+            ok(f"page file {pf:.0f} GB: Windows' commit holds the GPU's {vram:.0f} GB beside the other programs")
     elif any(hip_unified_memory(g) for g in chosen):
         ok("APU / unified memory: the engine sizes the GPU expert pool from available system RAM")
     unvalidated = sorted({g["arch"] for g in chosen if g["arch"] in HIP_ARCHS_UNVALIDATED})
@@ -738,7 +880,7 @@ def check_hip_pc(a, installed=False) -> dict:
              "not been validated on such a card yet - please report how it goes in an issue "
              "(https://github.com/mw00/project-maya/issues)")
     select_build_backend("hip")
-    return {"backend": "hip", "gpus": chosen, "archs": list(HIP_ARCHS) + unvalidated, "rocm": str(root),
+    return {"backend": "hip", "gpus": chosen, "archs": sorted({g["arch"] for g in chosen}), "rocm": str(root),
             **({"rocm_bin": str(bindir)} if WIN else {})}
 
 
@@ -753,12 +895,9 @@ def find_nvcc(archs, given=None) -> tuple:
     """(nvcc, version) for these GPUs: --nvcc, else the newest toolkit that can build for them (Strata's find_nvcc
     takes the newest of all, but CUDA 13 cannot build for Volta), else the newest found (reported as unfit), else
     (None, None)."""
-    def version(c):
-        v = re.search(r"release (\d+)\.(\d+)", S.out([c, "--version"]))
-        return (int(v.group(1)), int(v.group(2))) if v else None
     if given:
-        return given, version(given)
-    return pick_nvcc([(c, version(c)) for c in dict.fromkeys(c for c in nvcc_candidates() if c and Path(c).exists())],
+        return given, S.nvcc_version(given)
+    return pick_nvcc([(c, S.nvcc_version(c)) for c in dict.fromkeys(c for c in nvcc_candidates() if c and Path(c).exists())],
                      archs)
 
 
@@ -809,10 +948,10 @@ def cuda_lib_dirs(nvcc: str) -> list:
 
 
 # ------------------------------------------------------------------------------------------------ 1. the PC
-def choose_gpus(a, found) -> list:
+def choose_gpus(a, found, min_cc: int = MIN_CC) -> list:
     """The GPUs the model runs on: --gpu / --gpus, else asked when several can share it (all of them recommended)."""
     byid = {g["index"]: g for g in found}
-    usable = [g for g in found if int(g["arch"]) >= MIN_CC]
+    usable = [g for g in found if int(g["arch"]) >= min_cc]
     if a.gpus or a.gpu is not None:
         try:
             want = [int(x) for x in str(a.gpus).split(",") if x.strip()] if a.gpus else [a.gpu]
@@ -822,14 +961,15 @@ def choose_gpus(a, found) -> list:
             fail(f"Maya runs on one GPU or splits the model's layers across up to {MAX_GPUS}: --gpu 0, or "
                  "--gpus 0,1,2,3 (each number once)")
         for i in want:
-            if i not in byid or int(byid[i]["arch"]) < MIN_CC:
+            if i not in byid or int(byid[i]["arch"]) < min_cc:
                 fail(f"GPU {i} cannot be used" + ("" if i in byid else " (not found)"),
                      "use one of: " + ", ".join(str(g["index"]) for g in usable))
         return [byid[i] for i in want]
     if not usable:
-        fail("none of the GPUs can run Maya",
-             "it needs an NVIDIA GPU of compute capability 7.0 or newer (V100 and newer; "
-             "Pascal - Tesla P40 / P100, GTX 10 - is experimental)")
+        fail("none of the GPUs can run this model",
+             f"it needs an NVIDIA GPU of compute capability {min_cc / 10:.1f} or newer (" +
+             ("V100 and newer; Pascal - Tesla P40 / P100, GTX 10 - is experimental)" if min_cc < 80 else
+              "RTX 30 / A100 and newer)"))
     best = sorted(usable, key=lambda g: (-round(g["vram_gb"]), g["index"]))
     if len(best) == 1:
         return best
@@ -843,10 +983,13 @@ def choose_gpus(a, found) -> list:
             labels.append(f"{gpu_label(gs[0])} + {gpu_label(gs[1])} together")
         else:
             labels.append(f"{gpu_label(gs[0])} only")
-    pick = choose("Which GPUs?",
-                  ["Maya can run on one GPU, or split the model's layers across several: each then caches the experts "
-                   "of its", "own layers, so together they hold more of them (V100s: ~50 tok/s benchmark on two, ~24 "
-                   "on one)."],
+    intro = (["DeepSeek-V4.1-Flash runs best on all of them: pairs of equal GPUs split each of their layers (tensor",
+              "parallel), the pairs take the layers in turn, and the more VRAM, the fewer experts the CPU computes."]
+             if min_cc >= DS4_MIN_CC else
+             ["Maya can run on one GPU, or split the model's layers across several: each then caches the experts "
+              "of its", "own layers, so together they hold more of them (V100s: ~50 tok/s benchmark on two, ~24 "
+              "on one)."])
+    pick = choose("Which GPUs?", intro,
                   [(label, "recommended" if i == 0 else None, None) for i, label in enumerate(labels)], 0,
                   a.yes or a.check,
                   ["(--gpus picks any others, e.g. --gpus 0,2,5; a model with a draft block drafts tokens on two GPUs "
@@ -854,12 +997,17 @@ def choose_gpus(a, found) -> list:
     return opts[pick]
 
 
-def check_pc(a) -> dict:
+def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3") -> dict:
     step(1, "checking this PC")
+    ds4 = family == "deepseek"
     if a.backend == "hip":
+        if ds4 and not gguf:
+            fail(f"{DS4}'s EXL3 quant runs on NVIDIA GPUs only (its prompt kernels have no HIP port)",
+                 f"set up its GGUF instead: {ME} --setup --model {DS4} --ds4-quant gguf-q8")
         return check_hip_pc(a)
     if not (WIN or sys.platform.startswith("linux")):
         fail("Project Maya runs on Linux and Windows", "the engine needs an NVIDIA GPU and CUDA")
+    min_cc = (DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else MIN_CC
     if WIN:
         warn("Windows support is new (experimental): Maya is developed and measured on Linux - tell us how it runs")
     if S.is_wsl():
@@ -872,15 +1020,15 @@ def check_pc(a) -> dict:
               "install the NVIDIA driver (Ubuntu: sudo ubuntu-drivers install)") + f", restart, and run {ME} again")
     say("  NVIDIA GPUs:")
     for g in found:
-        say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= VALIDATED_CC else
-                                       "can be used (Pascal: experimental)" if int(g["arch"]) >= MIN_CC else
-                                       "too old (Maya needs compute capability 6.0 or newer)"))
-    chosen = choose_gpus(a, found)
+        say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= max(min_cc, VALIDATED_CC) else
+                                       "can be used (Pascal: experimental)" if int(g["arch"]) >= min_cc else
+                                       f"too old (this model needs compute capability {min_cc / 10:.1f} or newer)"))
+    chosen = choose_gpus(a, found, min_cc)
     archs = sorted({int(g["arch"]) for g in chosen})
     vram = sum(g["vram_gb"] for g in chosen)
     ok("using " + " + ".join(gpu_label(g) for g in chosen) +
        (f": the model's layers are split across the {len(chosen)}" if len(chosen) > 1 else ""))
-    if vram < 23:
+    if vram < 23 and not ds4:
         say(f"  {vram:.0f} GB of VRAM in total: the engine fills it with the most-used experts and serves the rest from "
             "RAM and the SSD - give it a try (more VRAM is faster; tell us your speed)")
     if min(archs) < VALIDATED_CC:
@@ -914,11 +1062,13 @@ def check_pc(a) -> dict:
         ok(f"NVIDIA driver {chosen[0]['driver']}")
 
     if WIN:
-        vcvars = S.find_vcvars()
+        vcvars = S.find_vcvars(nvcc=nvcc)
         if vcvars is None:
-            problems.append(("the C++ compiler (Visual Studio 2022 Build Tools, 'Desktop development with C++') is "
+            problems.append(("the C++ compiler (Visual Studio Build Tools, 'Desktop development with C++') is "
                              "not installed", "https://visualstudio.microsoft.com/visual-cpp-build-tools/ - in the "
-                             "installer tick 'Desktop development with C++' (CUDA 12 needs 2019 or 2022, not 2026)"))
+                             "installer tick 'Desktop development with C++' (CUDA 12.x needs 2019 or 2022; "
+                             + ("CUDA 12.x does not take 2026 - install 2022 alongside it, or use CUDA 13.2+"
+                                if nv and nv < (13, 2) else "2026 works with CUDA 13.2 and newer") + ")"))
         else:
             ok(f"C++ compiler: Visual Studio Build Tools ({vcvars})")
     elif a.host_compiler:
@@ -943,7 +1093,23 @@ def check_pc(a) -> dict:
 
     total, avail = mem_gb()
     msg = f"RAM: {total:.0f} GB, {avail:.0f} GB available now"
-    ok(msg + ("" if total >= 60 else " - it runs with 32 GB; more RAM keeps more experts close and is faster"))
+    if ds4:   # (below DS4_MEMORY_GB the engine reads the experts RAM cannot hold from the SSD: --mmap-experts auto)
+        if gguf:   # (a GGUF's: VRAM first, the rest read in place - RAM through the page cache, then the SSD;
+            # --mmap-experts off copies them into RAM)
+            ok(msg + f"; with {vram:.0f} GB of VRAM the most-used experts sit in VRAM, the others in RAM and on the "
+                     "SSD (more RAM is faster)")
+        elif vram + total < DS4_EXL3.get(ds4_quant, DS4_EXL3["exl3"])["memory_gb"]:
+            q = DS4_EXL3.get(ds4_quant, DS4_EXL3["exl3"])
+            warn(f"{msg}; with {vram:.0f} GB of VRAM that is below the ~{q['memory_gb']} GB that hold all of {DS4}'s "
+                 f"{q['weights_gb']} GB of weights at {q['bits']} bits, so the experts that do not fit are read from the "
+                 "model's files on the SSD, much slower (2.9 bits, one RTX 3090 and 64 GB measured: prompts ~50 "
+                 "tokens/s, answers ~4-5 tokens/s). More GPUs (--gpus) or RAM make it faster")
+        else:
+            ok(msg + f"; with {vram:.0f} GB of VRAM that holds {DS4} at {DS4_EXL3.get(ds4_quant, DS4_EXL3['exl3'])['bits']} bits")
+        if len(chosen) % 2 or len({round(g["vram_gb"]) for g in chosen}) > 1:
+            ok("tensor parallel pairs equal GPUs: a GPU without an equal neighbour runs its layers alone")
+    else:
+        ok(msg + ("" if total >= 60 else " - it runs with 32 GB; more RAM keeps more experts close and is faster"))
     pf = S.page_file_gb()
     need_pf = int(vram + 8.999)   # the card's memory and the pinned RAM tier are both charged to RAM + page file
     if pf is not None and pf < need_pf:
@@ -956,7 +1122,7 @@ def check_pc(a) -> dict:
     cpu, avx2, avx512 = S.cpu_info()
     if not avx2:
         warn(f"the CPU ({cpu}) has no AVX2: the engine runs, its CPU expert lane on ggml's own kernels (slower; "
-             "on 2x Xeon E5-2660 v2 it still added ~15% to 4-GPU decode). STRATA_GLM_CPU_LANE=0 turns it off")
+             "on 2x Xeon E5-2660 v2 it still added ~15% to 4-GPU decode). MAYA_GLM_CPU_LANE=0 turns it off")
     else:
         ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'}, {os.cpu_count()} threads)")
 
@@ -969,19 +1135,19 @@ def check_pc(a) -> dict:
              f"install it and run {ME} again - this script installs nothing system-wide")
     select_build_backend("cuda")
     return {"backend": "cuda", "gpus": chosen, "archs": archs, "nvcc": nvcc,
-            "vcvars": str(S.find_vcvars()) if WIN else None}
+            "vcvars": str(vcvars) if WIN else None}
 
 
 # ------------------------------------------------------------------------------------------------ 2. choices
-def choose_context(a, prev_ctx) -> int:
+def choose_context(a, prev_ctx, contexts=CONTEXTS, recommended=DEFAULT_CONTEXT) -> int:
     if a.context:
         return a.context
-    default = prev_ctx if prev_ctx in CONTEXTS else DEFAULT_CONTEXT
+    default = prev_ctx if prev_ctx in contexts else recommended
     pick = choose("Context?", ["Context length = how much text the model sees at once (the chat, files, tool output). "
                                "A longer one takes", "VRAM from the expert cache, so answers get a little slower:"],
-                  [(f"{c // 1024}K tokens", "recommended" if c == DEFAULT_CONTEXT else None, None) for c in CONTEXTS],
-                  CONTEXTS.index(default), a.yes)
-    return CONTEXTS[pick]
+                  [(f"{c // 1024}K tokens", "recommended" if c == recommended else None, None) for c in contexts],
+                  contexts.index(default), a.yes)
+    return contexts[pick]
 
 
 def shard_names(m: dict, pattern: str | None = None) -> list:
@@ -1057,6 +1223,43 @@ def choose_draft(a, pc: dict, inst: dict) -> str:
     return DRAFTS[pick]
 
 
+def config_family(cfg: dict) -> str:
+    """"deepseek" for a DeepSeek-V4.1-Flash config (maya-ds4's --pack), else "glm"."""
+    args = cfg.get("args") or []
+    return "deepseek" if (cfg.get("installer") or {}).get("family") == "deepseek" or "--pack" in args[:-1] or \
+        Path(cfg.get("exe", "")).name.startswith(("maya-ds4", "strata-ds4")) else "glm"   # (before v1.1.16's names)
+
+
+def choose_family(a, prev: dict) -> str:
+    """"glm" or "deepseek": what the options say (--model, --gguf-dir, --draft), else asked - the model set up before
+    is the default."""
+    if a.model:
+        return "deepseek" if a.model == DS4 else "glm"
+    if a.gguf_dir or a.draft:
+        return "glm"
+    if a.model_dir:
+        return "deepseek"
+    default = config_family(prev) if prev else "glm"
+    try:
+        have = sum(g["vram_gb"] for g in S.gpus() if g.get("vram_gb")) + mem_gb()[0]
+    except Exception:  # noqa: BLE001 - no NVIDIA tools: no figure for this PC
+        have = None
+    here = f" (this PC: {have:.0f} GB)" if have else ""
+    rows = [("GLM-5.3-Flash", None,
+             "Z.ai's GLM-5.3-Flash in Project Maya's GGUF quants (Maya-S to Maya-L, 95-156 GB) or turboderp's EXL3 "
+             "quants: from one GPU up, the experts that do not fit in VRAM from RAM and the SSD; NVIDIA (AMD: "
+             "experimental); pictures with its vision encoder."),
+            (DS4, "experimental",
+             "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUFs (UD-Q8_K_XL 508 GB or "
+             "UD-Q4_K_XL 501 GB; NVIDIA from V100 on or AMD, Linux or Windows) or LibertAIDAI's EXL3 quants at 2.9 or "
+             "3.5 bits with DeepSeek's two Engram tables (414 / 461 GB; NVIDIA V100 or newer, DSpark drafting, "
+             "pictures from RTX 30 / A100 on); "
+             f"fast with about {DS4_MEMORY_GB} GB of VRAM and RAM together{here}, with less the experts that do not "
+             "fit are read from the SSD; tensor parallel across pairs of equal GPUs, a 256K context.")]
+    pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
+    return FAMILIES[pick]
+
+
 def choose_model(a, models: Path, inst: dict) -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
     the downloads - the earlier download is the default."""
@@ -1084,18 +1287,18 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
                                                                      "Face"),
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
                      else "experimental" if is_exl3(q) else None, m["about"]))
-    pick = choose("Model?", ["The model to download (GLM-5.3-Flash GGUF files you already have: --gguf-dir <file or "
-                             "folder>):"], rows, opts.index(default), a.yes)
+    pick = choose("Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
+                                           "--gguf-dir <file or folder>):"], rows, opts.index(default), a.yes)
     return "download", opts[pick]
 
 
 # ------------------------------------------------------------------------------------------------ 3. tools
-def tools_step(a) -> Path:
+def tools_step(a, packages=PY_PACKAGES) -> Path:
     """The Python packages (into .venv) and llama.cpp's source at the pinned commit - listed, and asked, first."""
     step(3, "Python packages and llama.cpp's source")
     stamp = Path(sys.prefix) / ".strata-pip.json"          # S.pip_install's record of what it installed
     have = read_json(stamp) if stamp.exists() else []
-    need = [p for p in PY_PACKAGES if p not in (have if isinstance(have, list) else [])]
+    need = [p for p in packages if p not in (have if isinstance(have, list) else [])]
     llama = Path(a.llama_dir).expanduser().resolve() if a.llama_dir else ROOT / "third_party" / "llama.cpp"
     llama_ok = (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir()
     if a.llama_dir and not llama_ok:
@@ -1113,7 +1316,7 @@ def tools_step(a) -> Path:
         if ask("  Download them now?", ["y", "n"], "y", a.yes) != "y":
             fail("nothing was downloaded", f"run {ME} again when you are ready (or pass --llama-dir with a "
                                            f"llama.cpp checkout at commit {S.LLAMA_CPP_COMMIT[:10]})")
-    S.pip_install(PY_PACKAGES, ", ".join(PY_PACKAGES))
+    S.pip_install(list(packages), ", ".join(packages))
     if not llama_ok:
         llama = S.get_llama_cpp()
     ok(f"llama.cpp {S.LLAMA_CPP_COMMIT[:10]}: {llama}")
@@ -1146,13 +1349,15 @@ def toolkit_root_defs(nvcc) -> list:
     return [] if root == Path("/usr") else [f"-DCUDAToolkit_ROOT={root}"]
 
 
-def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, soft=False) -> dict | None:
-    """cmake configure + build of the `strata` target in build/; the exact commands are printed as they run.
-    soft: a failure warns and returns None (the engine already there keeps working) instead of stopping."""
+def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, soft=False,
+                   target: str = "maya") -> dict | None:
+    """cmake configure + build of the `maya` target (DeepSeek: `maya-ds4`) in build/; the exact commands are
+    printed as they run.  soft: a failure warns and returns None (the engine already there keeps working) instead of
+    stopping."""
     def stop(what):
         msg = f"the engine build stopped while {what} (the reason is above)"
-        hint = ("common causes: 'unsupported Microsoft Visual Studio version' - CUDA 12 needs Visual Studio 2019 or "
-                "2022 (its Build Tools are enough);" if WIN else
+        hint = ("common causes: 'unsupported Microsoft Visual Studio version' - CUDA 12.x needs Visual Studio 2019 or "
+                "2022 (its Build Tools are enough; only CUDA 13.2 and newer take 2026);" if WIN else
                 "common causes: 'unsupported GNU version' - install an older g++ your CUDA accepts (e.g. g++-13) and run "
                 "again (it is found by itself), or pass --host-compiler g++-13;") + (
                 "\n       'Unsupported gpu architecture compute_70' (or compute_61) - CUDA 13 cannot build for Volta "
@@ -1183,19 +1388,23 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=",".join(str(i) for i in gpu_ids))
     # nvcc takes 2-4 GB per job on the big kernels: half the threads, and no more jobs than RAM / 4 GB
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
-    build = [cmake, "--build", str(BUILD), "--target", "strata", "-j", str(jobs)]
+    build = [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)]
     say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) +
         " (10-30 minutes the first time, a few minutes after an update) ...")
     if cuda_archs == "native":
         say("  (CMakeLists.txt refuses an explicit sm_70 - Maya's own floor is sm_75 - so CMake is asked for this")
         say(f"  machine's GPUs instead: CMAKE_CUDA_ARCHITECTURES=native with CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']})")
-    stopped = cmake_steps(conf, build, env, "build-maya.bat")
+    stopped = cmake_steps(conf, build, env, "build-maya.bat", nvcc=nvcc)
     if stopped:
         return stop(stopped)
+    # the targets compiled from this source for these GPUs (a GLM-5.3-Flash and a DeepSeek setup share build/)
+    old = read_json(STAMP)
+    same = old.get("src") == src and old.get("archs") == archs and old.get("nvcc") == nvcc
     meta = {"src": src, "archs": archs, "gpu_ids": list(gpu_ids), "nvcc": nvcc, "host_compiler": host_compiler,
-            "llama": str(llama), "lib_dirs": cuda_lib_dirs(nvcc), "date": time.strftime("%Y-%m-%d %H:%M")}
+            "llama": str(llama), "lib_dirs": cuda_lib_dirs(nvcc), "date": time.strftime("%Y-%m-%d %H:%M"),
+            "targets": sorted({target} | (set(old.get("targets") or ["maya"]) if same else set()))}
     STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
-    ok(f"engine compiled: {EXE}")
+    ok(f"engine compiled: {exe_for_target(target)}")
     return meta
 
 
@@ -1209,10 +1418,39 @@ def shell_join(cmd) -> str:
     return cmdline(cmd) if WIN else shlex.join(cmd)
 
 
-def cmake_steps(conf, build, env, bat_name: str, vcvars=None) -> str | None:
+def path_unquoted(value: str) -> str:
+    """A Windows PATH with the double quotes taken out of its entries (an entry that is quoted because it holds a ';'
+    is left out: it cannot be written without them)."""
+    entries, cur, quoted = [], [], False
+    for ch in value:
+        if ch == '"':
+            quoted = not quoted
+        elif ch == ";" and not quoted:
+            entries.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    entries.append("".join(cur))
+    return ";".join(e for e in entries if ";" not in e)
+
+
+def vs_env(env=None) -> dict:
+    """The environment for a .bat that calls Visual Studio's vcvars64.bat: PATH's entries without quotes.  A quoted
+    entry with a parenthesis in it - "C:\\Program Files (x86)\\NVIDIA Corporation\\PhysX\\Common", as some installers
+    write it - stops vcvars64.bat at once with '\\NVIDIA was unexpected at this time.' and the build or the toolkit
+    probe with it (issue #251); Windows finds the same programs without the quotes."""
+    env = dict(os.environ if env is None else env)
+    for k in [k for k in env if k.upper() == "PATH"]:
+        if '"' in env[k]:
+            env[k] = path_unquoted(env[k])
+    return env
+
+
+def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None) -> str | None:
     """CMake's configure, then its build (once more when that stops: it continues where it stopped).  None when both
     worked, else what stopped.  On Windows both run in a .bat that first calls Visual Studio's vcvars64.bat - the
-    compiler's environment - the way Strata's setup.py builds there (cmake_build)."""
+    compiler's environment - the way Strata's setup.py builds there (cmake_build).  `nvcc` says which toolkit the
+    CUDA build uses: its release decides whether a VS 2026-only PC is usable (S.find_vcvars)."""
     if not WIN:
         if run(conf, env=env, check=False).returncode != 0:
             return "configuring"
@@ -1221,7 +1459,7 @@ def cmake_steps(conf, build, env, bat_name: str, vcvars=None) -> str | None:
             if run(build, env=env, check=False).returncode != 0:
                 return "compiling"
         return None
-    vcvars = vcvars or S.find_vcvars()
+    vcvars = vcvars or S.find_vcvars(nvcc=nvcc)
     if vcvars is None:
         return "looking for Visual Studio's C++ compiler (the Build Tools with 'Desktop development with C++')"
     bat = ROOT / bat_name
@@ -1231,7 +1469,7 @@ def cmake_steps(conf, build, env, bat_name: str, vcvars=None) -> str | None:
     say(f"  > {bat}   (Visual Studio's environment, then:)")
     say("  > " + cmdline(conf))
     say("  > " + cmdline(build))
-    rc = run(["cmd", "/c", str(bat)], env=env, check=False, echo=False).returncode
+    rc = run(["cmd", "/c", str(bat)], env=vs_env(env), check=False, echo=False).returncode
     return None if rc == 0 else "compiling" if rc == 4 else "configuring"
 
 
@@ -1253,9 +1491,6 @@ def toolchain_for(archs, nvcc_given: str | None, hc_given: str | None) -> tuple:
     toolkits are tried."""
     import tempfile
 
-    def version(c):
-        v = re.search(r"release (\d+)\.(\d+)", S.out([c, "--version"]))
-        return (int(v.group(1)), int(v.group(2))) if v else None
     if nvcc_given:
         nvccs = [nvcc_given]
     else:
@@ -1263,19 +1498,19 @@ def toolchain_for(archs, nvcc_given: str | None, hc_given: str | None) -> tuple:
         for c in nvcc_candidates():
             if c and Path(c).exists() and os.path.realpath(c) not in seen:
                 seen.add(os.path.realpath(c))
-                found.append((c, version(c)))
+                found.append((c, S.nvcc_version(c)))
         lo, hi = nvcc_range(archs)
         nvccs = [c for c, v in sorted((f for f in found if f[1]), key=lambda f: f[1], reverse=True)
                  if v >= lo and (hi is None or v < hi)]
     hcs = [None] if WIN else [hc_given] if hc_given else [None] + sorted(
         {q.name for d in ("/usr/bin", "/usr/local/bin") for q in Path(d).glob("g++-[0-9]*")
          if re.fullmatch(r"g\+\+-\d+", q.name)}, key=lambda n: -int(n[4:]))
-    vcvars = S.find_vcvars() if WIN else None
     say("  Finding a CUDA toolkit and C++ compiler that build the engine here ...")
     with tempfile.TemporaryDirectory() as t:
         src = Path(t) / "probe.cu"
         src.write_text(PROBE_CU, encoding="utf-8")
         for nv in nvccs:
+            vcvars = S.find_vcvars(nvcc=nv) if WIN else None   # which VS a toolkit takes is in its release (S.find_vcvars)
             for c in hcs:
                 cmd = [nv, "-std=c++20", "-c", str(src), "-o", str(Path(t) / "probe.o")] + \
                       (["-ccbin", shutil.which(c) or c] if c else [])
@@ -1283,7 +1518,8 @@ def toolchain_for(archs, nvcc_given: str | None, hc_given: str | None) -> tuple:
                     bat = Path(t) / "probe.bat"
                     bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{cmdline(cmd)}\r\n', encoding="utf-8")
                     cmd = ["cmd", "/c", str(bat)]
-                if subprocess.run(cmd, capture_output=True, text=True).returncode == 0:
+                if subprocess.run(cmd, capture_output=True, text=True,
+                                  env=vs_env() if vcvars else None).returncode == 0:
                     ok(f"{nv} with " + ("Visual Studio's C++ compiler" if WIN else c or "the default g++"))
                     return nv, c
     warn("no installed CUDA toolkit and C++ compiler pair compiled a test file: the build will show why (" +
@@ -1291,7 +1527,7 @@ def toolchain_for(archs, nvcc_given: str | None, hc_given: str | None) -> tuple:
     return (nvccs[0] if nvccs else nvcc_given), hc_given
 
 
-def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False) -> dict | None:
+def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str = "maya") -> dict | None:
     root = Path(pc["rocm"])
     cmake = pick_cmake()
     if not cmake:
@@ -1302,7 +1538,8 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False) -> dict | No
                ROCM_PATH=str(root), HIP_PATH=str(root))
     env["PATH"] = os.pathsep.join([str(bindir), str(clang.parent), env.get("PATH", "")])
     if not WIN:
-        env["LD_LIBRARY_PATH"] = os.pathsep.join([str(root / "lib"), env.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
+        libs = [str(root / d) for d in ("lib", "lib64") if (root / d).is_dir() and root != Path("/usr")]
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(libs + [env.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
     # Keep compiler-cache writes inside this project, including when run in a workspace sandbox.
     env.setdefault("CCACHE_DIR", str(BUILD / ".ccache"))
     conf = [cmake]
@@ -1326,9 +1563,11 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False) -> dict | No
              f"-DCMAKE_HIP_ARCHITECTURES={';'.join(pc['archs'])}",
              f"-DCMAKE_HIP_COMPILER={clang.as_posix()}", f"-DCMAKE_PREFIX_PATH={root.as_posix()}",
              f"-DSTRATA_GGML_DIR={llama.as_posix()}"]
+    if not WIN and root == Path("/usr"):   # a distribution's ROCm: CMake's HIP check looks for hip-lang under this root
+        conf.append(f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}")
     jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
     say("  Compiling Maya for AMD " + ", ".join(pc["archs"]) + " ...")
-    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "strata", "-j", str(jobs)], env,
+    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)], env,
                    "build-maya-hip.bat", vcvars=S.find_vcvars(cuda=False) if WIN else None):
         if soft:
             warn("HIP rebuild failed; starting the previous engine")
@@ -1344,38 +1583,46 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False) -> dict | No
                     shutil.copy2(dll, EXE.parent)
                 except OSError as e:                   # (in use: an engine still running keeps the one it has)
                     warn(f"could not copy {dll.name} next to the engine ({e})")
+    old = read_json(STAMP)   # (the targets compiled from this source: a GLM-5.3-Flash and a DeepSeek setup share it)
+    same = old.get("backend") == "hip" and old.get("src") == src and old.get("archs") == pc["archs"]
     meta = {"backend": "hip", "src": src, "archs": pc["archs"], "rocm": str(root),
             "gpu_ids": [g["index"] for g in pc["gpus"]], "llama": str(llama),
-            "lib_dirs": [str(bindir if WIN else root / "lib")], "date": time.strftime("%Y-%m-%d %H:%M")}
+            "lib_dirs": [str(bindir if WIN else root / "lib")], "date": time.strftime("%Y-%m-%d %H:%M"),
+            "targets": sorted({target} | (set(old.get("targets") or ["maya"]) if same else set()))}
     STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
-    ok(f"engine compiled: {EXE}")
+    ok(f"engine compiled: {exe_for_target(target)}")
     return meta
 
 
-def build_step(a, pc, llama: Path) -> dict:
+def build_step(a, pc, llama: Path, target: str = "maya") -> dict:
     step(4, "the engine")
     src = S.source_hash(S.ENGINE_SOURCES)              # src/, include/, third_party/ggml, CMakeLists.txt
     meta = read_json(STAMP)
+    exe = exe_for_target(target)
     if pc.get("backend") == "hip":
-        if (EXE.exists() and not a.rebuild and meta.get("backend") == "hip" and meta.get("src") == src
-                and meta.get("archs") == pc["archs"] and meta.get("rocm") == pc["rocm"]):
-            ok(f"HIP engine already compiled: {EXE}")
+        if (exe.exists() and not a.rebuild and meta.get("backend") == "hip" and meta.get("src") == src
+                and meta.get("archs") == pc["archs"] and meta.get("rocm") == pc["rocm"]
+                and target in (meta.get("targets") or ["maya"])):
+            ok(f"HIP engine already compiled: {exe}")
             return meta
-        return compile_engine_hip(pc, llama, src)
-    if (EXE.exists() and not a.rebuild and meta.get("src") == src and set(pc["archs"]) <= set(meta.get("archs", []))
+        return compile_engine_hip(pc, llama, src, target=target)
+    if (exe.exists() and not a.rebuild and meta.get("src") == src and set(pc["archs"]) <= set(meta.get("archs", []))
+            and target in (meta.get("targets") or ["maya"])
             and (not a.nvcc or a.nvcc == meta.get("nvcc"))
             and (not a.host_compiler or a.host_compiler == meta.get("host_compiler"))):
-        ok(f"engine already compiled for " + ", ".join(f"sm_{x}" for x in meta["archs"]) + f": {EXE}")
+        ok(f"engine already compiled for " + ", ".join(f"sm_{x}" for x in meta["archs"]) + f": {exe}")
         return meta
     nvcc, hc = toolchain_for(pc["archs"], a.nvcc, a.host_compiler)
     pc["nvcc"] = nvcc or pc["nvcc"]
-    return compile_engine(pc["archs"], [g["index"] for g in pc["gpus"]], pc["nvcc"], hc, llama, src)
+    return compile_engine(pc["archs"], [g["index"] for g in pc["gpus"]], pc["nvcc"], hc, llama, src, target=target)
 
 
 def refresh_engine(cfg: dict) -> None:
     """At a start: the engine's source changed since it was compiled (a git pull) - compile what changed."""
     meta = read_json(STAMP)
-    if not meta or Path(cfg["exe"]).resolve() != EXE.resolve():
+    exe = Path(cfg["exe"]).resolve()
+    target = "maya-ds4" if exe == DS4_EXE.resolve() else "maya"
+    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve()):
         return
     src = S.source_hash(S.ENGINE_SOURCES)
     if meta.get("src") == src:
@@ -1390,7 +1637,7 @@ def refresh_engine(cfg: dict) -> None:
               "gpus": [{"index": i} for i in cfg.get("gpu", [0])]}
         if WIN and meta.get("lib_dirs"):
             pc["rocm_bin"] = meta["lib_dirs"][0]
-        compile_engine_hip(pc, llama, src, soft=True)
+        compile_engine_hip(pc, llama, src, soft=True, target=target)
         return
     say("  The engine's source changed since it was compiled (an update): compiling what changed ...")
     nvcc, llama = meta.get("nvcc"), Path(meta.get("llama") or ROOT / "third_party" / "llama.cpp")
@@ -1399,7 +1646,7 @@ def refresh_engine(cfg: dict) -> None:
              f"({ME} --setup --rebuild compiles it again)")
         return
     gpu_ids = meta.get("gpu_ids") or (cfg.get("gpu") if isinstance(cfg.get("gpu"), list) else [0])
-    compile_engine(meta["archs"], gpu_ids, nvcc, meta.get("host_compiler"), llama, src, soft=True)
+    compile_engine(meta["archs"], gpu_ids, nvcc, meta.get("host_compiler"), llama, src, soft=True, target=target)
 
 
 # ------------------------------------------------------------------------------------------------ 5. the model
@@ -1558,21 +1805,93 @@ def sha256_checked(path: Path, want) -> bool:
     return True
 
 
-def offer_download(a, quant: str, d: Path, shards: list) -> bool:
+def file_url(m: dict, name: str) -> str:
+    """A download's file on Hugging Face: from the model's repo, or the one its "sources" names for it (DeepSeek's
+    Engram tables: DeepSeek's base repo)."""
+    repo, revision = (m.get("sources") or {}).get(name) or (m["repo"], m["revision"])
+    return hf_url(repo, revision, m["folder"], name)
+
+
+# curl's part of every model download: resume a file where it stopped, and give up on a connection that stalls (under
+# 1 KB/s for a minute) so it is run again instead of hanging
+CURL_RESUME = ["-C", "-", "--speed-limit", "1024", "--speed-time", "60", "--connect-timeout", "30"]
+DL_JOBS = 4         # files fetched at once (Hugging Face sends several streams faster than one)
+DL_STUCK = 30       # runs of curl in a row that add nothing to a file before the setup gives up on it
+
+
+def fetch_files(m: dict, shards: list, missing: list, urls: dict) -> None:
+    """The missing files with curl, DL_JOBS at a time, each resumed where it stopped and run again whenever its
+    connection drops or stalls - a download stopped half way (a dropped line, Ctrl+C, a restart) loses nothing: the
+    next run continues every file from its size on disk.  One line says how far the model is."""
+    want = {s: (m.get("files") or {}).get(hf_name(m, s)) for s in shards}
+    total = sum(want.values()) if all(want.values()) else m.get("download_gb", 0) * 1e9
+    size = lambda s: s.stat().st_size if s.exists() else 0   # noqa: E731
+    queue, running = list(missing), {}
+    stuck, after, start_size = {s: 0 for s in missing}, {s: 0.0 for s in missing}, {}
+    t0, base, last = time.time(), sum(size(s) for s in shards), 0.0
+    try:
+        while queue or running:
+            now = time.time()
+            for s in [q for q in queue if after[q] <= now][:max(0, DL_JOBS - len(running))]:
+                queue.remove(s)
+                start_size[s] = size(s)
+                cmd = ["curl", "-sS", "-L", "--fail"] + CURL_RESUME + ["-o", str(s), urls[s]]
+                running[s] = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                              stderr=subprocess.PIPE)
+            time.sleep(1)
+            for s, p in list(running.items()):
+                rc = p.poll()
+                if rc is None:
+                    continue
+                del running[s]
+                err = (p.communicate()[1] or b"").decode(errors="replace").strip().splitlines()
+                have = size(s)
+                if want[s] is not None and have > want[s]:   # (more than the file: its tail is wrong - start it over)
+                    s.unlink()
+                    have = 0
+                if want[s] is None and rc == 0 or want[s] is not None and have == want[s]:
+                    continue
+                stuck[s] = 0 if have > start_size[s] else stuck[s] + 1
+                if stuck[s] >= DL_STUCK:
+                    S.progress()
+                    fail(f"the download of {s.name} keeps stopping without progress "
+                         f"({err[-1] if err else f'curl exit code {rc}'})",
+                         f"check the connection, then run {ME} --download-model again: it continues where it stopped")
+                after[s] = time.time() + min(60, 5 * stuck[s])   # (again at once after progress, slower when stuck)
+                queue.append(s)
+            if time.time() - last > 2 or not (queue or running):
+                last = time.time()
+                have = sum(size(s) for s in shards)
+                rate = (have - base) / max(1e-3, last - t0)
+                eta = (total - have) / rate if rate > 0 and total > have else 0
+                left = f" · {int(eta // 3600)} h {int(eta % 3600 // 60):02d} min left" if eta else ""
+                share = f" ({100 * have / total:.0f}%)" if total else ""
+                S.progress(f"{have / 1e9:.1f} / {total / 1e9:.1f} GB{share} · {rate / 1e6:.0f} MB/s{left} · "
+                         f"{len(running)} files at once", have / total if total else None)
+    finally:
+        for p in running.values():   # (stopped half way: no curl keeps writing behind the setup's back)
+            p.terminate()
+        S.progress()
+
+
+def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) -> bool:
     """Shows what would be downloaded - the source, the size, the exact commands - and downloads only after a yes
     (or --download-model).  False: nothing was downloaded."""
-    m = MODELS[quant]
+    m = m or MODELS[quant]
     missing = [s for s in shards if file_incomplete(m, s)]
-    urls = {s: hf_url(m["repo"], m["revision"], m["folder"], hf_name(m, s)) for s in shards}
+    urls = {s: file_url(m, hf_name(m, s)) for s in shards}
     on_disk = sum(s.stat().st_size for s in shards if s.exists()) / 1e9
     remaining = max(0.0, m["download_gb"] - on_disk)
     free = shutil.disk_usage(existing(d)).free / 1e9
     curl = shutil.which("curl")
     cmds = [["mkdir"] + ([] if WIN else ["-p"]) + [str(d)]] + \
-        [["curl", "-L", "--fail", "--retry", "5", "-C", "-", "-o", str(s), urls[s]] for s in missing]
+        [["curl", "-L", "--fail", "--retry", "5"] + CURL_RESUME + ["-o", str(s), urls[s]] for s in missing]
     say(f"  {quant}: {m['about']}.")
     say(f"  Source: https://huggingface.co/{m['repo']}" + (f" (folder {m['folder']}/)" if m["folder"] else "") +
         (f" (branch {m['branch']})" if m.get("branch") else "") + "; the files' own license applies.")
+    for repo in dict.fromkeys(r for r, _ in (m.get("sources") or {}).values()):
+        names = [n for n, (r, _) in m["sources"].items() if r == repo]
+        say(f"  And from https://huggingface.co/{repo}: " + ", ".join(names))
     say(f"  The model is {m['download_gb']:.1f} GB in {len(shards)} file{'s' if len(shards) != 1 else ''}; "
         f"{len(missing)} still to download, about "
         f"{remaining:.0f} GB, into")
@@ -1603,13 +1922,10 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
             f"({ME} --download-model downloads them without asking).")
         return False
     d.mkdir(parents=True, exist_ok=True)
+    if curl:
+        fetch_files(m, shards, missing, urls)
     for s in missing:
-        if curl:
-            cmd = ["curl", "-L", "--fail", "--retry", "5", "-C", "-", "-o", str(s), urls[s]]
-            if run(cmd, check=False).returncode != 0:
-                fail(f"the download of {s.name} stopped (the reason is above)",
-                     f"run {ME} --download-model again: it continues where it stopped")
-        else:
+        if not curl:
             S.download(urls[s], s)
         why = file_incomplete(m, s)
         if why:
@@ -1808,7 +2124,7 @@ def fetch(url: str, dst: Path, want: str | None) -> None:
 
 
 def compile_vision(pc, meta, llama: Path, src: str) -> bool:
-    """strata-vision: llama.cpp's mtmd at the pinned commit with GLM-5.3-Flash's vision tower added
+    """maya-vision: llama.cpp's mtmd at the pinned commit with GLM-5.3-Flash's vision tower added
     (tools/vision/glm5next_patch.py, idempotent), for the same GPUs and toolkit as the engine."""
     cmake = pick_cmake()
     if cmake is None:
@@ -1830,8 +2146,8 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
     say("  Compiling the vision encoder (llama.cpp's image library with ggml's CUDA kernels: 10-20 minutes, once) ...")
-    if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "strata-vision", "-j", str(jobs)], None,
-                   "build-maya-vision.bat"):
+    if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)], None,
+                   "build-maya-vision.bat", nvcc=meta.get("nvcc") or pc["nvcc"]):
         return False
     VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
                                   "date": time.strftime("%Y-%m-%d %H:%M")}, indent=1), encoding="utf-8")
@@ -1890,8 +2206,8 @@ def parse_env(items) -> dict:
     for it in items:
         k, sep, v = it.partition("=")
         if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
-            fail(f"--env takes KEY=VALUE, e.g. --env STRATA_GLM_RAM_HEADROOM_GB=4, not {it!r}")
-        env[k] = v
+            fail(f"--env takes KEY=VALUE, e.g. --env MAYA_GLM_RAM_HEADROOM_GB=4, not {it!r}")
+        env[N.read_as(k)] = v                          # (in memory under the name the code reads; MAYA_ on disk)
     return env
 
 
@@ -1933,10 +2249,10 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         cfg["backend"] = "hip"
         # Leave space for the Linux desktop. The engine sizes its prompt chunk from
         # the available prompt-memory budget; forcing 256 here severely slows HIP.
-        hip_env = {"STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16"}
+        hip_env = {"STRATA_GLM_RESERVE_MB": str(hip_reserve_mib(pc["gpus"])), "STRATA_GLM_RAM_HEADROOM_GB": "16"}
         gpus = pc["gpus"]
         if len(gpus) == 1:
-            hip_env["STRATA_GLM_SPLIT"] = "0"   # two cards: the engine picks the split (and drafts with MTP)
+            hip_env["STRATA_GLM_SPLIT"] = "0"   # two or more cards: the engine picks the split (and drafts with MTP)
         # Larger prompt sub-batches feed the matrix cores much better (7900 XT: ~250 -> ~410 tok/s); they need
         # a bigger prompt budget, borrowed from the expert pool only while a prompt runs.
         if any(hip_unified_memory(g) for g in gpus):
@@ -1946,7 +2262,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
             total_ram, _ = mem_gb()
             if WIN:     # Windows counts the GPU's carve-out apart from its RAM, and its desktop runs on that GPU
                 total_ram += sum(g.get("vram_gb", 0) for g in gpus)
-            hip_env.update({"STRATA_GLM_RESERVE_MB": "3072" if WIN else "1024", "STRATA_GLM_PREFILL_SUB": "1024",
+            hip_env.update({"STRATA_GLM_PREFILL_SUB": "1024",
                             "STRATA_GLM_PREFILL_MB": "6144" if total_ram >= 96 else "4096"})
         elif min(g.get("vram_gb", 0) for g in gpus) >= 20:
             hip_env.update({"STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
@@ -2003,7 +2319,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
            (": " + ", ".join(f"{k}={v}" for k, v in cal["settings"].items()) if cal.get("settings") else ""))
         if cal.get("context"):
             ok(f"(tuned at context {cal['context']}: {ME} --calibrate tunes this context too)")
-    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, port)}")
     return cfg_path
@@ -2070,6 +2386,35 @@ def add_profile(cfg: dict) -> bool:
     return True
 
 
+def ds4_seed_profile(cfg: dict) -> Path | None:
+    """A DeepSeek config whose pack has no expert profile yet (a fresh setup, or one from before the shipped profile)
+    and that names no other one (--expert-profile): the shipped DS4_PROFILE copied into the pack, where the engine
+    reads it and saves what it learns.  Only a profile of the pack's geometry (its layers x routed experts).  The
+    profile written, or None."""
+    args = cfg.get("args") or []
+    pack = flag_value(args, "--pack")
+    if pack is None or "--expert-profile" in args[:-1] or not DS4_PROFILE.is_file():
+        return None
+    dst = Path(pack) / "expert-profile.bin"
+    if dst.exists():
+        return None
+    geo = {}
+    try:
+        for line in (Path(pack) / "ds4.txt").read_text(encoding="utf-8").splitlines():
+            k, _, v = line.partition(" ")
+            geo[k] = v.strip()
+        want = int(geo["num_hidden_layers"]) * int(geo["n_routed_experts"]) * 4
+    except (OSError, KeyError, ValueError):
+        return None
+    if DS4_PROFILE.stat().st_size != want:
+        return None
+    try:
+        shutil.copyfile(DS4_PROFILE, dst)
+    except OSError:
+        return None
+    return dst
+
+
 def keep_profile(old: list, new: list) -> list:
     """A learned expert profile wired in by hand: the old config's --expert-profile replaces the
     shipped one only when it is another file that still exists (a moved or deleted one falls back to the shipped
@@ -2095,7 +2440,10 @@ def hardware_key(cfg: dict) -> str:
     sel = [found.get(i) or {} for i in cfg.get("gpu") or []]
     a = cfg.get("args") or []
     ctx = a[a.index("--max-context") + 1] if "--max-context" in a[:-1] else "?"
-    quant = (cfg.get("installer") or {}).get("quant") or cfg.get("model_name", "?")
+    inst = cfg.get("installer") or {}
+    quant = inst.get("quant") or cfg.get("model_name", "?")
+    if inst.get("ds4_quant"):   # (DeepSeek's quants: each its own tuning)
+        quant = f"{quant}/{inst['ds4_quant']}"
     return "|".join([" + ".join(g.get("name", "?") for g in sel) or "?",
                      f"{sum(g.get('vram_gb', 0) for g in sel):.0f}GB", S.cpu_info()[0], f"{S.ram_gb():.0f}GB", quant,
                      str(ctx), "images" if cfg.get("vision") else "text"] + (["dflash2"] if "--dflash" in a else []))
@@ -2154,6 +2502,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     """Tune the CPU lane on this PC (tools/calibrate_glm.py): the result goes into the config's env and into
     CAL_STORE for this PC, model and context (a setup again applies it)."""
     cfg = read_json(cfg_path)
+    if config_family(cfg) == "deepseek":
+        return calibrate_ds4_config(cfg_path)
     if cfg.get("backend") == "hip":
         warn("the tuning measures the CUDA engine's CPU lane (NVIDIA GPUs): the HIP port keeps its own settings")
         return False
@@ -2181,7 +2531,7 @@ def calibrate_config(cfg_path: Path) -> bool:
         cfg["env"] = env
     else:
         cfg.pop("env", None)
-    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     store = load_calibrations()
     store[hardware_key(cfg)] = {"settings": res["settings"], "tok_s": res["report"].get("tok_s"),
                                 "date": time.strftime("%Y-%m-%d")}
@@ -2195,6 +2545,55 @@ def calibrate_config(cfg_path: Path) -> bool:
         ok("tuned for this PC: " + ", ".join(f"{k}={v}" for k, v in res["settings"].items()) + speed)
     else:
         ok("tuned for this PC: the engine's own settings are already the fastest here" + speed)
+    return True
+
+
+def ds4_tuned(chosen: dict) -> str:
+    """A DeepSeek calibration's settings as the engine arguments they are ("--tp 8, the engine's own CPU threads")."""
+    return ", ".join(f"{k} {v}" if v is not None else f"the engine's own {k[2:].replace('-', ' ')}"
+                     for k, v in chosen.items())
+
+
+def calibrate_ds4_config(cfg_path: Path) -> bool:
+    """Tune maya-ds4 on this PC (tools/calibrate_ds4_tp.py): --tp and --cpu-threads go into the config's args and
+    into CAL_STORE for this PC, quant and context (a setup again applies them where the config before had none)."""
+    cfg = read_json(cfg_path)
+    busy = busy_gpus(cfg)
+    if busy:
+        warn("the tuning needs the GPU(s) to itself: " + ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
+             " (a model server still running?) - stop it, then run ./maya.sh --calibrate")
+        return False
+    found = {g["index"]: g for g in S.gpus() or []}
+    vram = [found[i]["vram_gb"] for i in cfg.get("gpu") or [] if i in found]
+    n_tp = len(CAL4.tp_candidates(vram)) or 1
+    say()
+    say(f"  Tuning {DS4} for this PC: the output speed with each tensor parallel grouping of the GPUs that differs")
+    say(f"  ({n_tp} here) and with fewer CPU threads. Every setting is a start of the model of its own, so it takes")
+    say(f"  about {6 * (n_tp + 1)}-{10 * (n_tp + 3)} minutes; the PC is busy meanwhile.")   # (9 GPUs: 7-8 starts, 6-12 min each)
+    log = cfg.get("log")
+    since = os.path.getsize(log) if log and os.path.isfile(log) else 0
+    try:
+        res = CAL4.run(cfg, vram, say=say)
+    except Exception as e:                             # the config stays as it was
+        warn(f"the tuning did not finish ({e}): the config's settings stay")
+        why = CAL.engine_error(log, since)
+        if why:
+            say(f"       the engine said: {why}")
+        return False
+    cfg["args"] = CAL4.apply(cfg.get("args") or [], res["args"])
+    cfg.setdefault("installer", {})["calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"), **res["report"]}
+    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    store = load_calibrations()
+    store[hardware_key(cfg)] = {"args": res["args"], "tok_s": res["report"].get("tok_s"),
+                                "prompt_tok_s": res["report"].get("prompt_tok_s"), "date": time.strftime("%Y-%m-%d")}
+    try:
+        CAL_STORE.parent.mkdir(parents=True, exist_ok=True)
+        CAL_STORE.write_text(json.dumps(store, indent=1), encoding="utf-8")
+    except OSError as e:
+        warn(f"could not save {CAL_STORE} ({e}): {cfg_path.name} has the settings, a setup again does not")
+    r = res["report"]
+    speed = f" ({r['tok_s']} tok/s answering, the config's own {r['own_tok_s']})" if r.get("tok_s") else ""
+    ok(f"tuned for this PC: {ds4_tuned(res['args'])}{speed}")
     return True
 
 
@@ -2220,6 +2619,8 @@ def needs_speed_calibration(cfg: dict) -> bool:
     calibration could not run then - the GPUs were busy): its next start measures first.  Not with --parallel above 1:
     the engine then decodes without the drafter."""
     args = cfg.get("args") or []
+    if config_family(cfg) == "deepseek":               # (its DSpark drafter: measured once too)
+        return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {})
     return "--dflash" in args[:-1] and parallel_of(cfg) <= 1 and \
         "speed_calibration" not in (cfg.get("installer") or {})
 
@@ -2231,6 +2632,8 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     that chooses DFlash2, or --speed-calibration, measures again.  False: not measured (the reason is shown; nothing
     changed, and a failure is recorded so that a start does not try again by itself)."""
     cfg = read_json(cfg_path)
+    if config_family(cfg) == "deepseek":
+        return speed_calibration_ds4(cfg_path, cfg, why)
     drafter = drafter_file(cfg)
     if drafter is None or not drafter.is_file():
         warn("the speed calibration compares the DFlash2 drafter with the MTP block, and the drafter is not on this "
@@ -2276,7 +2679,7 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
             say(f"       the engine said: {why_not}")
         cfg.setdefault("installer", {})["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
                                                                 "failed": str(e)[:300]}
-        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
         return False
     o, d = res["other"]["tok_s"], res["dflash2"]["tok_s"]
     keep = res["keep"] == "dflash2"
@@ -2286,7 +2689,7 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     inst["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(),
                                  "dflash2_tok_s": d, ("no_drafting" if one else "mtp") + "_tok_s": o,
                                  "tokens": [res["other"]["tokens"], res["dflash2"]["tokens"]], "kept": inst["draft"]}
-    cfg_path.write_text(json.dumps(out, indent=1), encoding="utf-8")
+    cfg_path.write_text(json.dumps(N.env_out(out), indent=1), encoding="utf-8")
     say()
     if keep:
         ok(f"speed calibration: DFlash2 is faster on this PC - {d:.1f} against {o:.1f} tokens/s with {other} "
@@ -2299,21 +2702,135 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     return True
 
 
+def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
+    """DeepSeek's speed calibration (tools/calibrate_ds4.py): the sustained decode speed with the DSpark drafter and
+    without it (--dspark none), measured on this PC's GPUs; the config keeps the faster - the drafter only when it wins
+    by more than CDS.MIN_GAIN - and the result (installer.speed_calibration)."""
+    if not CDS.has_drafter(cfg):
+        warn(f"the speed calibration compares DeepSeek's DSpark drafter with no drafting, and this pack has no "
+             f"drafter: {ME} --setup downloads it")
+        return False
+    busy = busy_gpus(cfg)
+    if busy:
+        warn("the speed calibration needs the GPU(s) to itself: " +
+             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
+             f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration")
+        return False
+    say()
+    say("  Speed calibration: the DSpark drafter or none?" + (f" ({why})" if why else ""))
+    say("  Drafting makes some PCs faster and others slower: it depends on how much of the model fits in the GPUs'")
+    say("  memory, and on the CPU, the RAM and the SSD. So Maya measures both here, the way you will use it. It loads")
+    say(f"  the model twice; each time it warms up, then writes about {CDS.MIN_TOKENS} tokens of answers, and the "
+        "sustained")
+    say("  speeds are compared. About 10-30 minutes; the PC is busy.")
+    log = cfg.get("log")
+    since = os.path.getsize(log) if log and os.path.isfile(log) else 0
+    try:
+        res = CDS.run(cfg, say=say)
+    except Exception as e:                             # never stops a setup or a start: the config stays as it was
+        warn(f"the speed calibration did not finish ({e}): nothing changed; {ME} --speed-calibration tries again")
+        why_not = CAL.engine_error(log, since)
+        if why_not:
+            say(f"       the engine said: {why_not}")
+        cfg.setdefault("installer", {})["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
+                                                                "failed": str(e)[:300]}
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        return False
+    o, d = res["none"]["tok_s"], res["dspark"]["tok_s"]
+    keep = res["keep"] == "dspark"
+    out = CDS.with_dspark(cfg, "on" if keep else "none")
+    out.setdefault("installer", {})["speed_calibration"] = {
+        "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "dspark_tok_s": d, "no_drafting_tok_s": o,
+        "drafts_accepted": [res["dspark"]["drafts_accepted"], res["dspark"]["drafts_offered"]],
+        "tokens": [res["none"]["tokens"], res["dspark"]["tokens"]], "kept": "dspark" if keep else "none"}
+    cfg_path.write_text(json.dumps(N.env_out(out), indent=1), encoding="utf-8")
+    say()
+    if keep:
+        ok(f"speed calibration: the DSpark drafter is faster on this PC - {d:.1f} against {o:.1f} tokens/s "
+           f"(+{res['gain'] * 100:.0f}%): Maya drafts with it")
+    else:
+        ok(f"speed calibration: the DSpark drafter is not faster on this PC - {d:.1f} against {o:.1f} tokens/s: "
+           "Maya decodes without drafting (and its memory holds more of the model)")
+    return True
+
+
+def drafting_choice(a, drafter: str, minutes: str) -> str:
+    """How a setup settles its drafter: "measure" (the speed calibration), or the user's own choice without
+    measuring - "on" (draft with it) or "off".  --drafting, or --no-speed-calibration (= on), else asked; --yes
+    measures."""
+    if getattr(a, "drafting", None):
+        return a.drafting
+    if getattr(a, "no_speed_calibration", False):
+        return "on"
+    say()
+    say(f"  {drafter}: Maya can measure on this PC whether drafting makes answers faster ({minutes} minutes, the")
+    say("  model loaded twice), or you choose now and skip the measuring.")
+    r = ask("  m = measure, y = draft with it, n = no drafting (m/y/n)", ["m", "y", "n"], "m", a.yes)
+    return {"m": "measure", "y": "on", "n": "off"}[r]
+
+
+def keep_drafting(cfg_path: Path, on: bool) -> None:
+    """The user's choice instead of the speed calibration: the config drafts with its drafter (on) or not, and
+    installer.speed_calibration records the choice - so a start does not measure by itself (--speed-calibration
+    measures any time)."""
+    cfg = read_json(cfg_path)
+    ds4 = config_family(cfg) == "deepseek"
+    if ds4:
+        out, kept = CDS.with_dspark(cfg, "on" if on else "none"), ("dspark" if on else "none")
+    else:
+        out = cfg if on else CD.without_dflash(cfg)
+        kept = out.setdefault("installer", {})["draft"] = "dflash2" if on else "mtp"
+    out.setdefault("installer", {})["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
+                                                            "version": maya_version(), "skipped": "chosen",
+                                                            "kept": kept}
+    cfg_path.write_text(json.dumps(N.env_out(out), indent=1), encoding="utf-8")
+    name = "the DSpark drafter" if ds4 else "DFlash2"
+    if on:
+        ok(f"speed calibration skipped: Maya drafts with {name}, as chosen")
+    elif ds4:
+        ok("speed calibration skipped: Maya decodes without drafting, as chosen")
+    else:
+        one = len(cfg.get("gpu") or [0]) < 2
+        ok("speed calibration skipped: Maya " + ("decodes without drafting" if one else "drafts with the MTP block") +
+           ", as chosen")
+    say(f"       ({ME} --speed-calibration measures which is faster on this PC any time)")
+
+
 def server_command(cfg_path: Path, a) -> tuple:
     """The dashboard's server for an installed config: (its command, its environment, what the setup's screen shows of
     it).  The engine is compiled again first when its source changed (an update)."""
     cfg = read_json(cfg_path)
+    rename_programs()
+    renamed = fix_config_names(cfg)                    # (v1.1.16's names: the programs, and the settings as MAYA_*)
+    try:
+        old_env = any(str(k).startswith(N.OLD) for k in
+                      json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("env") or {})
+    except (OSError, ValueError, AttributeError):
+        old_env = False
+    if renamed or old_env:
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    if renamed:
+        ok(f"{cfg_path.name}: the programs are named after Maya now ({Path(cfg['exe']).name})")
     if getattr(a, "parallel", None):                   # --parallel given at a start: kept in the config
         set_arg(cfg.setdefault("args", []), "--parallel", a.parallel)
-        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     select_build_backend(cfg.get("backend", "cuda"))
     args = cfg.get("args") or []
-    pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
+    ds4 = config_family(cfg) == "deepseek"
+    flag = "--pack" if ds4 else "--glm-pack"
+    pack = Path(args[args.index(flag) + 1]) if flag in args[:-1] else None
     for p, what in ((Path(cfg.get("exe", "")), "the engine"), (pack, "the pack"),
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
         if p is None or not p.exists():
             fail(f"{cfg_path.name}: {what} is missing ({p})", f"run {ME} --setup to repair it")
     # a model file changed after its pack was built (pack_stale, #155): the pack's places in it are wrong
+    if ds4 and (pack / PACK_SOURCES).exists():
+        rec = {r.get("name") for r in read_json(pack / PACK_SOURCES).get("files") or []}
+        why = pack_stale(pack, [s for s in ds4_shards(pack.parent) if s.name in rec or not rec])   # (its own files:
+        # the folder may also hold an earlier layout's)
+        if why is not None:
+            fail(f"{cfg_path.name}: {why}, so its index of where the tensors sit is wrong",
+                 f"run {ME} --setup --repack to build it again (a minute)")
     src = pack_source(pack)
     if src is not None and src != EXL3_GGUF and all(s.exists() for s in shard_set(pack.parent / src)):
         why = pack_stale(pack, shard_set(pack.parent / src))
@@ -2323,12 +2840,15 @@ def server_command(cfg_path: Path, a) -> tuple:
         if not (pack / PACK_SOURCES).exists():
             stamp_pack(pack, shard_set(pack.parent / src))
     if add_profile(cfg):                               # a config written before the expert profile (an update)
-        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
         ok(f"{cfg_path.name}: starts from the shipped expert profile now (--expert-profile {PROFILE})")
+    if ds4 and ds4_seed_profile(cfg):                  # (DeepSeek's: a pack that has not learned one yet)
+        ok(f"{cfg_path.name}: starts from DeepSeek's shipped expert profile ({DS4_PROFILE.name}, copied into the pack)")
     cfg_path.touch()                                   # the most recently used model
     refresh_engine(cfg)
-    if needs_speed_calibration(cfg):                   # DFlash2 set up before the speed calibration: measured once
-        if speed_calibration(cfg_path, "once, for a setup that drafts with DFlash2 - new in this version"):
+    if needs_speed_calibration(cfg):                   # a drafter set up without its speed calibration: measured once
+        drafter = "DeepSeek's DSpark drafter" if config_family(cfg) == "deepseek" else "DFlash2"
+        if speed_calibration(cfg_path, f"once, for a setup that drafts with {drafter}"):
             cfg = read_json(cfg_path)
             args = cfg.get("args") or []
     port = a.port or cfg.get("port") or 8080
@@ -2367,8 +2887,12 @@ def server_command(cfg_path: Path, a) -> tuple:
     if host not in ("127.0.0.1", "localhost", "::1"):
         say("  Other devices:    the server prints this machine's addresses when it is ready" +
             ("" if key else " - WARNING: no API key, anyone on your network can use it (--api-key KEY)"))
-    say("  Loading takes a few minutes: the engine pins up to all but about 6 GB of the free RAM for its expert tier")
-    say("  (STRATA_GLM_RAM_HEADROOM_GB changes the 6) and warms its caches - the first answers are the slowest.")
+    if ds4:
+        say("  Loading takes a few minutes: the engine places the experts in VRAM by how often they are used, copies the")
+        say("  rest into RAM for its CPU lane and pins them - the first answers are the slowest.")
+    else:
+        say("  Loading takes a few minutes: the engine pins up to all but about 6 GB of the free RAM for its expert tier")
+        say("  (MAYA_GLM_RAM_HEADROOM_GB changes the 6) and warms its caches - the first answers are the slowest.")
     say("  Ctrl+C (or closing this terminal) stops it. Engine log: " + str(cfg.get("log", "")))
     say("  " + "-" * 100)
     return cmd, env, info
@@ -2382,7 +2906,55 @@ def start(cfg_path: Path, a) -> int:
         rc = setup_tui.run(lambda: serve_on_screen(cfg_path, a), maya_version(), None, ME, steps=False)
         return after_server(rc, a)
     cmd, env, _ = server_command(cfg_path, a)
-    return after_server(subprocess.call(cmd, env=env), a)
+    return after_server(run_server(cmd, env=env), a)
+
+
+STOP_WAIT_S = 150   # a stop's longest wait for the server: its request in progress (40 s) and the engine's QUIT (50 s)
+
+
+def run_server(cmd, env=None, wait_s: float = STOP_WAIT_S) -> int:
+    """Maya's server in this terminal until it ends: its exit code.  It ends with this process, however this one
+    ends: its stdin is a pipe from here (--parent-pipe), so when this process ends - Ctrl+C, SIGTERM or SIGHUP (a
+    service manager, `kill`, the terminal closed: KeyboardInterrupt here, stop_signals), a crash, even SIGKILL - the
+    pipe closes and the server stops as on Ctrl+C: the request in progress answers, the engine gets QUIT and keeps its
+    conversation.  On Windows a job object also ends the server and everything it started at once when this process
+    ends without the time for that (setup.end_with_me: the console closed, taskkill /F).  A stop here closes the pipe
+    and waits for the server (up to `wait_s` seconds, then it is ended)."""
+    p = subprocess.Popen(list(cmd) + ["--parent-pipe"], env=env, stdin=subprocess.PIPE)
+    S.end_with_me(p)
+    deadline = None
+    while True:
+        try:
+            return p.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            if deadline is not None and time.monotonic() > deadline:
+                say(f"  (the server did not end within {wait_s:.0f} s of the stop: ended)")
+                p.kill()
+                return p.wait()
+        except KeyboardInterrupt:                      # (the server gets Ctrl+C itself; a signal here: the pipe says it)
+            if deadline is None:
+                deadline = time.monotonic() + wait_s
+                try:
+                    p.stdin.close()
+                except OSError:
+                    pass
+
+
+def stop_signals() -> None:
+    """SIGTERM and SIGHUP (and Windows' SIGBREAK: Ctrl+Break, the console closed) stop maya.py as Ctrl+C does - a
+    KeyboardInterrupt - so a service manager, `kill <pid>` or a closed terminal stop the setup, or the server it runs
+    (run_server), the same way.  A signal that is ignored (nohup) stays ignored."""
+    import signal
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        try:
+            if sig is not None and signal.getsignal(sig) is not signal.SIG_IGN:
+                signal.signal(sig, stop)
+        except (OSError, RuntimeError, ValueError):     # (not the main thread: an embedding caller)
+            pass
 
 
 def serve_on_screen(cfg_path: Path, a) -> int:
@@ -2392,7 +2964,7 @@ def serve_on_screen(cfg_path: Path, a) -> int:
     log = Path(info["log"]) if info.get("log") else None
     seen = log.stat().st_size if log is not None and log.is_file() else 0
     rc = S.UI.serve(cmd, env, info)
-    if rc not in (0, UPDATE_EXIT):
+    if rc not in (0, UPDATE_EXIT, RESTART_EXIT):
         last = last_line(log, seen)
         fail(f"Maya stopped: its server ended with exit code {rc}",
              (f"its engine's last line: {last} (the whole log: {log})" if last else "the reason is in its output")
@@ -2415,15 +2987,18 @@ def after_server(rc: int, a) -> int:
     """The server ended: its exit code - or About > Updates moved this folder to a new release, and the new version
     starts: its maya.py compiles what changed in the engine and loads the same model (the most recently used, so no
     question)."""
-    if rc != UPDATE_EXIT:
+    if rc not in (UPDATE_EXIT, RESTART_EXIT):
         return rc
     again = [sys.executable, str(HERE / "maya.py"), "--yes"]
-    for flag, v in (("--backend", a.backend), ("--port", a.port), ("--host", a.host), ("--api-key", a.api_key),
+    # (a new port from the dashboard: not this start's --port - the config's, which it saved, applies)
+    port = None if rc == RESTART_EXIT else a.port
+    for flag, v in (("--backend", a.backend), ("--port", port), ("--host", a.host), ("--api-key", a.api_key),
                     ("--gpu", a.gpu), ("--gpus", a.gpus), ("--config", getattr(a, "config", None))):
         if v is not None:
             again += [flag, str(v)]
     say()
-    say("  Updated from the dashboard: starting the new version ...")
+    say("  The port changed from the dashboard: starting Maya again on it ..." if rc == RESTART_EXIT else
+        "  Updated from the dashboard: starting the new version ...")
     sys.stdout.flush()
     if WIN:
         return subprocess.call(again)
@@ -2610,6 +3185,12 @@ BENCH_TOPICS = [
 ]
 
 
+def bench_exe(cfg: dict) -> Path:
+    """Which engine binary a HIP config's --bench should relaunch - config_family(cfg)'s target, through the same
+    exe_for_target every build step uses, so this can't drift out of sync with either."""
+    return exe_for_target("maya-ds4" if config_family(cfg) == "deepseek" else "maya")
+
+
 def bench(cfg_path: Path, version: str) -> int:
     """--bench: a standard speed test of the installed model on this PC - decode (writing an answer) on three
     questions and prefill (reading a prompt) at 2k and 8k tokens of this folder's docs - through the engine alone, the
@@ -2618,7 +3199,7 @@ def bench(cfg_path: Path, version: str) -> int:
     cfg = read_json(cfg_path)
     select_build_backend(cfg.get("backend", "cuda"))
     if cfg.get("backend") == "hip":
-        cfg["exe"] = str(EXE)
+        cfg["exe"] = str(bench_exe(cfg))
     port = cfg.get("port") or 8080
     try:
         urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
@@ -2749,7 +3330,14 @@ def setup_screen(a, asks: bool = True) -> bool:
 
 def set_up(a, prev: dict) -> Path | None:
     """Steps 1-8, then the tuning: the config written, or None when the model was not downloaded.  `prev`: the
-    config of the setup before (its answers are the defaults)."""
+    config of the setup before (its answers are the defaults).  The model comes first: GLM-5.3-Flash or DeepSeek-V4.1-
+    Flash-1017 (set_up_ds4), each then with the answers of its own setup before."""
+    family = choose_family(a, prev)
+    if config_family(prev) != family:
+        prev = next((c for c in map(read_json, configs()) if config_family(c) == family and
+                     c.get("backend", "cuda") == a.backend), {})
+    if family == "deepseek":
+        return set_up_ds4(a, prev)
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -2780,12 +3368,9 @@ def set_up(a, prev: dict) -> Path | None:
     vision = vision_step(a, pc, meta, llama, d, quant)  # 7
     cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash)   # 8
     if dflash is not None:                             # DFlash2: kept only if it makes THIS PC faster (measured)
-        if getattr(a, "no_speed_calibration", False):
-            c = read_json(cfg_path)
-            c.setdefault("installer", {})["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
-                                                                  "skipped": "--no-speed-calibration"}
-            cfg_path.write_text(json.dumps(c, indent=1), encoding="utf-8")
-            ok("speed calibration skipped (--no-speed-calibration): Maya drafts with DFlash2")
+        how = drafting_choice(a, "DFlash2", "5-20")
+        if how != "measure":                           # (or as the user chose)
+            keep_drafting(cfg_path, how == "on")
         else:
             if S.UI is not None:                       # (the screen shows it in the tuning's tab)
                 S.UI.step(9, "speed calibration: DFlash2 or the MTP block")
@@ -2808,6 +3393,550 @@ def set_up(a, prev: dict) -> Path | None:
     return cfg_path
 
 
+# ------------------------------------------------------------------------------------------------ DeepSeek-V4.1-Flash
+def ds4_maya_published(quant: str) -> bool:
+    """Whether Maya's quant of DeepSeek has its files in download_gguf.json (they are listed once uploaded)."""
+    q = ((read_json(DS4_GGUF_MANIFEST).get("maya") or {}).get("quants") or {}).get(DS4_QUANTS[quant]) or {}
+    return bool(q.get("files"))
+
+
+def ds4_gguf_model(quant: str) -> dict:
+    """A GGUF of DeepSeek as a MODELS entry (offer_download's form): its shards, sizes, sha256, repo folder - unsloth's,
+    or Maya's (the Engram tables in its own shards) - and "earlier": the layouts its files had before, each in the
+    same form (ds4_earlier)."""
+    man = read_json(DS4_GGUF_MANIFEST)
+    if quant in DS4_MAYA:
+        my = man.get("maya") or {}
+        q = (my.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
+        if not q.get("files"):
+            fail(f"{DS4} {DS4_QUANTS[quant]} is not published yet",
+                 f"set up unsloth's GGUF meanwhile: {ME} --setup --model {DS4} --ds4-quant gguf-q8")
+        about, repo, revision = (f"{DS4} {DS4_QUANTS[quant]}, Maya's quant ({q.get('about', 'the experts in 2-3 bits')})",
+                                 my["repo"], my["revision"])
+    else:
+        q = (man.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
+        if not q.get("files"):
+            fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
+        about, repo, revision = (f"{DS4} as unsloth's {DS4_QUANTS[quant]} GGUF (dense weights "
+                                 f"{'BF16' if quant == 'gguf-q8' else 'Q8_0'}, experts MXFP4, the Engram tables MXFP8)",
+                                 man["repo"], man["revision"])
+
+    def form(files: dict, rev: str) -> dict:
+        files = {Path(k).name: v for k, v in files.items()}
+        return {"about": about, "format": "ds4-gguf", "repo": repo, "revision": rev, "folder": DS4_QUANTS[quant],
+                "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
+                "download_gb": sum(v[0] for v in files.values()) / 1e9}
+    m = form(q["files"], revision)
+    m["earlier"] = [dict(form(e["files"], e["revision"]), engram=[form(s, e["revision"]) for s in e.get("engram") or []])
+                    for e in q.get("earlier") or []]
+    return m
+
+
+def ds4_earlier(m: dict, d: Path) -> dict | None:
+    """An earlier layout of m's files (ds4_gguf_model's "earlier") that d holds whole, used as it is - nothing
+    downloaded again: unsloth's GGUFs before they were re-sharded on 2026-10-19, or v1.1.16's Maya-S (its 4 shards, the
+    Engram tables apart: unsloth's MXFP8 shard of them in <...-GGUF>/Engram, either of its layouts; as "engram" the
+    folder then).  None: m's own files are whole, or no earlier layout is."""
+    if not any(file_incomplete(m, d / n) for n in m["files"]):
+        return None
+    for e in m.get("earlier") or []:
+        if any(file_incomplete(e, d / n) for n in e["files"]):
+            continue
+        if not e["engram"]:
+            return dict(e, engram=None, layout="earlier")
+        eg = d.parent / "Engram"
+        if any(not any(file_incomplete(s, eg / n) for n in s["files"]) for s in e["engram"]):
+            return dict(e, engram=eg, layout="earlier")
+    return None
+
+
+def ds4_unused(m: dict, d: Path) -> None:
+    """A note for the files of an earlier layout in d (and its Engram tables beside it), now that m's own are used: the
+    user may delete them."""
+    for where, names in ((d, [n for e in m.get("earlier") or [] for n in e["files"]]),
+                         (d.parent / "Engram", [n for e in m.get("earlier") or [] for s in e["engram"] for n in s["files"]])):
+        names = [n for n in dict.fromkeys(names) if (where / n).exists() and n not in m["files"]]
+        if names:
+            warn(f"{where}: {len(names)} file{'s' if len(names) != 1 else ''} of an earlier layout of the model, not "
+                 f"used - you can delete {'them' if len(names) != 1 else 'it'} ({', '.join(names[:2])}"
+                 f"{', ...' if len(names) > 2 else ''})")
+
+
+def ds4_drafter_model() -> dict:
+    """DeepSeek's DSpark drafter (the GGUFs leave it out) as offer_download's form: the three shards of DeepSeek's own
+    checkpoint that hold only its blocks (download_gguf.json's "drafter")."""
+    man = (read_json(DS4_GGUF_MANIFEST).get("drafter") or {})
+    if not man.get("files"):
+        fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
+    return {"about": "DeepSeek's DSpark drafter (it drafts a few tokens at a time for the model to check: faster "
+                     "answers on PCs where that pays - measured after the setup), from DeepSeek's own checkpoint",
+            "format": "ds4-drafter", "repo": man["repo"], "revision": man["revision"], "folder": "",
+            "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
+            "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
+
+
+def ds4_maya_drafter_model() -> dict | None:
+    """The DSpark drafter Maya ships (download_gguf.json's "maya" / "drafter": DeepSeek's FP4 experts as released, its
+    FP8 dense weights in Q8_0 - the formats the engine reads, nothing to convert) as offer_download's form, or None
+    while it is not pinned there."""
+    my = read_json(DS4_GGUF_MANIFEST).get("maya") or {}
+    dr = my.get("drafter") or {}
+    if not dr.get("files") or not my.get("revision"):
+        return None
+    files = {Path(k).name: v for k, v in dr["files"].items()}
+    return {"about": "the model's DSpark drafter (it drafts a few tokens at a time for the model to check: faster "
+                     "answers on PCs where that pays - measured after the setup), from Maya's repo: DeepSeek's FP4 "
+                     "experts, its dense weights in 8-bit", "format": "ds4-drafter", "repo": my["repo"],
+            "revision": my["revision"], "folder": "dspark",
+            "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
+            "download_gb": sum(v[0] for v in files.values()) / 1e9}
+
+
+def ds4_quant_drafter(quant: str) -> dict | None:
+    """A Maya quant's own DSpark drafter (download_gguf.json's maya / quants / <quant> / "drafter": e.g. Maya-XS's, its
+    experts in 2 bits) as offer_download's form plus "json" (its .json's name in dspark/), or None: the shared one."""
+    if quant not in DS4_MAYA:
+        return None
+    my = read_json(DS4_GGUF_MANIFEST).get("maya") or {}
+    dr = ((my.get("quants") or {}).get(DS4_QUANTS[quant]) or {}).get("drafter") or {}
+    if not dr.get("files") or not dr.get("json"):
+        return None
+    files = {Path(k).name: v for k, v in dr["files"].items()}
+    return {"about": f"{DS4_QUANTS[quant]}'s DSpark drafter ({dr.get('about', 'its own formats')})",
+            "format": "ds4-drafter", "repo": my["repo"], "revision": my["revision"], "folder": "dspark",
+            "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
+            "download_gb": sum(v[0] for v in files.values()) / 1e9, "json": dr["json"]}
+
+
+def ds4_drafter_step(a, d: Path, quant: str | None = None) -> bool:
+    """The DSpark drafter in d (beside the GGUFs' folders, shared by both): downloaded when it is not there, then made
+    the GGUF path's formats (tools/ds4/drafter_pack.py: dspark.bin) - its three shards are removed after that.  A quant
+    with its own drafter (ds4_quant_drafter) gets that one instead.  False: not there (not downloaded): the model runs
+    without it."""
+    own = ds4_quant_drafter(quant) if quant else None
+    if own is not None:
+        want = [d / n for n in own["files"]]
+        if any(file_incomplete(own, f) for f in want) and not offer_download(a, "the DSpark drafter", d, want, own):
+            warn("the DSpark drafter was not downloaded: the model runs without it")
+            return False
+        ok(f"the DSpark drafter: {d / own['json']}")
+        return True
+    if (d / "dspark.bin").is_file() and (d / "dspark.json").is_file():
+        ok(f"the DSpark drafter: {d / 'dspark.bin'}")
+        return True
+    mm = ds4_maya_drafter_model()
+    if mm is not None:                                  # (Maya's: ready to use, nothing to convert)
+        want = [d / n for n in mm["files"]]
+        if any(file_incomplete(mm, f) for f in want) and not offer_download(a, "the DSpark drafter", d, want, mm):
+            warn("the DSpark drafter was not downloaded: the model runs without it")
+            return False
+        ok(f"the DSpark drafter: {d / 'dspark.bin'}")
+        return True
+    m = ds4_drafter_model()
+    shards = [d / n for n in m["files"]]
+    if any(file_incomplete(m, f) for f in shards) and not offer_download(a, "the DSpark drafter", d, shards, m):
+        warn("the DSpark drafter was not downloaded: the model runs without it")
+        return False
+    say("  Converting the drafter to the GGUF's formats (exactly the same values; under a minute) ...")
+    run([sys.executable, str(ROOT / "tools" / "ds4" / "drafter_pack.py"), "--dir", str(d)])
+    if not (d / "dspark.bin").is_file():
+        fail("the drafter's conversion did not write dspark.bin", "the reason is in the messages above")
+    for f in shards:                                   # (the setup's own download, now in dspark.bin)
+        f.unlink(missing_ok=True)
+    ok(f"the DSpark drafter: {d / 'dspark.bin'}")
+    return True
+
+
+def ds4_vision_model() -> dict:
+    """DeepSeek's vision tower (the GGUFs leave it out; every GGUF of the model shares it) as offer_download's form:
+    shard 1 of DeepSeek's own checkpoint (only the tower and its aligner) and config.json (download_gguf.json's
+    "vision"; its "marks" - 30 KB of shard 2 - are read by tools/ds4/vision_pack.py)."""
+    man = (read_json(DS4_GGUF_MANIFEST).get("vision") or {})
+    if not man.get("files") or not man.get("marks"):
+        fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
+    return {"about": "DeepSeek's vision tower (it lets the model read pictures), from DeepSeek's own checkpoint",
+            "format": "ds4-vision", "repo": man["repo"], "revision": man["revision"], "folder": "",
+            "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
+            "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
+
+
+def ds4_vision_dir(d: Path) -> Path:
+    """The vision tower's folder: beside the GGUFs' folders (as the drafter's), shared by every quant there."""
+    return d.parent / "vision"
+
+
+def ds4_pack_has_vision(pack: Path) -> bool:
+    """The pack holds a vision tower (its geometry is in ds4.txt: pack.py's from the EXL3 model, pack_gguf.py's from
+    vision_pack.py's files)."""
+    try:
+        return any(line.startswith("vision.num_hidden_layers ")
+                   for line in (pack / "ds4.txt").read_text(encoding="utf-8", errors="replace").splitlines())
+    except OSError:
+        return False
+
+
+def ds4_vision_blocker(pc: dict) -> str | None:
+    """Why the vision tower cannot run on this PC, or None: it needs ~1 GB of RAM (its weights, streamed from there)
+    and ~350 MB of the first GPU's memory - every GPU the GGUF path runs on has the BF16 matrix products it uses."""
+    total = mem_gb()[0]
+    if 0 < total < 16:
+        return f"{total:.0f} GB of RAM is too little beside the model"
+    return None
+
+
+def ds4_vision_step(a, pc: dict, d: Path) -> bool:
+    """Step 7 for a GGUF: the vision tower in ds4_vision_dir(d) - downloaded when it is not there (shard 1 of
+    DeepSeek's checkpoint, 0.97 GB, and its config.json), then made the GGUF path's file (tools/ds4/vision_pack.py:
+    vision.bin, with the picture markers read from shard 2 by a 30 KB range request); the shard is removed after
+    that.  False: no vision tower (skipped, cannot run here, or not downloaded): the model reads text only."""
+    step(7, "images (the vision tower)")
+    if a.no_vision:
+        ok("skipped (--no-vision): the model reads text only")
+        return False
+    why = ds4_vision_blocker(pc)
+    if why:
+        ok(f"{why}: the model reads text only")
+        return False
+    v = ds4_vision_dir(d)
+    if (v / "vision.bin").is_file() and (v / "vision.json").is_file():
+        ok(f"the vision tower: {v / 'vision.bin'} (on the first GPU, about 320 MB of its memory, the weights streamed "
+           "from RAM; the server resizes the pictures)")
+        return True
+    if not os.access(existing(v), os.W_OK):
+        warn(f"{existing(v)} is not writable: no vision tower, the model reads text only")
+        return False
+    m = ds4_vision_model()
+    files = [v / n for n in m["files"]]
+    if any(file_incomplete(m, f) for f in files) and not offer_download(a, "the vision tower", v, files, m):
+        warn("the vision tower was not downloaded: the model reads text only")
+        return False
+    for f in files:                                    # (offer_download checked the ones it fetched; these too)
+        if not sha256_checked(f, m["sha256"][f.name]):
+            fail(f"{f}: the sha256 does not match the published one", "delete it and run the setup again")
+    say("  Reading the picture markers (30 KB of DeepSeek's shard 2, a range request) and copying the tower into one "
+        "file (exactly the same values; a few seconds) ...")
+    r = run([sys.executable, str(ROOT / "tools" / "ds4" / "vision_pack.py"), "--dir", str(v)], check=False)
+    if r.returncode != 0 or not (v / "vision.bin").is_file():
+        warn("the vision tower was not made (the reason is above): the model reads text only - the setup tries again "
+             "next time, without downloading the shard again")
+        return False
+    for f in files:                                    # (the setup's own download, now in vision.bin)
+        f.unlink(missing_ok=True)
+    ok(f"the vision tower: {v / 'vision.bin'} (on the first GPU, about 320 MB of its memory, the weights streamed from "
+       "RAM; the server resizes the pictures)")
+    return True
+
+
+def choose_ds4_quant(a, prev: dict) -> str:
+    """--ds4-quant, else the one set up before, else asked (the GGUF at Q8 recommended)."""
+    if getattr(a, "ds4_quant", None):
+        return a.ds4_quant
+    hip = getattr(a, "backend", None) == "hip"
+    maya = [k for k in DS4_MAYA if ds4_maya_published(k)]
+    # the EXL3 quants only where they run: NVIDIA V100 or newer (compute capability 7.0+; not AMD yet) - a PC whose
+    # GPUs are all older is not offered them (nvidia-smi silent: offered, the PC check says)
+    try:
+        ccs = [] if hip else [int(g["arch"]) for g in S.gpus()]
+    except Exception:  # noqa: BLE001 - no NVIDIA tools
+        ccs = []
+    exl3_ok = not hip and (not ccs or max(ccs) >= DS4_MIN_CC)
+    keys = maya + [k for k in DS4_QUANTS if k not in DS4_MAYA and (exl3_ok or k not in DS4_EXL3)]
+    before = (prev.get("installer") or {}).get("ds4_quant")
+    default = before if before in keys else maya[0] if maya else DS4_DEFAULT_QUANT
+    gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya}
+    label = {"maya-s": (f"Maya-S ({gb.get('maya-s', 0):.0f} GB)", "Maya's quant: experts in 2-3 bits, the most of it in memory"),
+             "maya-m": (f"Maya-M ({gb.get('maya-m', 0):.0f} GB)", "Maya's quant: experts in 3.4 bits, closer to the original"),
+             "maya-xs": (f"Maya-XS ({gb.get('maya-xs', 0):.0f} GB, experimental)",
+                         "Maya's smallest quant: experts in ~1.6 bits, the whole model in a 128 GB PC's memory"),
+             "gguf-q8": ("GGUF UD-Q8_K_XL (508 GB)", "dense weights BF16, experts MXFP4 (DeepSeek's own formats)"),
+             "gguf-q4": ("GGUF UD-Q4_K_XL (501 GB)", "dense weights Q8_0 (less VRAM), experts MXFP4"),
+             "exl3": ("EXL3 2.9 bits (414 GB)", "with the DSpark drafter and the vision tower"),
+             "exl3-3.5": (f"EXL3 3.5 bits ({ds4_model('exl3-3.5')['download_gb']:.0f} GB)",
+                          f"closer to the original, slower: ~{DS4_EXL3['exl3-3.5']['memory_gb']} GB of VRAM + RAM hold it")}
+    pick = choose(f"Which files of {DS4}?", ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
+                                             "the memory: the experts that do not", "fit in VRAM are read from RAM and "
+                                             "the SSD. The EXL3 quants need a V100 or newer and ~230 / ~280 GB of "
+                                             "VRAM + RAM:"],
+                  [(label[k][0], "recommended" if k == keys[0] else None, label[k][1]) for k in keys],
+                  keys.index(default), a.yes or a.check)
+    return keys[pick]
+
+
+def ds4_model(quant: str = "exl3") -> dict:
+    """The DeepSeek download as a MODELS entry (offer_download's form): every file, its size, sha256 and repo."""
+    q = DS4_EXL3[quant]
+    man = read_json(q["manifest"])
+    eg = man.get("engram") or {}
+    if not man.get("files") or not eg.get("files"):
+        fail(f"{q['manifest']} is missing or damaged", f"restore it (git checkout tools/ds4/{q['manifest'].name})")
+    both = {**man["files"], **eg["files"]}
+    return {"about": f"{DS4} in LibertAIDAI's EXL3 quant at {q['bits']} bits per weight (with its DSpark drafter and "
+                     "vision tower), and the two Engram tables of DeepSeek's base repo", "format": "ds4",
+            "repo": man["repo"], "revision": man["revision"], "folder": "",
+            "files": {k: v[0] for k, v in both.items()}, "sha256": {k: v[1] for k, v in both.items()},
+            "sources": {k: (eg["repo"], eg["revision"]) for k in eg["files"]},
+            "download_gb": sum(v[0] for v in both.values()) / 1e9}
+
+
+def ds4_shards(d: Path) -> list:
+    """The files a DeepSeek pack indexes (the EXL3 shards and the Engram tables, or a GGUF's shards)."""
+    return sorted(p for p in d.glob("*.safetensors")) or sorted(p for p in d.glob("*.gguf"))
+
+
+def ds4_dir(a, models: Path, prev: dict, quant: str = "exl3") -> Path:
+    """The model's folder: --model-dir, else the folder of the DeepSeek setup before when it holds the same files
+    (its pack is inside it), else <models folder>/DeepSeek-V4.1-Flash-1017 (a GGUF: .../DeepSeek-V4.1-Flash-1017-GGUF/
+    <its folder>)."""
+    if a.model_dir:
+        return Path(a.model_dir).expanduser().resolve()
+    args = prev.get("args") or []
+    if "--pack" in args[:-1] and (prev.get("installer") or {}).get("ds4_quant", "exl3") == quant:
+        d = Path(args[args.index("--pack") + 1]).parent
+        if (d / "config.json").exists() or (quant not in DS4_EXL3 and ds4_shards(d)):
+            return d
+    return models / DS4_EXL3[quant]["dir"] if quant in DS4_EXL3 else models / f"{DS4}-GGUF" / DS4_QUANTS[quant]
+
+
+def ds4_link_engram(d: Path, m: dict, models: Path, prev: dict):
+    """The Engram tables are the same for every EXL3 quant: missing in d but whole in another DeepSeek folder (the
+    other quant's folder, the configs' model folders), hard-linked from it - no second download, no second copy on the
+    disk - with its sha256 record.  Anything else (another drive: no hard link) leaves them to the download."""
+    dirs = [models / q["dir"] for q in DS4_EXL3.values()] + [Path(p) for p in
+            [((read_json(c).get("installer") or {}).get("model_dir")) for c in configs()] + [(prev.get("installer") or
+            {}).get("model_dir")] if p]
+    for name in (m.get("sources") or {}):
+        dst = d / name
+        if dst.exists():
+            continue
+        for o in dict.fromkeys(x.resolve() for x in dirs if x.exists()):
+            src = o / name
+            if o == d.resolve() or not src.exists() or src.stat().st_size != m["files"][name]:
+                continue
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                os.link(src, dst)
+            except OSError:
+                continue
+            seen = read_json(o / VERIFIED).get(name)
+            if seen:   # (a hard link: the same size and time - its check still holds)
+                book = read_json(d / VERIFIED)
+                book[name] = seen
+                try:
+                    (d / VERIFIED).write_text(json.dumps(book, indent=1), encoding="utf-8")
+                except OSError:
+                    pass
+            ok(f"{name}: linked from {o} (the same Engram table for every quant)")
+            break
+
+
+def ds4_model_step(a, d: Path, m: dict):
+    """The model's files in d (downloaded when they are not there): their list, or None when nothing was
+    downloaded."""
+    step(5, f"the model ({DS4})")
+    files = [d / n for n in m["files"]]
+    if any(file_incomplete(m, f) for f in files) and not offer_download(a, DS4, d, files, m):
+        return None
+    if m.get("format") == "ds4-gguf":
+        ok(f"{DS4} ({m['folder']}): {len(files)} files, {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}" +
+           (" - an earlier layout of its files, used as it is" if m.get("layout") == "earlier" else ""))
+        if m.get("engram"):
+            eg = sorted(m["engram"].glob("*.gguf"))
+            ok(f"the Engram tables: {m['engram']} ({sum(f.stat().st_size for f in eg) / 1e9:.1f} GB, unsloth's MXFP8 "
+               "shard of them from an earlier setup)")
+        if rotational(d):
+            warn(f"{d} is on a spinning hard disk: the engine reads experts and the Engram tables from it while it "
+                 "answers - use an NVMe SSD (--models-dir)")
+        return files
+    conf = read_json(d / "config.json")
+    method = (conf.get("quantization_config") or {}).get("quant_method")
+    if conf.get("model_type") != "deepseek_v41" or method != "exl3":
+        fail(f"{d / 'config.json'}: a {conf.get('model_type')!r} model quantized as {method!r}, not {DS4} in EXL3 "
+             "(deepseek_v41, exl3)")
+    ok(f"{DS4}: {len(files)} files, {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
+    if rotational(d):
+        warn(f"{d} is on a spinning hard disk: the engine reads the Engram tables from it for every token - use an "
+             "NVMe SSD (--models-dir)")
+    return files
+
+
+def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram: Path | None = None,
+                  files: list | None = None, drafter: Path | None = None) -> Path:
+    """tools/ds4/pack.py's pack in <model>/maya-ds4: the geometry, where every tensor sits in the safetensors (read
+    in place), the Engram hash tables and the tokenizer - built again when its tools or the model's files changed, or
+    (a GGUF) when the drafter or the vision tower arrived after it.  announce=False: no step heading (step 7 adds the
+    vision tower it just made).  files: a GGUF's shards (default: every .gguf in d; the folder may also hold an
+    earlier layout's).  engram: the folder of the Engram tables v1.1.16's Maya-S leaves out (ds4_earlier's) - a pack of
+    other files is built again."""
+    if announce:
+        step(6, "the pack (the engine's index of the model files)")
+    pack = d / "maya-ds4"
+    tools = S.source_hash(DS4_GGUF_PACK_TOOLS if gguf else DS4_PACK_TOOLS)
+    need = ("ds4.txt", "tensors.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
+    shards = list(files) if gguf and files else ds4_shards(d)
+    if gguf and engram is not None:                    # (v1.1.16's Maya-S: its Engram tables are beside it)
+        shards += sorted(engram.glob("*.gguf"))
+    drafter_new = gguf and (drafter or d.parent / "dspark" / "dspark.json").is_file() and not CDS.has_drafter(
+        {"args": ["--pack", str(pack)]})               # (the drafter arrived after the pack was built)
+    vision_new = gguf and (ds4_vision_dir(d) / "vision.json").is_file() and not ds4_pack_has_vision(pack)
+    if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and not drafter_new and \
+            not vision_new and all((pack / f).exists() for f in need) and pack_stale(pack, shards) is None:
+        ok(f"pack already built: {pack}")
+        return pack
+    if not os.access(d, os.W_OK):
+        fail(f"{d} is not writable: the pack is written inside the model's folder")
+    say(f"  Indexing every tensor of the {'GGUF' if gguf else 'safetensors'} (the weights stay where they are), the "
+        "Engram hash tables and the")
+    say("  tokenizer (about a minute) ...")
+    run([sys.executable, str(ROOT / "tools" / "ds4" / ("pack_gguf.py" if gguf else "pack.py")), "--model", str(d),
+         "--out", str(pack)] + (["--vision", str(ds4_vision_dir(d))] if gguf else []) +
+        (["--engram", str(engram)] if gguf and engram is not None else []) +
+        (["--drafter", str(drafter)] if gguf and drafter is not None else []) +
+        (["--shards"] + [Path(f).name for f in files] if gguf and files else []))
+    missing = [f for f in need if not (pack / f).exists()]
+    if missing:
+        fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
+    stamp_pack(pack, shards)
+    rec = read_json(pack / PACK_SOURCES)
+    rec["tools"] = tools
+    (pack / PACK_SOURCES).write_text(json.dumps(rec, indent=1), encoding="utf-8")
+    ok(f"pack: {pack}")
+    return pack
+
+
+def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path,
+                     quant: str = "exl3", vision: bool | None = None) -> Path:
+    """maya-ds4.json and run-maya-ds4.sh.  A setup again keeps what the config before says that this one does not
+    ask: the engine settings below, the thinking level and sampling, where the server listens and its key.  vision:
+    whether the engine runs the vision tower (default: the EXL3 quant's own; a GGUF's when its pack has one)."""
+    step(8, "the configuration and the start script")
+    port = a.port or 8080
+    hip = pc.get("backend") == "hip"
+    cfg_path = ROOT / ("maya-ds4-hip.json" if hip else "maya-ds4.json")
+    old = read_json(cfg_path)
+    args = ["--pack", str(pack), "--max-context", str(ctx), "--tp", "2"]
+    kept = keep_args(old.get("args") or [], args, ("--tp", "--prefill-chunk", "--reserve-mib", "--vram-experts",
+                                                    "--cpu-threads", "--threads", "--dspark", "--dspark-conf",
+                                                    "--expert-profile"))
+    if vision is None:                   # (a GGUF has none of its own: vision_pack.py's, when the pack has it)
+        vision = quant in DS4_EXL3 or ds4_pack_has_vision(pack)
+    try:   # (the EXL3 quant's vision tower: not before RTX 30 / A100 - a V100 runs the model, text only)
+        ccs = [int(g["arch"]) for g in pc.get("gpus", [])]
+    except (TypeError, ValueError, KeyError):
+        ccs = []
+    if vision and quant in DS4_EXL3 and ccs and min(ccs) < DS4_VISION_MIN_CC:
+        vision = False
+    if a.no_vision or not vision:
+        args += ["--vision", "off"]
+    if "--dspark" not in args[:-1] and CDS.has_drafter({"args": args}):
+        args += ["--dspark", "none"]                   # (until the speed calibration finds that drafting pays here)
+    if getattr(a, "vram_reserve_mib", None) is not None:   # given now: written, and a later setup keeps it
+        set_arg(args, "--reserve-mib", a.vram_reserve_mib)
+        ok(f"VRAM kept free on each GPU: {a.vram_reserve_mib} MiB (--vram-reserve-mib)")
+    elif hip and "--reserve-mib" not in args[:-1]:
+        mib = hip_reserve_mib(pc["gpus"])
+        set_arg(args, "--reserve-mib", mib)
+        ok(f"VRAM kept free on each GPU: {mib} MiB (the desktop and other programs on an AMD GPU allocate beside the "
+           "engine; --vram-reserve-mib changes it)")
+    cfg = {"exe": str(DS4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
+           **({"backend": "hip"} if hip else {}),
+           "model_name": DS4_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
+           "sampling": old.get("sampling") or dict(DS4_SAMPLING),
+           "reasoning_effort": old.get("reasoning_effort") or DS4_EFFORT,
+           "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
+    for k in ("host", "api_key", "cors_origins", "mcp_servers"):
+        if old.get(k) is not None:
+            cfg[k] = old[k]
+            kept.append(k)
+    env = {**(old.get("env") or {}), **parse_env(a.env)}
+    if env:
+        cfg["env"] = env
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if kept:
+        ok("kept from the config before: " + ", ".join(kept))
+    cfg["log"] = str(cfg_path.with_suffix(".log"))
+    cfg["installer"] = {"family": "deepseek", "models_dir": str(models), "quant": DS4, "ds4_quant": quant,
+                        "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
+    cal = saved_calibration(cfg, any_context=True)     # --tp and the CPU threads tuned on this PC for this quant before
+    if cal is not None and isinstance(cal.get("args"), dict):
+        had = [f for f in CAL4.KEYS if f in (old.get("args") or [])[:-1]]   # (the config before's own values win)
+        new = {k: v for k, v in cal["args"].items() if k not in had}
+        if new:
+            cfg["args"] = CAL4.apply(cfg["args"], new)
+            ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else "") +
+               f": {ds4_tuned(new)}")
+            if cal.get("context"):
+                ok(f"(tuned at context {cal['context']}: {ME} --calibrate tunes this context too)")
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    ok(f"config: {cfg_path}")
+    ok(f"start script: {write_run_script(cfg_path, port)}")
+    if ds4_seed_profile(cfg):
+        ok("expert profile: the pack starts from DeepSeek's shipped one (the most-routed experts placed in VRAM and "
+           "read ahead first); the engine adds what this PC routes to it")
+    return cfg_path
+
+
+def set_up_ds4(a, prev: dict) -> Path | None:
+    """DeepSeek-V4.1-Flash-1017's steps 1-8: the PC (Linux, RTX 30 / A100 or newer, the memory), the context, its
+    engine (build/maya-ds4), the files, the pack, the config.  No tuning: the engine balances its own split."""
+    inst = prev.get("installer") or {}
+    prev_args = prev.get("args") or []
+    prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
+    quant = choose_ds4_quant(a, prev)
+    gguf = quant not in DS4_EXL3
+    pc = check_pc(a, "deepseek", gguf, quant)          # 1
+    step(2, "your choices")                            # 2
+    ok(f"files: {DS4_QUANTS[quant]}" + (" (Maya's quant)" if quant in DS4_MAYA else " (unsloth's GGUF)" if gguf else
+                                        f" (LibertAIDAI's EXL3 quant at {DS4_EXL3[quant]['bits']} bits)"))
+    ctx = choose_context(a, prev_ctx, DS4_CONTEXTS, DS4_DEFAULT_CONTEXT)
+    ok(f"context: {ctx} tokens")
+    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
+              Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
+    d = ds4_dir(a, models, prev, quant)
+    ok(f"model folder: {d}")
+    llama = tools_step(a, PY_PACKAGES + ["tokenizers"])   # 3 (the pack's Engram token map normalizes with it)
+    meta = build_step(a, pc, llama, "maya-ds4")      # 4
+    m = ds4_gguf_model(quant) if gguf else ds4_model(quant)
+    if not gguf:                                       # (the Engram tables from the other EXL3 quant's folder)
+        ds4_link_engram(d, m, models, prev)
+    old = ds4_earlier(m, d) if gguf else None          # (an earlier layout of the files, whole: used as it is)
+    files = ds4_model_step(a, d, old or m)             # 5
+    if files is None:
+        return None
+    if gguf and old is None:
+        ds4_unused(m, d)
+    engram = old and old["engram"]                     # (v1.1.16's Maya-S: its Engram tables beside it)
+    drafter = gguf and ds4_drafter_step(a, d.parent / "dspark", quant)   # (the EXL3 quant has its own)
+    own = ds4_quant_drafter(quant) if gguf else None   # (Maya-XS: its own drafter beside the shared one)
+    dj = d.parent / "dspark" / own["json"] if own is not None and drafter else None
+    pack = ds4_pack_step(a, d, gguf, engram=engram, files=files, drafter=dj)   # 6
+    if gguf:                                           # 7 (DeepSeek's checkpoint's tower, added to the pack)
+        vision = ds4_vision_step(a, pc, d)
+        if vision and not ds4_pack_has_vision(pack):
+            pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj)
+        vision = vision and ds4_pack_has_vision(pack)
+    else:
+        step(7, "images (the vision tower)")
+        vision = not a.no_vision
+        if a.no_vision:
+            ok("skipped (--no-vision): the model reads text only")
+        else:
+            ok("the model's own vision tower runs in the engine, on the first GPU (about 320 MB of its memory, the "
+               "weights streamed from RAM); the server resizes the pictures")
+    cfg_path = write_config_ds4(a, pc, meta, pack, ctx, models, d, quant, vision)   # 8
+    if (drafter or not gguf) and CDS.has_drafter(read_json(cfg_path)):
+        how = drafting_choice(a, "The DSpark drafter", "10-30")
+        if how != "measure":
+            keep_drafting(cfg_path, how == "on")
+        else:
+            if S.UI is not None:
+                S.UI.step(9, "speed calibration: the DSpark drafter or none")
+            speed_calibration(cfg_path)
+    return cfg_path
+
+
 def set_up_and_serve(a, prev: dict) -> tuple | None:
     """On the setup's screen: the setup, then Maya running on the same screen - its server's output there, Ctrl+C
     stops it.  (The config, the server's exit code or None when it was not started), or None when the model was not
@@ -2824,6 +3953,8 @@ def maya_version() -> str:
 
 
 def main() -> int:
+    N.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engines read, for all it starts)
+    stop_signals()            # (SIGTERM / SIGHUP stop it as Ctrl+C does: the server it runs with it)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", choices=["cuda", "hip"], help="GPU backend (HIP: experimental gfx1100/gfx1201/gfx1151 on Linux and Windows)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
@@ -2835,8 +3966,18 @@ def main() -> int:
                     help="the setup in plain text, the answers typed (not on the setup's own screen)")
     ap.add_argument("--download-model", action="store_true",
                     help="download the model without asking (the commands and the size are still printed)")
-    ap.add_argument("--model", choices=list(MODELS), help=f"which download (default: asked, {next(iter(MODELS))} "
-                                                          "recommended)")
+    ap.add_argument("--model", choices=list(MODELS) + [DS4],
+                    help=f"which model (default: asked): {DS4}, or a GLM-5.3-Flash download ({next(iter(MODELS))} "
+                         "recommended)")
+    ap.add_argument("--model-dir", help=f"use {DS4}'s files you already have: their folder (a GGUF's shards, or the "
+                                        "EXL3 quant's files and the Engram shards 47 / 48 of DeepSeek's repo); it "
+                                        "must be writable - the pack is written inside it")
+    ap.add_argument("--ds4-quant", choices=list(DS4_QUANTS),
+                    help=f"{DS4}'s files: maya-s = Maya's quant (the experts in 2-3 bits; the default once "
+                         "published; maya-m: 3.4 bits, once published; maya-xs: ~1.6 bits, experimental, with its own "
+                         "2-bit drafter: the whole model in a 128 GB PC's memory), gguf-q8 = unsloth's UD-Q8_K_XL GGUF, gguf-q4 = its UD-Q4_K_XL "
+                         "(dense weights Q8_0: less VRAM), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
+                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer)")
     ap.add_argument("--draft", choices=list(DRAFTS),
                     help="how the model drafts: mtp = its MTP block (the default), dflash2 = a DFlash2 drafter "
                          f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA)")
@@ -2865,7 +4006,7 @@ def main() -> int:
                                    "other devices on your network (set --api-key too)")
     ap.add_argument("--api-key", help="require this key from API clients and the dashboard")
     ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
-                    help="an engine setting kept in the config, e.g. STRATA_GLM_RAM_HEADROOM_GB=4 (docs/SETTINGS.md)")
+                    help="an engine setting kept in the config, e.g. MAYA_GLM_RAM_HEADROOM_GB=4 (docs/SETTINGS.md)")
     ap.add_argument("--nvcc", help="the CUDA toolkit's nvcc to build with (default: the newest that fits your GPUs)")
     ap.add_argument("--host-compiler", help="the C++ compiler nvcc uses, e.g. g++-12 (when the default g++ is newer "
                                             "than your CUDA accepts)")
@@ -2879,14 +4020,20 @@ def main() -> int:
                                                          "minutes, with Maya stopped): decode on three questions and "
                                                          "prefill at 2k / 8k tokens; writes maya-bench.txt")
     ap.add_argument("--calibrate", action="store_true",
-                    help="tune the engine's CPU lane for this PC (the PCIe share and the CPU threads, ~10-15 minutes), "
-                         "then start the model (with --no-start: only tune)")
+                    help="tune the engine's CPU lane for this PC (the PCIe share and the CPU threads, ~10-15 minutes; "
+                         f"{DS4}: the tensor parallel groups and the CPU threads, an engine start each, ~25-40 "
+                         "minutes on 9 GPUs), then start the model (with --no-start: only tune)")
     ap.add_argument("--speed-calibration", action="store_true",
-                    help="measure on this PC whether the DFlash2 drafter decodes faster than the MTP block (sustained "
-                         "speed, ~5-20 minutes, the model loaded twice) and keep the faster; then start the model "
+                    help="measure on this PC whether the drafter (DFlash2, or DeepSeek's DSpark) decodes faster than "
+                         "without it (sustained speed, ~5-30 minutes, the model loaded twice) and keep the faster; "
+                         "then start the model "
                          "(with --no-start: only measure)")
+    ap.add_argument("--drafting", choices=("measure", "on", "off"),
+                    help="the drafter (DFlash2 with --draft dflash2, DeepSeek's DSpark): measure = the speed "
+                         "calibration keeps it only if it is faster on this PC (the default with --yes; asked "
+                         "otherwise), on = draft with it, off = without it - both skip the measuring")
     ap.add_argument("--no-speed-calibration", action="store_true",
-                    help="with --draft dflash2: keep DFlash2 without measuring it against the MTP block")
+                    help="the same as --drafting on: draft with the drafter without measuring it")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
                                               "for --bench or --report (default: most recently used)")
     a = ap.parse_args()
@@ -2904,7 +4051,7 @@ def main() -> int:
         sys.stdout.flush()
         os.execve("/bin/sh", ["/bin/sh", str(HERE / "maya.sh"), *sys.argv[1:]], dict(os.environ, MAYA_SH="1"))
     version = maya_version()
-    say(f"Project Maya v{version} - GLM-5.3-Flash on your own GPU(s).")
+    say(f"Project Maya v{version} - GLM-5.3-Flash or {DS4} on your own GPU(s).")
     if a.report:
         return report(version, a.backend, a.config)
     if a.bench:
@@ -2924,7 +4071,8 @@ def main() -> int:
         # nothing set up yet (START-MAYA.bat / ./maya.sh without --backend): HIP on a PC with a supported AMD GPU
         # and no NVIDIA one, e.g. Strix Halo
         a.backend = "hip" if not S.gpus() and any(g["arch"] in HIP_ARCHS for g in S.amd_gpus()) else "cuda"
-    setting_up = a.setup or a.check or a.gguf_dir or a.model or a.rebuild or a.repack or a.download_model
+    setting_up = a.setup or a.check or a.gguf_dir or a.model or a.model_dir or a.rebuild or a.repack or \
+        a.download_model
     if have and not setting_up and (a.calibrate or a.speed_calibration or not a.no_start):
         pick = have[0]
         if len(have) > 1:
@@ -2932,6 +4080,12 @@ def main() -> int:
             for i, c in enumerate(have, 1):
                 say(f"  {i}) {c.name}")
             pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
+        if a.speed_calibration and config_family(read_json(pick)) == "deepseek":
+            ok(f"{DS4}'s engine drafts with its DSpark block: nothing to tune here (--calibrate tunes its --tp and CPU "
+               "threads)")
+            a.speed_calibration = False
+            if a.no_start and not a.calibrate:
+                return 0
         if a.calibrate:
             refresh_engine(read_json(pick))            # (the engine the tuning measures is the current one)
             if not calibrate_config(pick):
@@ -2950,10 +4104,12 @@ def main() -> int:
         say("Nothing is set up yet: the setup runs first, then the tuning.")
     prev = read_json(have[0]) if have else {}
     if a.check:
-        pc = check_pc(a)
+        ds4 = a.model == DS4 or bool(a.model_dir)
+        quant = choose_ds4_quant(a, prev) if ds4 else None
+        pc = check_pc(a, "deepseek" if ds4 else "glm", gguf=ds4 and quant != "exl3")
         say()
         if a.backend == "hip":
-            pick = (f"--gpus {','.join(str(g['index']) for g in pc['gpus'])}" if len(pc["gpus"]) == 2
+            pick = (f"--gpus {','.join(str(g['index']) for g in pc['gpus'])}" if len(pc["gpus"]) > 1
                     else f"--gpu {pc['gpus'][0]['index']}")
             say(f"HIP prerequisites found. Run {ME} --backend hip {pick} to try the experimental port.")
         else:

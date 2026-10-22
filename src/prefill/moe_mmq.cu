@@ -4,6 +4,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 
 #include "common.cuh"
+#include "convert.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
 
@@ -238,5 +239,19 @@ void iota(int32_t* dst, int64_t n, void* stream) {
     iota_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(dst, n);
     ck(cudaGetLastError(), "iota");
 }
+
+bool to_f16_supported(int t) { return ggml_get_to_fp16_cuda((ggml_type) t) != nullptr; }
+
+bool to_f16(int t, const void* w, uint16_t* dst, int64_t n, void* stream) {
+    const to_fp16_cuda_t f = ggml_get_to_fp16_cuda((ggml_type) t);
+    if (f == nullptr) return false;
+    f(w, (half*) dst, n, (cudaStream_t) stream);
+    ck(cudaGetLastError(), "to_f16");
+    return true;
+}
+
+extern "C" void strata_mmq_pool_slab(int dev, void* base, size_t bytes);   // src/prefill/ggml_cuda_host.cu's pool
+
+void pool_slab(int dev, void* base, size_t bytes) { strata_mmq_pool_slab(dev, base, bytes); }
 
 }  // namespace strata::prefill::mmq

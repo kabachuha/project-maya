@@ -42,6 +42,7 @@
 namespace strata::kernels::glmf {
 struct MoeRequest;
 struct CpuAnswer;
+struct MoeDev;
 }  // namespace strata::kernels::glmf
 
 namespace strata::core {
@@ -160,6 +161,9 @@ public:
         int64_t fixed = 0;
     };
     std::vector<PoolVram> pool_vram() const;
+    /// Windows on an APU (AMD's Strix / Gorgon Halo): the bytes of experts the commit (RAM + page file) kept off the
+    /// GPU over every part, and the page file (GiB) that keeps them on it - {0, 0} elsewhere (pool_check)
+    std::pair<size_t, size_t> commit_capped() const;
     /// The CPU LANE (a decode's RAM-tier experts): the share of them copied over PCIe to the GPU instead of computed
     /// on the CPU - 0: the CPU takes every one, 1: none (of f such experts in a route, f - round(share f) go to the
     /// CPU).  pcie_share(): the split in use, as a share; set_pcie_share(s): this split from the next token on, s < 0
@@ -214,11 +218,22 @@ public:
     /// position; false (+ err) when that slot holds none.  ~150 MB a checkpoint for GLM-5.3-Flash's 34 KDA layers.
     bool ckpt_save(int slot, std::string& err);
     bool ckpt_restore(int slot, std::string& err);
+    /// The snapshot (the previous prompt's state, before its last token) copied into checkpoint `slot` on a side
+    /// thread, while the next prompt runs: the snapshot stays intact until that prompt's snapshot_save, which waits
+    /// for the copy (as every checkpoint call does).  A turn that starts within 512 tokens of the snapshot gets no
+    /// ckpt_save at its own start; this one costs the prompt nothing.  False (+ err) when it cannot start.
+    bool ckpt_save_snapshot(int slot, std::string& err);
     /// Conversation slots: the snapshot (its KDA states) and every DSA cache's rows up to its position, every half,
     /// written to a file; slot_load puts them back as the live state and the snapshot, so a conversation set aside
     /// while others ran continues where it was.  The bytes written, or 0 + err.
     uint64_t slot_save(const std::string& path, std::string& err);
     bool slot_load(const std::string& path, int64_t n_pos, std::string& err);
+    /// The same, in host RAM: the exact bytes the file version writes, in a caller-held buffer whose
+    /// lifetime is the conversation's (engine-side: the run's).  Nothing reaches the disk.  The bytes
+    /// written, or 0 + err (out of RAM, no snapshot).  slot_load takes the buffer back as the live
+    /// state and the snapshot; false + err on a mismatch or a truncated buffer.
+    uint64_t slot_save(std::vector<uint8_t>& data, std::string& err);
+    bool slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::string& err);
     /// Runs the engine's sampler on the last forward's logits and returns the picked token id
     /// (-1 + err on failure).  Handles the device bookkeeping: with a split the logits (and the
     /// sampler buffer) live on the tail half's device, where peer reads are not available.
@@ -227,6 +242,15 @@ public:
     /// sampler's device (the tail half's): one table per conversation slot (0 .. seq_count()-1), rewritten for each
     /// request that names one.  nullptr for an empty list (and nullptr + err on failure).
     const float* logit_bias_table(int slot, const std::vector<std::pair<int32_t, float>>& bias, std::string& err);
+    /// EVERY pick of the engine's sampler (sample_token, the windows, the several-conversation steps): T rows of
+    /// `logits` (n_vocab each, this part's device) -> out[0..T) on stream s.  A request with penalties (#273) gets each
+    /// row's history: row t counts the last penalty_last_n tokens of *sp.host_history (what the state was fed, the
+    /// window's first token last) followed by win[1 .. n0 + t] - the drafts before that row's position (win: the
+    /// window's tokens, nullptr for a lone pick; n0: the drafts before row 0, a pipelined window's token).  So a draft
+    /// stands only where it is the penalized pick: drafting counts exactly the history plain decode counts.  Without
+    /// penalties it is exactly the sample_tokens call the sites made before.
+    void pick_tokens(const float* logits, int T, const strata::kernels::SamplerParams& sp, const int32_t* win, int n0,
+                     int* out, cudaStream_t s);
     /// Zeroes R, every KDA state and every DSA cache: the next `forward` starts a fresh sequence.
     void reset();
 
@@ -251,10 +275,30 @@ public:
     bool vision_reclaim(std::string& err);
     size_t vision_lend_bytes() const;
     int32_t forced(int32_t sampled) {
-        const int32_t t = force_tok_ >= 0 ? force_tok_ : sampled;
+        int32_t t = force_tok_ >= 0 ? force_tok_ : sampled;
         force_tok_ = -1;
+        if (follow_at_ < follow_.size()) {   // --spec-follow: the continuation's token, whatever was picked
+            const int32_t f = follow_[follow_at_++];
+            follow_differ_ += f != t;
+            t = f;
+        }
         return t;
     }
+    /// --spec-follow (STRATA_GLM_SPEC_FOLLOW): the next decoded tokens are `ids`, one a position, instead of the picked
+    /// ones - every decode path takes them through forced(), so the speculative ones keep exactly the drafts that match
+    /// them.  Two builds or settings then decode the same text (the same windows, drafts and routes), which a speed
+    /// A/B needs: a near-tie flip otherwise changes the text and with it the draft acceptance.  Empty: off.
+    void set_follow(std::vector<int32_t> ids) {
+        follow_ = std::move(ids);
+        follow_at_ = 0;
+        follow_differ_ = 0;
+    }
+    /// The continuation's tokens decoded so far, and how many of them differ from the model's own pick.
+    size_t follow_used() const { return follow_at_; }
+    size_t follow_differ() const { return follow_differ_; }
+    /// The continuation's token k places after the one forced() returns next (-1: past its end, or no continuation) -
+    /// a decode that checks a whole window of drafts before it emits any (DFlash2) compares them with these.
+    int32_t follow_peek(size_t k) const { return follow_at_ + k < follow_.size() ? follow_[follow_at_ + k] : -1; }
 
 private:
     bool step(int32_t token, std::string& err);   // one token through all layers
@@ -272,6 +316,8 @@ private:
     int64_t pos_ = 0;
     int64_t max_ctx_ = 0;
     bool loaded_ = false;
+    std::vector<int32_t> follow_;                 // set_follow: the continuation; follow_at_ its next token
+    size_t follow_at_ = 0, follow_differ_ = 0;
 
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
@@ -389,11 +435,11 @@ public:
         // EXL3 experts (exl3.txt, x_cb >= 0): expert e's part r (gate, up, down) piece j (trellis, suh, svh) lies at
         // x_off[9 e + 3 r + j] of shard x_shard[...]; the blob is [gate | up | down], a part [trellis | suh | svh]
         int x_cb = -1;
-        int x_K[3] = {0, 0, 0}, x_k[3] = {0, 0, 0}, x_n[3] = {0, 0, 0};
+        int x_k2[3] = {0, 0, 0}, x_k[3] = {0, 0, 0}, x_n[3] = {0, 0, 0};   // x_k2: each part's bitrate as 2 K
         std::vector<int> x_shard;
         std::vector<uint64_t> x_off;
         size_t x_piece(int r, int j) const {
-            return j == 0 ? (size_t) x_k[r] * (size_t) x_n[r] * (size_t) x_K[r] / 8
+            return j == 0 ? (size_t) x_k[r] * (size_t) x_n[r] * (size_t) x_k2[r] / 16
                           : 2 * (size_t) (j == 1 ? x_k[r] : x_n[r]);
         }
         size_t x_part(int r) const { return x_piece(r, 0) + x_piece(r, 1) + x_piece(r, 2); }
@@ -497,18 +543,33 @@ public:
     int last_tok_ = -1;                                    // the greedy argmax of the last fast forward
     const strata::kernels::SamplerParams* mtp_sample_ = nullptr;   // decode_spec, STRATA_GLM_SPEC_SAMPLE: fast_mtp DRAWS
     int32_t force_tok_ = -1;                               // force_next()
+    // pick_tokens' penalty rows (this part's, allocated with the first request that has penalties): a ring of
+    // kPenRows rows of pen_w_ tokens, pinned + device, each row's event recorded behind the pick that read it (the
+    // picks of several conversations, a pipelined window's tokens, can be in flight at once)
+    static constexpr int kPenCap = 4096;                   // the penalty window at most (penalty_last_n beyond it: 4096)
+    static constexpr int kPenRows = 64;
+    int32_t* pen_h_ = nullptr;
+    int32_t* pen_d_ = nullptr;
+    int pen_w_ = 0, pen_next_ = 0;
+    cudaEvent_t pen_ev_[kPenRows] = {};
+    std::mutex pen_mu_;                                    // (a pipelined window picks from its last part's thread)
+    bool pen_alloc(int w, std::string& err);
+    void pen_free();
     std::map<std::string, const uint16_t*> w16_;           // the pack's big BF16 rows, kept BF16 (fast mode)
     bool fast_setup(std::string& err);
     bool fast_setup_finish(std::string& err);
     bool dual_prefill_ready();   // STRATA_GLM_DUAL_PREFILL (glm_prefill.cu)
     int dual_pf_state_ = 0;      // 0 not tried, 1 on, -1 off
+    bool calc_prefill_ready();   // STRATA_GLM_PREFILL_CALC (glm_prefill.cu)
+    int calc_pf_state_ = 0;      // 0 not tried, 1 on, -1 off
     void ram_left_check() const;
     void fast_destroy();
     bool forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err);
     bool fast_token(int32_t token, std::string& err);
     bool fast_layers(int64_t p, bool hop_in, std::string& err);
     bool fast_dsa(int il, int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
-    bool fast_moe(int il, bool& pf_pending, std::string& err);   // one MoE FFN (x -> ffn)
+    bool fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wait = true);   // one MoE FFN (x -> ffn)
+    bool moe_defer_wait_ = false;                            // (fast_moe's cpu_wait = false: the caller waits)
     // ... its routed experts, once the router and the shared expert's gate / up have run: the token path's own
     // activations, or one row of a batched step's (multi_rows)
     struct MoeIo {
@@ -520,7 +581,14 @@ public:
         float* ffn;
     };
     bool fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, const float* const* ah_bias, bool& pf_pending,
-                          std::string& err);
+                          std::string& err, bool rows = false);   // rows: a batched step's row (STRATA_GLM_SKIP_EMPTY)
+    // ... its route (moe_route with the token path's settings) into md's plan, the shared expert's h to sh_hq; win /
+    // win_n / win_rows: a grouped batched step's row and rows (glm_rows.cu)
+    void fast_moe_route(int il, const MoeIo& io, const strata::kernels::glmf::MoeDev& md, void* sh_hq, bool pred,
+                        int n_ah, const float* const* ah_bias, bool lane, int win = 0, int win_n = 0, int win_rows = 0);
+    // STRATA_GLM_GROUP_EXPERTS: the routed experts of a batched step's n rows, each distinct one once for its rows
+    // (glm_rows.cu); false with err empty: not here (the rows go one by one)
+    bool rows_moe_grouped(int il, int n, std::string& err);
     void fast_service();
     // gate / up / down of one expert from the shards (or its chunk-th of n_chunks pieces)
     void fast_read_part(int il, int e, int role, uint8_t* blob, int chunk = 0, int n_chunks = 1);
@@ -558,6 +626,8 @@ public:
     std::vector<std::vector<float>> ckpt_buf_;             // ckpt_save's checkpoints (this half): KDA runs, pool rows
     std::vector<int64_t> ckpt_pos_;                        // ... their positions (-1: none)
     void ckpt_pool_copy(int64_t pos, float* host, bool restore);   // the open pool's rows at pos <-> host
+    std::thread ckpt_th_;                                  // ckpt_save_snapshot's copy (every half's, on this one)
+    void ckpt_join() { if (ckpt_th_.joinable()) ckpt_th_.join(); }
     std::string pack_dir_;
     std::string profile_path_;                             // --expert-profile (empty: the pack's own files)
     std::vector<std::pair<int32_t, int32_t>> profile_;     // its ranked (layer, expert) pairs, read by fast_setup
@@ -647,6 +717,8 @@ public:
     float* spec_hop_h_[2] = {nullptr, nullptr};            // pinned hop slots by position parity
     cudaEvent_t spec_ev_hop_[2] = {nullptr, nullptr};
     bool spec_kda_copy(bool restore);
+    size_t spec_kda_bytes() const;                         // the head's saved recurrent states on this part
+    bool spec_kda_reserve(std::string& err);               // ... taken at setup, before the expert pool
     // the speculative decode on a split of more than two parts: the HEAD GROUP is this part and the ones after it
     // up to spec_head_last() (STRATA_GLM_SPEC_HEAD=<parts>, default half), the TAIL GROUP the rest; each group runs
     // its parts one after another and the two groups overlap as the two halves of a two-part split do
@@ -746,6 +818,8 @@ public:
     /// sequence's position advances by one.  n <= rows_max().
     bool rows_ok() const { return rows_ != nullptr && n_parts_ == 1 && split_next_ == nullptr && fast_ != nullptr; }
     static int rows_max();
+    /// STRATA_GLM_SPLIT_ROWS as the scheduler and the parts' setup both take it: 0 (off) .. rows_max()
+    static int split_rows_setting();
     bool multi_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
                     int* tokens_out, std::string& err);
     /// LAYER SPLIT (glm_rows.cu): one token of each of n sequences through every part as one batched step per part,
@@ -843,6 +917,9 @@ public:
     // ---- the batched prompt path (src/core/glm_prefill.cu)
     struct PrefillState;
     PrefillState* pf_ = nullptr;
+    // STRATA_GLM_PREFILL_CALC: this (waiting) part's share of another part's MoE layer, enqueued on this GPU
+    struct CalcJob;
+    bool prefill_calc(const CalcJob& job, std::string& err);
     bool prefill_setup(std::string& err);                  // in fast_setup: sizes, host buffers (no device memory)
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
     size_t prefill_trim_prestage(size_t max_borrow);       // ... at most this many: a smaller prestage buffer (the new bytes)
@@ -879,7 +956,12 @@ public:
     PoolBudget part_budget(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) const;   // ... less pool_short_
     void pool_check(size_t floor_b, size_t slot_b, size_t all_b);   // auto: the budget written once, free VRAM read again
     size_t pool_short_ = 0;                                // what that check found short of the reserve
+    size_t commit_kept_ = 0, commit_limit_ = 0, commit_ram_ = 0;   // (a Windows APU: what the commit kept off, as read)
     PoolBudget pool_b_;                                    // the budget the pool was carved from
+    static size_t mmq_scratch_reserve();      // ... of which the prompt path's MMQ scratch pool needs this much
+    // the slots a layer must keep while the pool lends the prompt path: one route's experts, the device's spares, +2
+    // (Strata's floor); STRATA_GLM_PREFILL_KEEP lowers it, never below route + spares
+    static int pool_keep(int n_exp_used);
     bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder
     bool vis_lent_ = false;                                // ... and is with it now (freed)

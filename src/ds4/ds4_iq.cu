@@ -1,0 +1,1297 @@
+// src/ds4/ds4_iq.cu - a GGUF's low-bit routed experts on the device (see ds4_iq.cuh).  The block layouts and grids are
+// ggml's (ggml-common.h, MIT, third_party/ggml/LICENSE); the sign and grid tricks are llama.cpp's vecdotq.cuh.
+#include "ds4_iq.cuh"
+
+#include <cuda_fp16.h>
+#if !defined(STRATA_USE_HIP)
+#include <mma.h>
+#endif
+// rocWMMA (the prompt sets on RDNA 3 / 4's matrix cores) as glm_batch.cu reads it: a device pass for gfx11 / gfx12
+// only, the host pass when the build targets such a card (STRATA_HAS_WMMA)
+#if defined(STRATA_USE_HIP) && \
+    ((!(defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && STRATA_HAS_WMMA) || \
+     ((defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && (defined(__gfx1100__) || defined(__gfx1101__) || \
+      defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__))))
+#define DS4_ROCWMMA 1
+#pragma push_macro("__shfl_xor_sync")
+#undef __shfl_xor_sync
+#pragma push_macro("__shfl_down_sync")
+#undef __shfl_down_sync
+#pragma push_macro("__shfl_up_sync")
+#undef __shfl_up_sync
+#pragma push_macro("__shfl_sync")
+#undef __shfl_sync
+#include <rocwmma/rocwmma.hpp>
+#pragma pop_macro("__shfl_xor_sync")
+#pragma pop_macro("__shfl_down_sync")
+#pragma pop_macro("__shfl_up_sync")
+#pragma pop_macro("__shfl_sync")
+#else
+#define DS4_ROCWMMA 0
+#endif
+
+#define GGML_COMMON_DECL_CUDA
+#define GGML_COMMON_IMPL_CUDA
+#include "ggml-common.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+
+namespace strata::ds4::gguf::iq {
+namespace {
+
+constexpr int kWarps = 8, kThreads = kWarps * 32;
+
+// ---------------------------------------------------------------- the types
+template <int T>
+struct Ty;
+template <> struct Ty<kIQ2_XXS> { static constexpr int B = 66, TAB = 512, MIN = 0; };
+template <> struct Ty<kIQ2_S> { static constexpr int B = 82, TAB = 2048, MIN = 0; };
+template <> struct Ty<kIQ3_XXS> { static constexpr int B = 98, TAB = 256, MIN = 0; };
+template <> struct Ty<kIQ3_S> { static constexpr int B = 110, TAB = 512, MIN = 0; };
+template <> struct Ty<kIQ4_XS> { static constexpr int B = 136, TAB = 4, MIN = 0; };
+template <> struct Ty<kQ4_K> { static constexpr int B = 144, TAB = 0, MIN = 1; };
+template <> struct Ty<kQ2_K> { static constexpr int B = 84, TAB = 0, MIN = 1; };
+template <> struct Ty<kQ3_K> { static constexpr int B = 110, TAB = 0, MIN = 0; };
+template <> struct Ty<kIQ1_S> { static constexpr int B = 50, TAB = 2048, MIN = 0; };   // (iq1s_grid_gpu)
+template <> struct Ty<kIQ1_M> { static constexpr int B = 56, TAB = 2048, MIN = 0; };
+// MXFP4 (ds4_gguf.cu's own kernels everywhere else): a block of 32 values, an E8M0 scale then 16 code bytes; the light
+// sets take it too
+constexpr int kMXFP4 = 39;
+template <> struct Ty<kMXFP4> { static constexpr int B = 17, TAB = 0, MIN = 0; };
+template <int T> constexpr int kQK = T == kMXFP4 ? 32 : 256;   // values a block
+static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_s) == 82 && sizeof(block_iq3_xxs) == 98 &&
+                  sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 && sizeof(block_q4_K) == 144 &&
+                  sizeof(block_q2_K) == 84 && sizeof(block_q3_K) == 110 && sizeof(block_iq1_s) == 50 &&
+                  sizeof(block_iq1_m) == 56,
+              "ggml's block sizes");
+static_assert(IQ1S_DELTA == 0.125f && IQ1M_DELTA == 0.125f, "IQ1's delta: the codes 8 g +- 1 below");
+
+template <int T>
+__host__ __device__ __forceinline__ size_t row_bytes_t(int k) { return (size_t) (k / kQK<T>) * Ty<T>::B; }
+
+// the type's codebook into shared memory (u32 words; IQ4_XS: its 16 values, from bytes - an int8 table's alignment)
+template <int T>
+__device__ __forceinline__ void load_tab(uint32_t* tab) {
+    if constexpr (T == kIQ4_XS) {
+        if (threadIdx.x < 4) {
+            const uint8_t* kv = (const uint8_t*) kvalues_iq4nl + 4 * threadIdx.x;
+            tab[threadIdx.x] = (uint32_t) kv[0] | (uint32_t) kv[1] << 8 | (uint32_t) kv[2] << 16 | (uint32_t) kv[3] << 24;
+        }
+    } else if constexpr (Ty<T>::TAB > 0) {
+        const uint32_t* src = T == kIQ2_XXS                  ? (const uint32_t*) iq2xxs_grid
+                              : T == kIQ2_S                   ? (const uint32_t*) iq2s_grid
+                              : T == kIQ3_XXS                 ? (const uint32_t*) iq3xxs_grid
+                              : T == kIQ1_S || T == kIQ1_M    ? (const uint32_t*) iq1s_grid_gpu
+                                                              : (const uint32_t*) iq3s_grid;
+        for (int i = threadIdx.x; i < Ty<T>::TAB; i += blockDim.x) tab[i] = src[i];
+    }
+}
+
+__device__ __forceinline__ uint32_t ld2(const uint8_t* p) {   // 4 bytes from a 2-byte aligned address
+    const uint16_t* q = (const uint16_t*) p;
+    return (uint32_t) q[0] | ((uint32_t) q[1] << 16);
+}
+__device__ __forceinline__ uint32_t ld4(const uint8_t* p) { return *(const uint32_t*) p; }
+__device__ __forceinline__ float h2f(const uint8_t* p) { return __half2float(__ushort_as_half(*(const uint16_t*) p)); }
+// 7 sign bits (bits 0..6 of v) -> the 8 signs, bit 7 their parity (ggml's ksigns_iq2xs)
+__device__ __forceinline__ uint32_t ksigns8(uint32_t v) {
+    v &= 127u;
+    return v | ((__popc(v) & 1u) << 7);
+}
+// 4 grid bytes with the signs of bits 0..3 of b applied (bit i: byte i negative) - llama.cpp's HIP form, cheap where the
+// SIMD byte instructions (__vcmpne4 / __vsub4) are emulated (Volta, RDNA): every grid byte is nonzero and <= 62, so
+// (g ^ 0xff) + 1 = -g in each byte with no carry into the next
+__device__ __forceinline__ int sgn4(uint32_t g, uint32_t b) {
+    const uint32_t lo = (((b & 15u) * 0x10204080u) & 0x80808080u) >> 7;
+    return (int) ((g ^ (lo * 255u)) + lo);
+}
+__device__ __forceinline__ int2 tab16(uint32_t q4, const uint32_t* t) {   // vecdotq's get_int_from_table_16
+    uint32_t tmp[2];
+    const uint32_t sel = 0x32103210u | ((q4 & 0x88888888u) >> 1);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const uint32_t sh = 16 * i;
+        const uint32_t lo = __byte_perm(t[0], t[1], q4 >> sh), hi = __byte_perm(t[2], t[3], q4 >> sh);
+        tmp[i] = __byte_perm(lo, hi, sel >> sh);
+    }
+    return make_int2((int) __byte_perm(tmp[0], tmp[1], 0x6420), (int) __byte_perm(tmp[0], tmp[1], 0x7531));
+}
+// IQ1_S / IQ1_M: 4 grid values as their int8 codes 8 g +- 1 (g in {-1, 0, 1}) - n holds g + 1 (iq1s_grid_gpu's nibble)
+// times 8 in bits 3..6 of each byte (0, 8 or 16); bias 0x79 (delta +1/8: 8 n - 7) or 0x77 (-1/8: 8 n - 9) a byte, its
+// top bit flipped back after: each byte's sum stays below 0x100, so nothing carries into the next
+__device__ __forceinline__ int iq1c(uint32_t n8, uint32_t bias) { return (int) (((n8 & 0x78787878u) + bias) ^ 0x80808080u); }
+__device__ __forceinline__ uint32_t iq1_bias(uint32_t neg) { return neg ? 0x77777777u : 0x79797979u; }
+// IQ1_M's F16 block scale: the top nibbles of its 4 scale words (s01: words 0, 1; s23: words 2, 3)
+__device__ __forceinline__ float iq1m_d(uint32_t s01, uint32_t s23) {
+    const uint32_t u = ((s01 >> 12) & 0xFu) | ((s01 >> 24) & 0xF0u) | ((s23 >> 4) & 0xF00u) | ((s23 >> 16) & 0xF000u);
+    return __half2float(__ushort_as_half((unsigned short) u));
+}
+__device__ __forceinline__ int q3k_scale(const uint8_t* sc, int is) {
+    const int lo = is < 8 ? sc[is] & 15 : sc[is - 8] >> 4;
+    const int hi = (sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3;
+    return (lo | (hi << 4)) - 32;
+}
+__device__ __forceinline__ void q4k_scale(const uint8_t* q, int j, int& d, int& m) {   // ggml's get_scale_min_k4
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+// a 32-value sub-block (kb: its index in the row) as 32 int8 codes and its scales: weight i = d s q_i - m, s and m of
+// its half (i < 16: s0, m0; else s1, m1)
+struct Sub {
+    int q[8];
+    float d, m0, m1;
+    int s0, s1;
+};
+// IQ1_S / IQ1_M: a sub-block's bytes as 4 words, apart from their decode (the token kernels load the next sub-block's
+// while they decode this one's: a step of these small blocks is mostly the loads' latency) - IQ1_S: its qs word, its
+// qh, d's F16 bits; IQ1_M: its qs word, its two qh bytes, the 4 scale words (d's nibbles in their tops)
+struct Raw1 {
+    uint32_t q4, h, s01, s23;
+};
+template <int T>
+__device__ __forceinline__ void iq1_load(const uint8_t* __restrict__ row, int kb, Raw1& r) {
+    const int ib = kb & 7;
+    const uint8_t* b = row + (size_t) (kb >> 3) * Ty<T>::B;
+    if constexpr (T == kIQ1_S) {   // d, qs[32], qh[8] (u16: 4 x 3 index bits, the scale, the delta's sign)
+        r.q4 = ld2(b + 2 + 4 * ib);
+        r.h = *(const uint16_t*) (b + 34 + 2 * ib);
+        r.s01 = *(const uint16_t*) b;
+        r.s23 = 0;
+    } else {   // qs[32], qh[16] (a byte for two groups of 8), scales[8] (+ d's nibbles)
+        r.q4 = ld4(b + 4 * ib);
+        r.h = *(const uint16_t*) (b + 32 + 2 * ib);
+        r.s01 = ld4(b + 48);
+        r.s23 = ld4(b + 52);
+    }
+}
+template <int T>
+__device__ __forceinline__ void iq1_decode(const Raw1& r, int kb, const uint32_t* tab, Sub& s) {
+    const int ib = kb & 7;
+    if constexpr (T == kIQ1_S) {
+        const uint32_t bias = iq1_bias(r.h & 0x8000u);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t g = tab[((r.q4 >> (8 * l)) & 255u) | (((r.h >> (3 * l)) & 7u) << 8)];
+            s.q[2 * l] = iq1c(g << 3, bias);       // values 8 l .. 8 l + 3: the low nibbles
+            s.q[2 * l + 1] = iq1c(g >> 1, bias);   // 8 l + 4 .. 8 l + 7: the high ones
+        }
+        s.s0 = s.s1 = 2 * (int) ((r.h >> 12) & 7u) + 1;
+        s.d = __half2float(__ushort_as_half((unsigned short) r.s01)) * 0.125f;
+    } else {
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {   // group l: index bits 4 l .. 4 l + 2 of h, the delta's sign bit 4 l + 3
+            const uint32_t g = tab[((r.q4 >> (8 * l)) & 255u) | (((r.h >> (4 * l)) & 7u) << 8)];
+            const uint32_t bias = iq1_bias((r.h >> (4 * l + 3)) & 1u);
+            s.q[2 * l] = iq1c(g << 3, bias);
+            s.q[2 * l + 1] = iq1c(g >> 1, bias);
+        }
+        const uint32_t w = ((ib >> 1) < 2 ? r.s01 : r.s23) >> (16 * ((ib >> 1) & 1) + 6 * (ib & 1));
+        s.s0 = 2 * (int) (w & 7u) + 1;          // values 0..15
+        s.s1 = 2 * (int) ((w >> 3) & 7u) + 1;   // 16..31
+        s.d = iq1m_d(r.s01, r.s23) * 0.125f;
+    }
+    (void) ib;
+}
+template <int T>
+__device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, const uint32_t* tab, Sub& s) {
+    const int ib = kb & 7;
+    const uint8_t* b = row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B;
+    if constexpr (T == kMXFP4) {   // codes: value j in byte j's low nibble, j + 16 in its high one (any alignment)
+        const uint32_t t[4] = {0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu};   // ggml's kvalues_mxfp4
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint8_t* q = b + 1 + 4 * i;
+            const int2 v = tab16((uint32_t) q[0] | (uint32_t) q[1] << 8 | (uint32_t) q[2] << 16 | (uint32_t) q[3] << 24, t);
+            s.q[i] = v.x;
+            s.q[4 + i] = v.y;
+        }
+        const uint32_t e = b[0];   // 2^(e - 128): ggml's GGML_E8M0_TO_FP32_HALF (the codes are the E2M1 values doubled)
+        s.d = __uint_as_float(e < 2 ? 0x00200000u << e : (e - 1) << 23);
+        s.s0 = s.s1 = 1;
+        (void) ib;
+        (void) tab;
+    } else if constexpr (T == kIQ2_XXS) {
+        const uint8_t* q = b + 2 + 8 * ib;
+        const uint32_t a0 = ld2(q), a1 = ld2(q + 4);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint2 g = ((const uint2*) tab)[(a0 >> (8 * l)) & 255u];
+            const uint32_t sg = ksigns8(a1 >> (7 * l));
+            s.q[2 * l] = sgn4(g.x, sg);
+            s.q[2 * l + 1] = sgn4(g.y, sg >> 4);
+        }
+        s.s0 = s.s1 = 2 * (int) (a1 >> 28) + 1;
+        s.d = h2f(b) * 0.125f;
+    } else if constexpr (T == kIQ2_S) {
+        const uint8_t* qs = b + 2;
+        const uint32_t i4 = ld2(qs + 4 * ib), sg4 = ld2(qs + 32 + 4 * ib), h = b[66 + ib], sc = b[74 + ib];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint2 g = ((const uint2*) tab)[((i4 >> (8 * l)) & 255u) | ((h << (8 - 2 * l)) & 0x300u)];
+            const uint32_t sg = sg4 >> (8 * l);
+            s.q[2 * l] = sgn4(g.x, sg);
+            s.q[2 * l + 1] = sgn4(g.y, sg >> 4);
+        }
+        s.s0 = 2 * (int) (sc & 15) + 1;
+        s.s1 = 2 * (int) (sc >> 4) + 1;
+        s.d = h2f(b) * 0.125f;
+    } else if constexpr (T == kIQ3_XXS) {
+        const uint8_t* qs = b + 2;
+        const uint32_t w0 = ld2(qs + 8 * ib), w1 = ld2(qs + 8 * ib + 4), aux = ld2(qs + 64 + 4 * ib);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t w = l < 2 ? w0 : w1, sh = 16 * (l & 1);
+            const uint32_t sg = ksigns8(aux >> (7 * l));
+            s.q[2 * l] = sgn4(tab[(w >> sh) & 255u], sg);
+            s.q[2 * l + 1] = sgn4(tab[(w >> (sh + 8)) & 255u], sg >> 4);
+        }
+        s.s0 = s.s1 = 2 * (int) (aux >> 28) + 1;
+        s.d = h2f(b) * 0.25f;
+    } else if constexpr (T == kIQ3_S) {
+        const uint8_t* qs = b + 2;
+        const uint32_t w0 = ld2(qs + 8 * ib), w1 = ld2(qs + 8 * ib + 4), h = b[66 + ib], s4 = ld2(b + 74 + 4 * ib);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t w = l < 2 ? w0 : w1, sh = 16 * (l & 1);
+            const uint32_t i1 = ((w >> sh) & 255u) | ((h << (8 - 2 * l)) & 256u);
+            const uint32_t i2 = ((w >> (sh + 8)) & 255u) | ((h << (7 - 2 * l)) & 256u);
+            const uint32_t sg = s4 >> (8 * l);
+            s.q[2 * l] = sgn4(tab[i1], sg);
+            s.q[2 * l + 1] = sgn4(tab[i2], sg >> 4);
+        }
+        s.s0 = s.s1 = 1 + 2 * (int) ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 15);
+        s.d = h2f(b);
+    } else if constexpr (T == kIQ4_XS) {
+        const uint32_t sh = *(const uint16_t*) (b + 2);
+        const int ls = ((b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 15) | (((sh >> (2 * ib)) & 3) << 4);
+        const uint8_t* qs = b + 8 + 16 * ib;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int2 v = tab16(ld4(qs + 4 * t), tab);
+            s.q[t] = v.x;
+            s.q[4 + t] = v.y;
+        }
+        s.s0 = s.s1 = ls - 32;
+        s.d = h2f(b);
+    } else if constexpr (T == kQ4_K) {
+        int sc, m;
+        q4k_scale(b + 4, ib, sc, m);
+        const uint8_t* qs = b + 16 + 32 * (ib >> 1);
+        const int sh = 4 * (ib & 1);
+#pragma unroll
+        for (int t = 0; t < 8; ++t) s.q[t] = (int) ((ld4(qs + 4 * t) >> sh) & 0x0f0f0f0fu);
+        s.s0 = s.s1 = sc;
+        s.d = h2f(b);
+        s.m0 = s.m1 = h2f(b + 2) * (float) m;
+    } else if constexpr (T == kQ2_K) {
+        const int n = ib >> 2, j = ib & 3;
+        const uint8_t* qs = b + 16 + 32 * n;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) s.q[t] = (int) ((ld4(qs + 4 * t) >> (2 * j)) & 0x03030303u);
+        const int c0 = b[8 * n + 2 * j], c1 = b[8 * n + 2 * j + 1];
+        const float dmin = h2f(b + 82);
+        s.s0 = c0 & 15;
+        s.s1 = c1 & 15;
+        s.d = h2f(b + 80);
+        s.m0 = dmin * (float) (c0 >> 4);
+        s.m1 = dmin * (float) (c1 >> 4);
+    } else if constexpr (T == kIQ1_S || T == kIQ1_M) {
+        Raw1 r;
+        iq1_load<T>(row, kb, r);
+        iq1_decode<T>(r, kb, tab, s);
+        (void) b;
+    } else {   // Q3_K
+        const int n = ib >> 2, j = ib & 3;
+        const uint8_t* qs = b + 32 + 32 * n;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const uint32_t ql = (ld2(qs + 4 * t) >> (2 * j)) & 0x03030303u;
+            const uint32_t neg = ((~ld2(b + 4 * t)) >> (4 * n + j)) & 0x01010101u;
+            s.q[t] = (int) (ql | (neg * 0xFCu));   // (q - 4 in a byte: q + 0xFC, no carry for q <= 3)
+        }
+        s.s0 = q3k_scale(b + 96, 8 * n + 2 * j);
+        s.s1 = q3k_scale(b + 96, 8 * n + 2 * j + 1);
+        s.d = h2f(b + 108);
+    }
+}
+// the sub-block against 32 int8 activations (xa: values 0..15, xb: 16..31), before their scale: an exact integer dot,
+// its scales in F32 (explicit roundings: every instantiation the same bits)
+template <int T>
+__device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int4& xb) {
+    int lo = __dp4a(s.q[0], xa.x, 0);
+    lo = __dp4a(s.q[1], xa.y, lo);
+    lo = __dp4a(s.q[2], xa.z, lo);
+    lo = __dp4a(s.q[3], xa.w, lo);
+    int hi = __dp4a(s.q[4], xb.x, 0);
+    hi = __dp4a(s.q[5], xb.y, hi);
+    hi = __dp4a(s.q[6], xb.z, hi);
+    hi = __dp4a(s.q[7], xb.w, hi);
+    float v = __fmul_rn(s.d, (float) (s.s0 * lo + s.s1 * hi));
+    if constexpr (Ty<T>::MIN) {
+        int sl = __dp4a(0x01010101, xa.x, 0);
+        sl = __dp4a(0x01010101, xa.y, sl);
+        sl = __dp4a(0x01010101, xa.z, sl);
+        sl = __dp4a(0x01010101, xa.w, sl);
+        int sh = __dp4a(0x01010101, xb.x, 0);
+        sh = __dp4a(0x01010101, xb.y, sh);
+        sh = __dp4a(0x01010101, xb.z, sh);
+        sh = __dp4a(0x01010101, xb.w, sh);
+        v = __fsub_rn(v, __fadd_rn(__fmul_rn(s.m0, (float) sl), __fmul_rn(s.m1, (float) sh)));
+    }
+    return v;
+}
+
+// values [8 p, 8 p + 8) of sub-block kb, as F32 (the prompt sets' tiles): ggml's dequantize_row_* values
+template <int T>
+__device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, int p, const uint32_t* tab, float* w) {
+    const int ib = kb & 7;
+    const uint8_t* b = row + (size_t) (kb >> 3) * Ty<T>::B;
+    if constexpr (T == kIQ2_XXS) {
+        const uint8_t* q = b + 2 + 8 * ib;
+        const uint32_t a1 = ld2(q + 4);
+        const uint2 g = ((const uint2*) tab)[q[p]];
+        const uint32_t v = (a1 >> (7 * p)) & 127u, sg = v | ((__popc(v) & 1u) << 7);
+        const float dl = h2f(b) * (float) (2 * (int) (a1 >> 28) + 1) * 0.125f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float gv = (float) ((j < 4 ? g.x >> (8 * j) : g.y >> (8 * (j - 4))) & 255u);
+            w[j] = (sg >> j) & 1u ? -(dl * gv) : dl * gv;
+        }
+    } else if constexpr (T == kIQ2_S) {
+        const uint8_t* qs = b + 2;
+        const uint32_t idx = qs[4 * ib + p] | ((((uint32_t) b[66 + ib]) << (8 - 2 * p)) & 0x300u);
+        const uint32_t sg = qs[32 + 4 * ib + p], sc = b[74 + ib];
+        const uint2 g = ((const uint2*) tab)[idx];
+        const float dl = h2f(b) * (float) (2 * (int) (p < 2 ? sc & 15 : sc >> 4) + 1) * 0.125f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float gv = (float) ((j < 4 ? g.x >> (8 * j) : g.y >> (8 * (j - 4))) & 255u);
+            w[j] = (sg >> j) & 1u ? -(dl * gv) : dl * gv;
+        }
+    } else if constexpr (T == kIQ3_XXS || T == kIQ3_S) {
+        const uint8_t* qs = b + 2;
+        uint32_t g1, g2, sg;
+        float dl;
+        if constexpr (T == kIQ3_XXS) {
+            const uint32_t aux = ld2(qs + 64 + 4 * ib), v = (aux >> (7 * p)) & 127u;
+            g1 = tab[qs[8 * ib + 2 * p]];
+            g2 = tab[qs[8 * ib + 2 * p + 1]];
+            sg = v | ((__popc(v) & 1u) << 7);
+            dl = h2f(b) * (float) (2 * (int) (aux >> 28) + 1) * 0.25f;
+        } else {
+            const uint32_t h = b[66 + ib];
+            g1 = tab[qs[8 * ib + 2 * p] | ((h << (8 - 2 * p)) & 256u)];
+            g2 = tab[qs[8 * ib + 2 * p + 1] | ((h << (7 - 2 * p)) & 256u)];
+            sg = b[74 + 4 * ib + p];
+            dl = h2f(b) * (float) (1 + 2 * (int) ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 15));
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float gv = (float) ((j < 4 ? g1 >> (8 * j) : g2 >> (8 * (j - 4))) & 255u);
+            w[j] = (sg >> j) & 1u ? -(dl * gv) : dl * gv;
+        }
+    } else if constexpr (T == kIQ4_XS) {
+        const uint32_t sh = *(const uint16_t*) (b + 2);
+        const int ls = ((b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 15) | (((sh >> (2 * ib)) & 3) << 4);
+        const float dl = h2f(b) * (float) (ls - 32);
+        const uint8_t* qs = b + 8 + 16 * ib + 8 * (p & 1);
+        const int8_t* kv = (const int8_t*) tab;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] = dl * (float) kv[p < 2 ? qs[j] & 15 : qs[j] >> 4];
+    } else if constexpr (T == kQ4_K) {
+        int sc, m;
+        q4k_scale(b + 4, ib, sc, m);
+        const float d1 = h2f(b) * (float) sc, m1 = h2f(b + 2) * (float) m;
+        const uint8_t* qs = b + 16 + 32 * (ib >> 1) + 8 * p;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] = d1 * (float) ((ib & 1) ? qs[j] >> 4 : qs[j] & 15) - m1;
+    } else if constexpr (T == kQ2_K) {
+        const int n = ib >> 2, jj = ib & 3;
+        const int c = b[8 * n + 2 * jj + (p >> 1)];
+        const float dl = h2f(b + 80) * (float) (c & 15), ml = h2f(b + 82) * (float) (c >> 4);
+        const uint8_t* qs = b + 16 + 32 * n + 8 * p;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] = dl * (float) ((qs[j] >> (2 * jj)) & 3) - ml;
+    } else if constexpr (T == kIQ1_S || T == kIQ1_M) {   // ggml's dl (grid + delta), group p of the sub-block
+        uint32_t g;
+        float dl, dt;
+        if constexpr (T == kIQ1_S) {
+            const uint32_t h = *(const uint16_t*) (b + 34 + 2 * ib);
+            g = tab[b[2 + 4 * ib + p] | (((h >> (3 * p)) & 7u) << 8)];
+            dl = h2f(b) * (float) (2 * (int) ((h >> 12) & 7u) + 1);
+            dt = h & 0x8000u ? -IQ1S_DELTA : IQ1S_DELTA;
+        } else {
+            const uint32_t h = *(const uint16_t*) (b + 32 + 2 * ib);
+            const uint32_t s01 = ld4(b + 48), s23 = ld4(b + 52);
+            const uint32_t sw = ((ib >> 1) < 2 ? s01 : s23) >> (16 * ((ib >> 1) & 1) + 6 * (ib & 1) + 3 * (p >> 1));
+            g = tab[b[4 * ib + p] | (((h >> (4 * p)) & 7u) << 8)];
+            dl = iq1m_d(s01, s23) * (float) (2 * (int) (sw & 7u) + 1);
+            dt = (h >> (4 * p + 3)) & 1u ? -IQ1S_DELTA : IQ1S_DELTA;   // (ggml's dequantize_row_iq1_m: IQ1S_DELTA)
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] = dl * ((float) ((int) ((g >> (8 * (j & 3) + 4 * (j >> 2))) & 15u) - 1) + dt);
+    } else {   // Q3_K
+        const int n = ib >> 2, jj = ib & 3;
+        const float dl = h2f(b + 108) * (float) q3k_scale(b + 96, 8 * n + 2 * jj + (p >> 1));
+        const uint8_t* qs = b + 32 + 32 * n + 8 * p;
+        const uint8_t* hm = b + 8 * p;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            w[j] = dl * (float) ((int) ((qs[j] >> (2 * jj)) & 3) - (((hm[j] >> (4 * n + jj)) & 1) ? 0 : 4));
+    }
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // (ds4_gguf.cu's)
+    if (limit > 0.0f) {
+        gv = fminf(gv, limit);
+        uv = fminf(fmaxf(uv, -limit), limit);
+    }
+    return __fmul_rn(__fdiv_rn(gv, __fadd_rn(1.0f, expf(-gv))), uv);
+}
+__device__ __forceinline__ bool group(const Args& a, int grp, const uint8_t*& blob, int& m0, int& m1) {
+    if (a.grp_ptr == nullptr) {
+        const unsigned long long p = a.plan_ptr[grp];
+        if (p == 0ull) return false;
+        blob = (const uint8_t*) p;
+        m0 = grp;
+        m1 = grp + 1;
+        return true;
+    }
+    if (grp >= *a.n_groups) return false;
+    blob = (const uint8_t*) a.grp_ptr[grp];
+    m0 = a.grp_start[grp];
+    m1 = a.grp_start[grp + 1];
+    return true;
+}
+
+// ---------------------------------------------------------------- token / window experts
+// RW rows a warp, 32 / RW lanes a row (a lane a sub-block a step), their sums over those lanes
+template <int RW>
+__device__ __forceinline__ float lanes_sum(float v) {
+#pragma unroll
+    for (int o = 16 / RW; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+constexpr int kGuRW = 1, kDnRW = 2;   // rows a warp: gate / up (n_embd 5120: 10 sub-blocks a lane), down (2304: 9)
+
+// AH: a lane's next sub-block's raw words loaded a step ahead (IQ1 only); else each decoded from the row as before
+template <int T, bool AH>
+struct Ahead {
+    static constexpr bool on = AH && (T == kIQ1_S || T == kIQ1_M);
+    Raw1 r{};
+    __device__ __forceinline__ void load(const uint8_t* __restrict__ row, int kb) {
+        if constexpr (on) iq1_load<T>(row, kb, r);
+    }
+    __device__ __forceinline__ void get(const uint8_t* __restrict__ row, int kb, const uint32_t* tab, Sub& s) const {
+        if constexpr (on) iq1_decode<T>(r, kb, tab, s);
+        else decode<T>(row, kb, tab, s);
+    }
+};
+
+// A block's rows in RP passes of kWarps RW rows (RP > 1: IQ1_S / IQ1_M, whose 8 KB grid table a block loads would
+// otherwise rival the weights it reads - 50 or 56 bytes a block).  Every row's sums are the same whatever RP and AH (the
+// same lanes, the same order), so the window's entries keep the token path's bits.
+
+// grid (n_ff / (8 RW RP), groups): RW rows of the gate and of the up a warp a pass, NE of the group's entries a pass
+// (each sub-block decoded once for them) -> h = the clamped swiglu
+template <int T, int NE, int RP = 1, bool AH = false, int RW = kGuRW>
+__global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
+    constexpr int LPR = 32 / RW;
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    __shared__ int es[NE], xr[NE];
+    const uint8_t* blob;
+    int m0, m1;
+    if (!group(a, blockIdx.y, blob, m0, m1)) return;   // (uniform)
+    load_tab<T>(tab);
+    const int lane32 = threadIdx.x & 31, lane = lane32 % LPR;
+    const size_t rb = row_bytes_t<T>(a.n_embd);
+    const int nsb = a.n_embd / 32;
+    for (int mm = m0; mm < m1; mm += NE) {
+        const int ne = min(NE, m1 - mm);
+        __syncthreads();
+        if ((int) threadIdx.x < ne) {
+            const int e = a.grp_ptr != nullptr ? a.grp_ent[mm + threadIdx.x] : mm + threadIdx.x;
+            es[threadIdx.x] = e;
+            xr[threadIdx.x] = a.grp_ptr != nullptr ? e >> 3 : 0;
+        }
+        __syncthreads();
+        for (int p = 0; p < RP; ++p) {
+            const int row = ((blockIdx.x * RP + p) * kWarps + (threadIdx.x >> 5)) * RW + lane32 / LPR;
+            if (row >= a.n_ff) continue;   // (a whole warp: n_ff % (8 RW) == 0)
+            const uint8_t* g = blob + a.tr[0] + (size_t) row * rb;
+            const uint8_t* u = blob + a.tr[1] + (size_t) row * rb;
+            float ag[NE], au[NE];
+#pragma unroll
+            for (int i = 0; i < NE; ++i) ag[i] = au[i] = 0.0f;
+            Ahead<T, AH> pg, pu;
+            if (lane < nsb) pg.load(g, lane), pu.load(u, lane);
+            for (int kb = lane; kb < nsb; kb += LPR) {
+                Ahead<T, AH> ng = pg, nu = pu;
+                if (kb + LPR < nsb) ng.load(g, kb + LPR), nu.load(u, kb + LPR);
+                Sub sg, su;
+                pg.get(g, kb, tab, sg);
+                pu.get(u, kb, tab, su);
+#pragma unroll
+                for (int i = 0; i < NE; ++i)
+                    if (i < ne) {
+                        const int4* xp = (const int4*) (a.xq + (size_t) xr[i] * a.n_embd + (size_t) kb * 32);
+                        const int4 xa = xp[0], xb = xp[1];
+                        const float dx = a.xd[(size_t) xr[i] * nsb + kb];
+                        ag[i] = fmaf(dx, sub_dot<T>(sg, xa, xb), ag[i]);
+                        au[i] = fmaf(dx, sub_dot<T>(su, xa, xb), au[i]);
+                    }
+                pg = ng;
+                pu = nu;
+            }
+#pragma unroll
+            for (int i = 0; i < NE; ++i)
+                if (i < ne) {
+                    const float gv = lanes_sum<RW>(ag[i]), uv = lanes_sum<RW>(au[i]);
+                    if (lane == 0) a.h[(size_t) es[i] * a.n_ff + row] = swiglu(gv, uv, a.limit);
+                }
+        }
+    }
+}
+
+// grid (n_embd / (8 RW RP), groups): RW rows of the down a warp a pass for NE entries a pass, against their int8 h ->
+// part
+template <int T, int NE, int RP = 1, bool AH = false, int RW = kDnRW>
+__global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
+    constexpr int LPR = 32 / RW;
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    __shared__ int es[NE];
+    const uint8_t* blob;
+    int m0, m1;
+    if (!group(a, blockIdx.y, blob, m0, m1)) return;
+    load_tab<T>(tab);
+    const int lane32 = threadIdx.x & 31, lane = lane32 % LPR;
+    const size_t rb = row_bytes_t<T>(a.n_ff);
+    const int nsb = a.n_ff / 32;
+    for (int mm = m0; mm < m1; mm += NE) {
+        const int ne = min(NE, m1 - mm);
+        __syncthreads();
+        if ((int) threadIdx.x < ne) es[threadIdx.x] = a.grp_ptr != nullptr ? a.grp_ent[mm + threadIdx.x] : mm + threadIdx.x;
+        __syncthreads();
+        for (int p = 0; p < RP; ++p) {
+            const int row = ((blockIdx.x * RP + p) * kWarps + (threadIdx.x >> 5)) * RW + lane32 / LPR;
+            if (row >= a.n_embd) continue;
+            const uint8_t* d = blob + a.tr[2] + (size_t) row * rb;
+            float ad[NE];
+#pragma unroll
+            for (int i = 0; i < NE; ++i) ad[i] = 0.0f;
+            Ahead<T, AH> pd;
+            if (lane < nsb) pd.load(d, lane);
+            for (int kb = lane; kb < nsb; kb += LPR) {
+                Ahead<T, AH> nd = pd;
+                if (kb + LPR < nsb) nd.load(d, kb + LPR);
+                Sub sd;
+                pd.get(d, kb, tab, sd);
+                pd = nd;
+#pragma unroll
+                for (int i = 0; i < NE; ++i)
+                    if (i < ne) {
+                        const int4* hp = (const int4*) (a.hq + (size_t) es[i] * a.n_ff + (size_t) kb * 32);
+                        const int4 ha = hp[0], hb = hp[1];
+                        ad[i] = fmaf(a.hd[(size_t) es[i] * nsb + kb], sub_dot<T>(sd, ha, hb), ad[i]);
+                    }
+            }
+#pragma unroll
+            for (int i = 0; i < NE; ++i)
+                if (i < ne) {
+                    const float v = lanes_sum<RW>(ad[i]);
+                    if (lane == 0) a.part[(size_t) es[i] * a.n_embd + row] = v;
+                }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- the prompt path's sets
+constexpr int BM = 64, BN = 64, TM = 4, TN = 4;
+static_assert((BM / TM) * (BN / TN) == kThreads, "one output tile a thread");
+
+// F32 FMAs (any device): a block RM rows (64, or 16 for experts of a few rows: a short prompt's) x BN outputs, a 32-value
+// sub-block of K a step, the weights dequantised into shared memory (each thread 8 values of a row), each thread RT x TN
+// outputs.  (deq8 is the tile loader a tensor-core form takes too.)
+template <int T, bool GATE_UP, int RM = BM>
+__global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
+    constexpr int RT = RM / (kThreads / (BN / TN));
+    static_assert(RT >= 1 && RT * (kThreads / (BN / TN)) == RM, "the block's rows");
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    __shared__ float wg[32][BN + 1];
+    __shared__ float wu[GATE_UP ? 32 : 1][BN + 1];
+    __shared__ float xs[RM][33];
+    __shared__ int src[RM];
+    const int e = blockIdx.z;
+    const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
+    const int r0 = lo + blockIdx.x * RM;
+    if (r0 >= hi || hi - lo <= a.skip_le) return;   // (uniform; skip_le: the light kernels' experts)
+    load_tab<T>(tab);
+    const int nr = min(RM, hi - r0);
+    const int c0 = blockIdx.y * BN;
+    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const int K = GATE_UP ? a.n_embd : a.n_ff;
+    const size_t rb = row_bytes_t<T>(K);
+    const int tid = (int) threadIdx.x;
+    if (tid < RM) src[tid] = tid < nr ? (GATE_UP ? a.idx[r0 + tid] : r0 + tid) : -1;
+    __syncthreads();
+    const int ty = tid / (BN / TN), tx = tid % (BN / TN);
+    const int tr = tid >> 2, tq = tid & 3;
+    float ag[RT][TN], au[RT][TN];
+#pragma unroll
+    for (int i = 0; i < RT; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) ag[i][j] = au[i][j] = 0.0f;
+    for (int kb = 0; kb < K / 32; ++kb) {
+        float w8[8];
+        deq8<T>(blob + a.tr[GATE_UP ? 0 : 2] + (size_t) (c0 + tr) * rb, kb, tq, tab, w8);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) wg[tq * 8 + j][tr] = w8[j];
+        if (GATE_UP) {
+            deq8<T>(blob + a.tr[1] + (size_t) (c0 + tr) * rb, kb, tq, tab, w8);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) wu[tq * 8 + j][tr] = w8[j];
+        }
+        for (int i = tid; i < RM * 32; i += kThreads) {
+            const int r = i / 32, c = i % 32, sr = src[r];
+            float v = 0.0f;
+            if (sr >= 0) {
+                const size_t at = (size_t) sr * a.ldx + (size_t) kb * 32 + c;
+                v = GATE_UP ? a.xf[at] : __half2float(__ushort_as_half(a.xh[at]));
+            }
+            xs[r][c] = v;
+        }
+        __syncthreads();
+#pragma unroll 8
+        for (int kk = 0; kk < 32; ++kk) {
+            float xv[RT], gw[TN], uw[TN];
+#pragma unroll
+            for (int i = 0; i < RT; ++i) xv[i] = xs[ty * RT + i][kk];
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                gw[j] = wg[kk][tx * TN + j];
+                if (GATE_UP) uw[j] = wu[kk][tx * TN + j];
+            }
+#pragma unroll
+            for (int i = 0; i < RT; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    ag[i][j] = fmaf(xv[i], gw[j], ag[i][j]);
+                    if (GATE_UP) au[i][j] = fmaf(xv[i], uw[j], au[i][j]);
+                }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < RT; ++i) {
+        const int r = ty * RT + i;
+        if (r >= nr) continue;
+        const size_t lr = (size_t) (r0 + r);
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int c = c0 + tx * TN + j;
+            if (GATE_UP) a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(swiglu(ag[i][j], au[i][j], a.limit)));
+            else a.y[lr * a.ldo + c] = ag[i][j];
+        }
+    }
+}
+
+#if !defined(STRATA_USE_HIP) || STRATA_HAS_WMMA
+// the same on the tensor cores (sm_70+; AMD: RDNA 3 / 4's, rocWMMA): 8 warps each 16 rows x 32 outputs, the tiles
+// F16 in shared memory
+constexpr int kLdT = 40;
+template <int T, bool GATE_UP>
+__global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
+#if defined(STRATA_USE_HIP) && !DS4_ROCWMMA
+    __builtin_trap();   // (a device pass for a card without WMMA: never launched there - tc_ok)
+#else
+#if defined(STRATA_USE_HIP)
+    namespace wm = rocwmma;
+    using wh = _Float16;
+#else
+    namespace wm = nvcuda::wmma;
+    using wh = __half;
+#endif
+    struct Tiles {
+        __half x[BM][kLdT], wg[BN][kLdT], wu[GATE_UP ? BN : 1][kLdT];
+    };
+    // the results leave through a 16 x 16 tile a warp in the tiles' room (the gate's and the up's accumulators hold the
+    // same elements, so the SwiGLU runs on them in registers): a block's shared memory is its tiles' alone - 15 KB, not
+    // a 64 x 64 staging of both (35 KB), so more blocks fit a CU to hide the loads (a Radeon 8065S, 32 experts x 128
+    // rows: 7.7-11.4 -> 13.6-14.6 TFLOP/s; a 4K prompt +8%)
+    static_assert(sizeof(Tiles) >= (size_t) (kThreads / 32) * 16 * 16 * sizeof(float), "the warps' output tiles");
+    __shared__ __align__(32) unsigned char smem[sizeof(Tiles)];
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    __shared__ int src[BM];
+    Tiles& Tl = *reinterpret_cast<Tiles*>(smem);
+    const int e = blockIdx.z;
+    const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
+    const int r0 = lo + blockIdx.x * BM;
+    if (r0 >= hi || hi - lo <= a.skip_le) return;   // (uniform; skip_le: the light kernels' experts)
+    load_tab<T>(tab);
+    const int nr = min(BM, hi - r0);
+    const int c0 = blockIdx.y * BN;
+    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const int K = GATE_UP ? a.n_embd : a.n_ff;
+    const size_t rb = row_bytes_t<T>(K);
+    const int tid = (int) threadIdx.x, warp = tid >> 5;
+    if (tid < BM) src[tid] = tid < nr ? (GATE_UP ? a.idx[r0 + tid] : r0 + tid) : -1;
+    __syncthreads();
+    const int wm_ = warp >> 1, wn = (warp & 1) * 2;
+    wm::fragment<wm::accumulator, 16, 16, 16, float> fg[2], fu[2];
+    for (int j = 0; j < 2; ++j) {
+        wm::fill_fragment(fg[j], 0.0f);
+        wm::fill_fragment(fu[j], 0.0f);
+    }
+    const int tr = tid >> 2, tq = tid & 3;
+    for (int kb = 0; kb < K / 32; ++kb) {
+        for (int m = 0; m < (GATE_UP ? 2 : 1); ++m) {
+            float w8[8];
+            deq8<T>(blob + a.tr[GATE_UP ? m : 2] + (size_t) (c0 + tr) * rb, kb, tq, tab, w8);
+            __half* dst = m == 0 ? &Tl.wg[tr][tq * 8] : &Tl.wu[tr][tq * 8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) dst[j] = __float2half_rn(w8[j]);
+        }
+        const int sr = src[tr];
+        if (a.xh_vec) {   // FP16 rows, 16-byte aligned: 8 values in one load (gate / up: the caller's rows_f16 of the same F32
+            // rows - __float2half_rn as below, so the same bits - not 36 conversions of them, a block column each)
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (sr >= 0) v = *reinterpret_cast<const uint4*>(a.xh + (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8);
+            *reinterpret_cast<uint4*>(&Tl.x[tr][tq * 8]) = v;
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                __half v = __float2half_rn(0.0f);
+                if (sr >= 0) {
+                    const size_t at = (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8 + j;
+                    v = GATE_UP ? __float2half_rn(a.xf[at]) : __ushort_as_half(a.xh[at]);
+                }
+                Tl.x[tr][tq * 8 + j] = v;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 32; kk += 16) {
+            wm::fragment<wm::matrix_a, 16, 16, 16, wh, wm::row_major> fa;
+            wm::load_matrix_sync(fa, (const wh*) &Tl.x[wm_ * 16][kk], kLdT);
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                wm::fragment<wm::matrix_b, 16, 16, 16, wh, wm::col_major> fb;
+                wm::load_matrix_sync(fb, (const wh*) &Tl.wg[(wn + j) * 16][kk], kLdT);
+                wm::mma_sync(fg[j], fa, fb, fg[j]);
+                if (GATE_UP) {
+                    wm::load_matrix_sync(fb, (const wh*) &Tl.wu[(wn + j) * 16][kk], kLdT);
+                    wm::mma_sync(fu[j], fa, fb, fu[j]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    float* ow = reinterpret_cast<float*>(smem) + (size_t) warp * 16 * 16;   // (the K loop's last barrier: tiles free)
+    const int lane = tid & 31;
+    for (int j = 0; j < 2; ++j) {
+        if (GATE_UP)
+            for (int i = 0; i < (int) fg[j].num_elements; ++i) fg[j].x[i] = swiglu(fg[j].x[i], fu[j].x[i], a.limit);
+        wm::store_matrix_sync(ow, fg[j], 16, wm::mem_row_major);
+        __syncthreads();   // (uniform: every warp stores, then reads its own tile)
+        for (int i = lane; i < 16 * 16; i += 32) {
+            const int r = wm_ * 16 + i / 16, c = c0 + (wn + j) * 16 + i % 16;
+            if (r >= nr) continue;
+            const size_t lr = (size_t) (r0 + r);
+            if (GATE_UP) a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(ow[i]));
+            else a.y[lr * a.ldo + c] = ow[i];
+        }
+        __syncthreads();
+    }
+#endif
+}
+#endif
+
+// ---------------------------------------------------------------- GEMVs
+constexpr int kMaxJobs = 8;
+struct Jobs {
+    MvJob j[kMaxJobs];
+};
+template <int T, int NC>
+__global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    load_tab<T>(tab);
+    __syncthreads();
+    const MvJob& b = J.j[blockIdx.y];
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= b.n) return;
+    const uint8_t* w = b.w + (size_t) row * b.ld;
+    const int nsb = b.k / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        Sub s;
+        decode<T>(w, kb, tab, s);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < b.ncol) {
+            const float v = warp_sum(acc[c]);
+            if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+        }
+}
+
+// ---------------------------------------------------------------- the prompt sets' light experts
+// A set's experts of a few rows (<= kLightRows: a prompt of a few hundred tokens spreads ~10 over most of 384 experts)
+// in the token kernels' form: each weight sub-block decoded once and dotted with every row's int8 input (rounded per 32
+// values as the token path rounds them) - the weights read once at the memory's speed, where a 64-row GEMM tile did 64
+// rows' work for them.  Each expert by its own rows: the light kernels take the experts of <= kLightRows rows, the tiles
+// the others (SetArgs::skip_le: they skip the light ones) - every expert's sums in one fixed order whatever the set.
+// Expert e's row i is input row e kLightRows + i of the scratch, output (local) row bounds[e] - row0 + i.
+constexpr int kLightRows = 16;
+constexpr int kLightMaxExp = 512;   // a set's experts at most (the scratch: kLightMaxExp kLightRows rows)
+
+// grid (k / 32 / 8, n_exp kLightRows): the light experts' rows of k values (gate / up: F32 x[idx[lr]]; down: F16 h[lr],
+// ldx apart) -> int8 q[e kLightRows + i][k], scales d[..][k / 32]
+__global__ void __launch_bounds__(kThreads) light_q8_kernel(const float* __restrict__ xf, const uint16_t* __restrict__ xh,
+                                                           const int* __restrict__ idx, int ldx, int k,
+                                                           const int* __restrict__ bounds, int row0,
+                                                           int8_t* __restrict__ q, float* __restrict__ d) {
+    const int e = blockIdx.y / kLightRows, i = blockIdx.y % kLightRows;
+    const int rows = bounds[e + 1] - bounds[e];
+    const int b = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (i >= rows || rows > kLightRows || b * 32 >= k) return;
+    const int lr = bounds[e] - row0 + i;
+    const size_t at = (size_t) b * 32 + lane, qr = (size_t) blockIdx.y;
+    const float v = xf != nullptr ? xf[(size_t) idx[lr] * ldx + at] : __half2float(__ushort_as_half(xh[(size_t) lr * ldx + at]));
+    float am = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    const float sc = am / 127.0f;   // (ds4_gguf.cu's q8_quant: the same operations)
+    q[qr * k + at] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+    if (lane == 0) d[qr * (k / 32) + b] = sc;
+}
+
+// grid (n_ff / 8 or n_embd / 8, n_exp): a light expert's rows, a warp a row of the weights (gate and up, or down), every
+// row of the expert a pass -> h16 (the F16 swiglu) or y
+template <int T, int NE, bool GATE_UP>
+__global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const int8_t* __restrict__ xq,
+                                                          const float* __restrict__ xd) {
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    const int e = blockIdx.y;
+    const int lo = a.bounds[e] - a.row0, ne = a.bounds[e + 1] - a.bounds[e];
+    if (ne <= 0 || ne > NE) return;   // (uniform: the tiles take an expert of more rows)
+    load_tab<T>(tab);
+    __syncthreads();
+    const int K = GATE_UP ? a.n_embd : a.n_ff, N = GATE_UP ? a.n_ff : a.n_embd, nsb = K / 32;
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= N) return;
+    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const size_t rb = row_bytes_t<T>(K);
+    const uint8_t* w0 = blob + a.tr[GATE_UP ? 0 : 2] + (size_t) row * rb;
+    const uint8_t* w1 = blob + a.tr[1] + (size_t) row * rb;
+    const size_t q0 = (size_t) e * kLightRows;
+    float a0[NE], a1[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) a0[i] = a1[i] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        Sub s0, s1;
+        decode<T>(w0, kb, tab, s0);
+        if (GATE_UP) decode<T>(w1, kb, tab, s1);
+#pragma unroll
+        for (int i = 0; i < NE; ++i)
+            if (i < ne) {
+                const int4* xp = (const int4*) (xq + (q0 + i) * K + (size_t) kb * 32);
+                const int4 xa = xp[0], xb = xp[1];
+                const float dx = xd[(q0 + i) * nsb + kb];
+                a0[i] = fmaf(dx, sub_dot<T>(s0, xa, xb), a0[i]);
+                if (GATE_UP) a1[i] = fmaf(dx, sub_dot<T>(s1, xa, xb), a1[i]);
+            }
+    }
+#pragma unroll
+    for (int i = 0; i < NE; ++i)
+        if (i < ne) {
+            const float v0 = warp_sum(a0[i]);
+            const float v1 = GATE_UP ? warp_sum(a1[i]) : 0.0f;
+            if (lane == 0) {
+                const size_t lr = (size_t) (lo + i);
+                if (GATE_UP) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(swiglu(v0, v1, a.limit)));
+                else a.y[lr * a.ldo + row] = v0;
+            }
+        }
+}
+
+// (tests: decode_values) each sub-block of n rows decoded as the token kernels (decode: the codes times their scales,
+// sub_dot's roundings) and as the tiles' loader (deq8) read it
+template <int T>
+__global__ void __launch_bounds__(kThreads) values_kernel(const uint8_t* __restrict__ w, int k, int n, float* sub,
+                                                           float* tile) {
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    load_tab<T>(tab);
+    __syncthreads();
+    const int nsb = k / 32;
+    const size_t rb = row_bytes_t<T>(k);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n * nsb; i += gridDim.x * blockDim.x) {
+        const int r = i / nsb, kb = i % nsb;
+        const uint8_t* row = w + (size_t) r * rb;
+        float* o = sub + (size_t) r * k + (size_t) kb * 32;
+        Sub s;
+        decode<T>(row, kb, tab, s);
+#pragma unroll
+        for (int t = 0; t < 8; ++t)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int at = 4 * t + j, q = (int) (int8_t) (uint8_t) ((uint32_t) s.q[t] >> (8 * j));
+                float v = __fmul_rn(s.d, (float) ((at < 16 ? s.s0 : s.s1) * q));
+                if constexpr (Ty<T>::MIN) v = __fsub_rn(v, at < 16 ? s.m0 : s.m1);
+                o[at] = v;
+            }
+        float w8[8];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            deq8<T>(row, kb, p, tab, w8);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) tile[(size_t) r * k + (size_t) kb * 32 + 8 * p + j] = w8[j];
+        }
+    }
+}
+
+bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), STRATA_DS4_NO_TC=1 keeps the F32 kernel
+#if defined(STRATA_USE_HIP)
+#if STRATA_HAS_WMMA
+    static const bool ok = [] {
+        int dev = 0;
+        cudaDeviceProp p{};
+        const char* v = std::getenv("STRATA_DS4_NO_TC");
+        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+               (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx12", 5) == 0) &&
+               !(v != nullptr && v[0] == '1');
+    }();
+    return ok;
+#else
+    return false;
+#endif
+#else
+    static const bool ok = [] {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        const char* v = std::getenv("STRATA_DS4_NO_TC");
+        return major >= 7 && !(v != nullptr && v[0] == '1');
+    }();
+    return ok;
+#endif
+}
+
+// ---------------------------------------------------------------- dispatch
+// F(T) for the type t at run time; false when it is not one of these
+#define DS4_IQ_SWITCH(t, F)          \
+    switch (t) {                     \
+        case kIQ2_XXS: F(kIQ2_XXS); break; \
+        case kIQ2_S: F(kIQ2_S); break;     \
+        case kIQ3_XXS: F(kIQ3_XXS); break; \
+        case kIQ3_S: F(kIQ3_S); break;     \
+        case kIQ4_XS: F(kIQ4_XS); break;   \
+        case kQ4_K: F(kQ4_K); break;       \
+        case kQ2_K: F(kQ2_K); break;       \
+        case kQ3_K: F(kQ3_K); break;       \
+        case kIQ1_S: F(kIQ1_S); break;     \
+        case kIQ1_M: F(kIQ1_M); break;     \
+        default: return false;       \
+    }
+
+// IQ1's token / window kernels: RP rows passes a block (1 or 4), AH the loads a step ahead - measured per platform
+// (ds4_gguf_test --bench-q), the defaults below; DS4_IQ_RP=1|4 and DS4_IQ_AHEAD=0|1 choose (the same sums either way)
+struct Iq1Var {
+    int rp;
+    int ah;   // -1: the type's default (kAhead)
+};
+// the early loads by default: IQ1_M on AMD (a Radeon 8065S, 6 experts' gate / up: 200 -> 150 us); IQ1_S there and both
+// on the V100 gain nothing from them
+#if defined(STRATA_USE_HIP)
+template <int T>
+constexpr bool kAhead = T == kIQ1_M;
+#else
+template <int T>
+constexpr bool kAhead = false;
+#endif
+const Iq1Var& iq1_var() {
+    static const Iq1Var v = [] {
+        Iq1Var r{1, -1};
+        if (const char* e = std::getenv("DS4_IQ_RP")) r.rp = std::atoi(e) == 4 ? 4 : 1;
+        if (const char* e = std::getenv("DS4_IQ_AHEAD")) r.ah = std::atoi(e) != 0 ? 1 : 0;
+        return r;
+    }();
+    return v;
+}
+// grid.x: the blocks of one pass (n / (kWarps RW))
+template <int T, int NE>
+void launch_gu(const Args& a, dim3 grid, cudaStream_t s) {
+    if constexpr (T == kIQ1_S || T == kIQ1_M) {
+        const Iq1Var& v = iq1_var();
+        const bool rp = v.rp == 4 && grid.x % 4 == 0, ah = v.ah >= 0 ? v.ah != 0 : kAhead<T>;
+        const dim3 g4(grid.x / 4, grid.y, grid.z);
+        if (rp && ah) { gate_up_kernel<T, NE, 4, true><<<g4, kThreads, 0, s>>>(a); return; }
+        if (rp) { gate_up_kernel<T, NE, 4, false><<<g4, kThreads, 0, s>>>(a); return; }
+        if (ah) { gate_up_kernel<T, NE, 1, true><<<grid, kThreads, 0, s>>>(a); return; }
+    }
+    gate_up_kernel<T, NE><<<grid, kThreads, 0, s>>>(a);
+}
+template <int T, int NE>
+void launch_dn(const Args& a, dim3 grid, cudaStream_t s) {
+    if constexpr (T == kIQ1_S || T == kIQ1_M) {
+        const Iq1Var& v = iq1_var();
+        const bool rp = v.rp == 4 && grid.x % 4 == 0, ah = v.ah >= 0 ? v.ah != 0 : kAhead<T>;
+        const dim3 g4(grid.x / 4, grid.y, grid.z);
+        if (rp && ah) { down_kernel<T, NE, 4, true><<<g4, kThreads, 0, s>>>(a); return; }
+        if (rp) { down_kernel<T, NE, 4, false><<<g4, kThreads, 0, s>>>(a); return; }
+        if (ah) { down_kernel<T, NE, 1, true><<<grid, kThreads, 0, s>>>(a); return; }
+    }
+    down_kernel<T, NE><<<grid, kThreads, 0, s>>>(a);
+}
+template <int T>
+void gu_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
+    if (ne <= 1) launch_gu<T, 1>(a, grid, s);
+    else if (ne <= 4) launch_gu<T, 4>(a, grid, s);
+    else if (ne <= 8) launch_gu<T, 8>(a, grid, s);
+    else launch_gu<T, 16>(a, grid, s);
+}
+template <int T>
+void dn_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
+    if (ne <= 1) launch_dn<T, 1>(a, grid, s);
+    else if (ne <= 4) launch_dn<T, 4>(a, grid, s);
+    else if (ne <= 8) launch_dn<T, 8>(a, grid, s);
+    else launch_dn<T, 16>(a, grid, s);
+}
+template <int T, bool GU>
+void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
+#if !defined(STRATA_USE_HIP) || STRATA_HAS_WMMA
+    if (tc_ok()) {
+        SetArgs b = a;   // (gate / up: FP16 rows when the caller gave them - set_gate_up's x16)
+        b.xh_vec = b.xh != nullptr && ((uintptr_t) b.xh & 15) == 0 && (b.ldx & 7) == 0 ? 1 : 0;
+        set_tc_kernel<T, GU><<<grid, kThreads, 0, s>>>(b);
+        return;
+    }
+#endif
+    if (a.max_rows <= 16) {   // (a block of 64 rows would do 64 rows' FMAs for the few there are)
+        grid.x = (unsigned) ((a.max_rows + 15) / 16);
+        set_kernel<T, GU, 16><<<grid, kThreads, 0, s>>>(a);
+        return;
+    }
+    set_kernel<T, GU><<<grid, kThreads, 0, s>>>(a);
+}
+// the light sets' int8 rows, per stream (kLightMaxExp kLightRows rows of k)
+struct LightBuf {
+    int8_t* q = nullptr;
+    float* d = nullptr;
+    size_t cap = 0;
+};
+std::mutex g_lmu;
+std::unordered_map<cudaStream_t, LightBuf> g_light;
+LightBuf* light_buf(cudaStream_t s, int k) {
+    std::lock_guard<std::mutex> lk(g_lmu);
+    LightBuf& b = g_light[s];
+    const size_t need = (size_t) kLightMaxExp * kLightRows * (size_t) std::max(k, 8192);
+    if (b.cap < need) {
+        if (b.q != nullptr) cudaFree(b.q);
+        if (b.d != nullptr) cudaFree(b.d);
+        b = LightBuf{};
+        if (cudaMalloc(&b.q, need) != cudaSuccess || cudaMalloc(&b.d, need / 32 * sizeof(float)) != cudaSuccess) {
+            std::fprintf(stderr, "ds4 iq: the light sets' scratch (%zu MB) failed\n", need >> 20);
+            return nullptr;
+        }
+        b.cap = need;
+    }
+    return &b;
+}
+bool light_on() {   // STRATA_DS4_NO_LIGHT=1: every set through the GEMM tiles
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_DS4_NO_LIGHT");
+        return !(v != nullptr && v[0] == '1');
+    }();
+    return on;
+}
+template <int T, bool GU>
+void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
+    const dim3 grid((unsigned) (((GU ? a.n_ff : a.n_embd) + kWarps - 1) / kWarps), (unsigned) a.n_exp);
+    if (a.max_rows <= 4) light_kernel<T, 4, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
+    else if (a.max_rows <= 8) light_kernel<T, 8, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
+    else light_kernel<T, kLightRows, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
+}
+bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
+    const int K = gu ? a.n_embd : a.n_ff;
+    LightBuf* b = light_buf(s, K);
+    if (b == nullptr) return false;
+    const dim3 gq((unsigned) ((K / 32 + kWarps - 1) / kWarps), (unsigned) (a.n_exp * kLightRows));
+    light_q8_kernel<<<gq, kThreads, 0, s>>>(gu ? a.xf : nullptr, gu ? nullptr : a.xh, a.idx, a.ldx, K, a.bounds,
+                                            a.row0, b->q, b->d);
+    if (gu) {
+        if (a.tg == kMXFP4) {
+            launch_light<kMXFP4, true>(a, *b, s);
+            return true;
+        }
+#define LG_(T) launch_light<T, true>(a, *b, s)
+        DS4_IQ_SWITCH(a.tg, LG_)
+#undef LG_
+    } else {
+        if (a.td == kMXFP4) {
+            launch_light<kMXFP4, false>(a, *b, s);
+            return true;
+        }
+#define LD_(T) launch_light<T, false>(a, *b, s)
+        DS4_IQ_SWITCH(a.td, LD_)
+#undef LD_
+    }
+    return true;
+}
+
+template <int T>
+void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
+    const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
+    if (max_c <= 1) mv_kernel<T, 1><<<grid, kThreads, 0, s>>>(J);
+    else if (max_c <= 4) mv_kernel<T, 4><<<grid, kThreads, 0, s>>>(J);
+    else mv_kernel<T, 16><<<grid, kThreads, 0, s>>>(J);
+}
+
+}  // namespace
+
+bool supported(int t) { return block_bytes(t) > 0; }
+
+int block_bytes(int t) {
+    switch (t) {
+        case kIQ2_XXS: return Ty<kIQ2_XXS>::B;
+        case kIQ2_S: return Ty<kIQ2_S>::B;
+        case kIQ3_XXS: return Ty<kIQ3_XXS>::B;
+        case kIQ3_S: return Ty<kIQ3_S>::B;
+        case kIQ4_XS: return Ty<kIQ4_XS>::B;
+        case kQ4_K: return Ty<kQ4_K>::B;
+        case kQ2_K: return Ty<kQ2_K>::B;
+        case kQ3_K: return Ty<kQ3_K>::B;
+        case kIQ1_S: return Ty<kIQ1_S>::B;
+        case kIQ1_M: return Ty<kIQ1_M>::B;
+        default: return 0;
+    }
+}
+
+const char* name(int t) {
+    switch (t) {
+        case kIQ2_XXS: return "IQ2_XXS";
+        case kIQ2_S: return "IQ2_S";
+        case kIQ3_XXS: return "IQ3_XXS";
+        case kIQ3_S: return "IQ3_S";
+        case kIQ4_XS: return "IQ4_XS";
+        case kQ4_K: return "Q4_K";
+        case kQ2_K: return "Q2_K";
+        case kQ3_K: return "Q3_K";
+        case kIQ1_S: return "IQ1_S";
+        case kIQ1_M: return "IQ1_M";
+        default: return "?";
+    }
+}
+
+bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
+    if (a.n_embd % 256 != 0 || a.n_ff % (kWarps * kGuRW) != 0) return false;
+    const dim3 grid((unsigned) (a.n_ff / (kWarps * kGuRW)), (unsigned) groups);
+#define GU_(T) gu_ne<T>(a, grid, ne_max, s)
+    DS4_IQ_SWITCH(a.tg, GU_)
+#undef GU_
+    return true;
+}
+
+bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
+    if (a.n_ff % 256 != 0 || a.n_embd % (kWarps * kDnRW) != 0) return false;
+    const dim3 grid((unsigned) (a.n_embd / (kWarps * kDnRW)), (unsigned) groups);
+#define DN_(T) dn_ne<T>(a, grid, ne_max, s)
+    DS4_IQ_SWITCH(a.td, DN_)
+#undef DN_
+    return true;
+}
+
+bool light_gate_up(const SetArgs& a, cudaStream_t s) {
+    if (a.n_exp > kLightMaxExp || !light_on() || a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
+    return light_set(a, true, s);
+}
+bool light_down(const SetArgs& a, cudaStream_t s) {
+    if (a.n_exp > kLightMaxExp || !light_on() || a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
+    return light_set(a, false, s);
+}
+
+bool set_gate_up(const SetArgs& a, cudaStream_t s) {
+    if (a.n_embd % 256 != 0 || a.n_ff % BN != 0) return false;
+    SetArgs t = a;
+    if (light_gate_up(a, s)) {   // the experts of a few rows; the tiles the others
+        if (a.max_rows <= kLightRows) return true;
+        t.skip_le = kLightRows;
+    }
+    const dim3 grid((unsigned) ((a.max_rows + BM - 1) / BM), (unsigned) (a.n_ff / BN), (unsigned) a.n_exp);
+#define SG_(T) launch_set<T, true>(t, grid, s)
+    DS4_IQ_SWITCH(a.tg, SG_)
+#undef SG_
+    return true;
+}
+
+bool set_down(const SetArgs& a, cudaStream_t s) {
+    if (a.n_ff % 256 != 0 || a.n_embd % BN != 0) return false;
+    SetArgs t = a;
+    if (light_down(a, s)) {
+        if (a.max_rows <= kLightRows) return true;
+        t.skip_le = kLightRows;
+    }
+    const dim3 grid((unsigned) ((a.max_rows + BM - 1) / BM), (unsigned) (a.n_embd / BN), (unsigned) a.n_exp);
+#define SD_(T) launch_set<T, false>(t, grid, s)
+    DS4_IQ_SWITCH(a.td, SD_)
+#undef SD_
+    return true;
+}
+
+bool mv(const MvJob* jobs, int n, cudaStream_t s) {
+    // the jobs by type, up to kMaxJobs a launch
+    bool done[64] = {};
+    if (n > 64) return false;
+    for (int i = 0; i < n; ++i)
+        while (!done[i]) {
+            const int t = jobs[i].type;
+            Jobs J{};
+            int nj = 0, max_n = 0, max_c = 1;
+            for (int k = i; k < n && nj < kMaxJobs; ++k) {
+                if (done[k] || jobs[k].type != t) continue;
+                if (jobs[k].k % 256 != 0 || jobs[k].ncol < 1 || jobs[k].ncol > 16) return false;
+                J.j[nj++] = jobs[k];
+                max_n = std::max(max_n, jobs[k].n);
+                max_c = std::max(max_c, jobs[k].ncol);
+                done[k] = true;
+            }
+#define MV_(T) mv_nc<T>(J, nj, max_n, max_c, s)
+            DS4_IQ_SWITCH(t, MV_)
+#undef MV_
+        }
+    return true;
+}
+
+bool decode_values(int type, const uint8_t* w, int k, int n, float* sub, float* tile, cudaStream_t s) {
+    if (k % 256 != 0 || n < 1) return false;
+    const unsigned blocks = (unsigned) std::min<int>(1024, (n * (k / 32) + kThreads - 1) / kThreads);
+#define DV_(T) values_kernel<T><<<blocks, kThreads, 0, s>>>(w, k, n, sub, tile)
+    DS4_IQ_SWITCH(type, DV_)
+#undef DV_
+    return true;
+}
+
+}  // namespace strata::ds4::gguf::iq

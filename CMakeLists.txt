@@ -9,6 +9,14 @@
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.27 LANGUAGES CXX)
+
+# Maya's build options by the names its docs give them: -DMAYA_X=... sets STRATA_X, the name this file reads
+get_cmake_property(_maya_cache CACHE_VARIABLES)
+foreach(_v IN LISTS _maya_cache)
+  if(_v MATCHES "^MAYA_(.+)$")
+    set(STRATA_${CMAKE_MATCH_1} "${${_v}}")
+  endif()
+endforeach()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
@@ -76,11 +84,11 @@ if(STRATA_ENABLE_CUDA)
     endif()
     if(_base LESS 75)
       message(FATAL_ERROR
-        "Strata needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series), but "
+        "Maya needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series), but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
     endif()
   endforeach()
-  message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
+  message(STATUS "Maya: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
   # Pascal (sm_6x - a "native" build on a Tesla P40, as maya.py's arch_setting() asks for below sm_75): GP102 / GP104
   # cache global loads in L2 only unless the code is compiled to cache them in L1 as well, and the decode's GEMVs - many
   # small loads of weights, scales and the q8_1 activations every warp of a block reads - starve there (Maya-L's Q6_K
@@ -95,7 +103,7 @@ if(STRATA_ENABLE_CUDA)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")
     if(_base MATCHES "^6[0-9]$")
       string(APPEND CMAKE_CUDA_FLAGS " -Xptxas -dlcm=ca")
-      message(STATUS "Strata: Pascal (sm_${_base}): global loads cached in L1 (-Xptxas -dlcm=ca)")
+      message(STATUS "Maya: Pascal (sm_${_base}): global loads cached in L1 (-Xptxas -dlcm=ca)")
       break()
     endif()
   endforeach()
@@ -154,6 +162,8 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
+  add_executable(ds4_prefill_stats_test tests/ds4_prefill_stats_test.cpp)
+  add_test(NAME ds4_prefill_stats_test COMMAND ds4_prefill_stats_test)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
@@ -203,7 +213,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
              COMMAND strata-load --file ${CMAKE_CURRENT_SOURCE_DIR}/pack/full/experts.bin --layers 1)
     set_tests_properties(expert_arena_load PROPERTIES PASS_REGULAR_EXPRESSION "per-layer checksums")
   else()
-    message(STATUS "strata: pack/full/experts.bin absent - the expert arena load test is NOT registered")
+    message(STATUS "maya: pack/full/experts.bin absent - the expert arena load test is NOT registered")
   endif()
 
   # ---- strata_kernels (P2.S2) ----
@@ -277,6 +287,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(exl3_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
     add_test(NAME exl3_test COMMAND exl3_test)
     set_tests_properties(exl3_test PROPERTIES TIMEOUT 120)
+    # the same decoders against exllamav3 itself (tools/exl3_exllamav3_fixture.py's tiles): the same bits
+    add_test(NAME exl3_exllamav3 COMMAND exl3_test --exllamav3 ${CMAKE_CURRENT_SOURCE_DIR}/data/exl3-exllamav3)
+    set_tests_properties(exl3_exllamav3 PROPERTIES TIMEOUT 60)
+  endif()
+  # the batched rows' MoE pieces (the fused wait / fetch, the rows' CPU-lane waits, a group's experts each once)
+  # against the per-row kernels (random Q8_0 experts, no model)
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    add_executable(glm_moe_rows_test tests/glm_moe_rows_test.cu)
+    target_link_libraries(glm_moe_rows_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_moe_rows_test COMMAND glm_moe_rows_test)
+    set_tests_properties(glm_moe_rows_test PROPERTIES TIMEOUT 60)
   endif()
   # the INT8 latent records' FP16 reads against the plain conversion, every code x every scale (GPU, no model)
   if(STRATA_BUILD_TESTS)
@@ -285,12 +306,28 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME glm_lat8_test COMMAND glm_lat8_test)
     set_tests_properties(glm_lat8_test PROPERTIES TIMEOUT 60)
   endif()
+  # __dp4a as the kernels see it (sm_60: kernels/dp4a.hpp's vmad fallback) against the byte-wise form (GPU, no model)
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    add_executable(dp4a_sm60_test tests/dp4a_sm60_test.cu)
+    target_link_libraries(dp4a_sm60_test PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME dp4a_sm60_test COMMAND dp4a_sm60_test)
+    set_tests_properties(dp4a_sm60_test PROPERTIES TIMEOUT 60)
+  endif()
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
   # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON
   if(STRATA_BUILD_TESTS OR STRATA_PARITY_PROMPT_ATTN)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
     target_include_directories(qsa_prompt_attn_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  endif()
+  # the Volta grouped-WMMA prompt experts (STRATA_PF_WMMA) against a double reference over the same FP16 weights
+  # (GPU, synthetic, no model); skips with 77 below sm_70
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    add_executable(pf_wmma_parity src/kernels/pf_wmma_parity.cpp)
+    target_include_directories(pf_wmma_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(pf_wmma_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME pf_wmma_parity COMMAND pf_wmma_parity)
+    set_tests_properties(pf_wmma_parity PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
   endif()
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
@@ -315,6 +352,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # FMA changes tie results. The embedding gather also relies on separately rounded operations.
     set_source_files_properties(src/kernels/cuda/elementwise.cu src/kernels/cuda/quantize_act.cu
       PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    # EXL3: multiply-adds fused where the source writes them, not after inlining - otherwise a kernel's rounding
+    # depends on where the compiler inlined its GEMV, and a verify window's bits stop matching the token path's
+    set_source_files_properties(src/kernels/cuda/exl3.cu PROPERTIES COMPILE_OPTIONS "-ffp-contract=on")
   endif()
 
   set(STRATA_ORACLE_SOURCE_DIR "" CACHE PATH "Pinned llama.cpp source for independent CUDA parity tests")
@@ -374,12 +414,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
   endif()
   # --expert-profile-save's profile (rank_learned_profile, write_expert_profile) and the profile header's version
-  # (a version other than 1 is refused by its number): CPU only
-  foreach(_t expert_profile_save_test expert_profile_version_test)
+  # (a version other than 1 is refused by its number); the split decode's groups (split_groups): CPU only
+  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_t}.cpp")
       enable_testing()
       add_executable(${_t} tests/core/${_t}.cpp)
-      target_link_libraries(${_t} PRIVATE strata_engine)
+      # (strata_prefill after strata_engine, as the engines link: on HIP glm_prefill.cu uses its Gemm - #355)
+      target_link_libraries(${_t} PRIVATE strata_engine strata_prefill)
       add_test(NAME ${_t} COMMAND ${_t})
       set_tests_properties(${_t} PROPERTIES TIMEOUT 60)
     endif()
@@ -400,9 +441,43 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
   endif()
 
-  add_executable(strata src/program/generate.cpp)
-  target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  add_executable(maya src/program/generate.cpp)
+  target_include_directories(maya PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(maya PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+
+  # DeepSeek-V4.1-Flash (EXL3, tools/ds4/pack.py; or a GGUF, tools/ds4/pack_gguf.py): its own engine over the kernel
+  # libraries (src/ds4)
+  # (CUDA, or HIP through include/strata/hip_compat as the GLM engine; Linux and Windows)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+    add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
+                              src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
+                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp)
+    target_include_directories(maya-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    target_link_libraries(maya-ds4 PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
+                          ${_strata_gpu_blas_target})
+    if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)   # (the prompt path's dense GEMMs: ds4_lt.cu)
+      set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS STRATA_HIPBLASLT_AVAILABLE=1)
+      target_link_libraries(maya-ds4 PRIVATE roc::hipblaslt)
+    endif()
+    if(NOT WIN32)   # mmap / mbind (NUMA)
+      add_executable(ds4_cpu_bench tests/ds4_cpu_bench.cpp)
+      target_link_libraries(ds4_cpu_bench PRIVATE strata_kernels_cpu)
+    endif()
+    # the CPU lane's MXFP4 rows: every tier this CPU runs (and ggml-cpu's dot) at the experts' real size (no GPU)
+    add_executable(ds4_mx_bench tests/ds4_mx_bench.cpp src/ds4/ds4_gguf_cpu.cpp)
+    target_link_libraries(ds4_mx_bench PRIVATE strata_kernels_cpu)
+    # the CPU lane's time an expert by format, as the PCIe lane's calibration times it (no GPU), and the split it plans
+    add_executable(ds4_lane_bench tests/ds4_lane_bench.cpp src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq_cpu.cpp)
+    target_include_directories(ds4_lane_bench PRIVATE third_party/ggml)
+    target_link_libraries(ds4_lane_bench PRIVATE strata_kernels_cpu)
+    # the GGUF kernels (BF16 matrices, MXFP4 experts) against a double-precision reference, and the packed KV caches
+    # against the BF16 rows bit for bit (needs a GPU, no model)
+    add_executable(ds4_gguf_test tests/ds4_gguf_test.cu src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu
+                                 src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_kernels.cu
+                                 src/ds4/ds4_host_ar.cpp)
+    target_include_directories(ds4_gguf_test PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    target_link_libraries(ds4_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
+  endif()
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
@@ -418,6 +493,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_mv_bench PRIVATE strata_kernels strata_hip_runtime)
     add_test(NAME glm_mv_parity COMMAND glm_mv_bench --parity-only)
     set_tests_properties(glm_mv_parity PROPERTIES TIMEOUT 120)
+    add_executable(ds4_attention_layout_bench EXCLUDE_FROM_ALL tests/ds4_attention_layout_bench.cu src/ds4/ds4_kernels.cu)
+    target_include_directories(ds4_attention_layout_bench PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    target_link_libraries(ds4_attention_layout_bench PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
     add_executable(hip_expert_cache_staging tests/hip/expert_cache_staging.cpp)
     target_link_libraries(hip_expert_cache_staging PRIVATE strata_engine)
     add_test(NAME hip_expert_cache_staging COMMAND hip_expert_cache_staging)
@@ -941,7 +1019,8 @@ if(STRATA_NATIVE_EXPERTS)
     else()
       set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
     endif()
-    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu
+                ${_strata_mmq}/convert.cu)
     if(_strata_mmq_glu)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_GLU=1)
     endif()
@@ -984,7 +1063,8 @@ if(STRATA_NATIVE_EXPERTS)
       src/prefill/moe_mmq.cu
       src/prefill/moe_fused_rdna4.cu
       src/prefill/ggml_cuda_host.cu
-      "${_strata_mmq}/quantize.cu")
+      "${_strata_mmq}/quantize.cu"
+      "${_strata_mmq}/convert.cu")
     target_compile_definitions(strata_engine PRIVATE STRATA_HIP_PREFILL_FUSED=1)
     foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")

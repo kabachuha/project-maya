@@ -291,10 +291,10 @@ bool Glm5Model::win_reserve(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     if (!win_alloc(kWinMax, err)) return false;
-    const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
-    int n_rec = 0;
+    const size_t kda_bytes = spec_kda_bytes();   // the same run per recurrent layer that spec_kda_copy saves
+    int n_rec = 0;                               // (the repeated layers: the commit's replay buffer below)
     for (int il = l0_; il < l1_; ++il) n_rec += g.is_recr(il);
-    if (n_rec > 0 && kda_bak_ == nullptr && cudaMalloc(&kda_bak_, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) {
+    if (kda_bytes > 0 && kda_bak_ == nullptr && cudaMalloc(&kda_bak_, kda_bytes) != cudaSuccess) {
         cudaGetLastError();
         kda_bak_ = nullptr;
         err = "glm window: the recurrent-state backup did not allocate";
@@ -1081,9 +1081,10 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         err = "glm window: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
-    if (sp != nullptr && !sp->greedy) {
-        // row t is drawn with the counter the token loop would use for the token after tokens[t]
-        strata::kernels::sample_tokens(WT.logits, T, (int) g.n_vocab, nullptr, 0, *sp, WT.tok, FT->cs);
+    if (sp != nullptr && (!sp->greedy || sp->penalty_last_n > 0)) {
+        // row t is drawn with the counter the token loop would use for the token after tokens[t] (and, with
+        // penalties, the history it would count: tokens[1..t] after what came before)
+        tail->pick_tokens(WT.logits, T, *sp, tokens, 0, WT.tok, FT->cs);
     } else {
         for (int t = 0; t < T; ++t) gf::argmax(WT.logits + (size_t) t * g.n_vocab, g.n_vocab, WT.tok + t, FT->cs);
     }
@@ -1287,7 +1288,8 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
         if (W.pick_sampled) {
             strata::kernels::SamplerParams sp = W.pick_sp;
             sp.counter += (uint64_t) t;
-            strata::kernels::sample_tokens(lg, 1, (int) g.n_vocab, nullptr, 0, sp, W.tok + sl, F->cs);
+            // (penalties: this window's tokens 1..t before it - pick_tok, written before token t was queued)
+            m->pick_tokens(lg, 1, sp, W.pick_tok + (sl - t), t, W.tok + sl, F->cs);
         } else {
             gf::argmax(lg, g.n_vocab, W.tok + sl, F->cs);
         }
@@ -1352,7 +1354,7 @@ bool Glm5Model::win_head_split(int t, int sl, const float* hx, float* lg, std::s
         cudaMemcpyAsync(lg + c0, ht_lg_h_ + (size_t) sl * nc, (size_t) nc * sizeof(float), cudaMemcpyHostToDevice, F->cs);
         strata::kernels::SamplerParams sp = W.pick_sp;
         sp.counter += (uint64_t) t;
-        strata::kernels::sample_tokens(lg, 1, V, nullptr, 0, sp, W.tok + sl, F->cs);
+        pick_tokens(lg, 1, sp, W.pick_tok + (sl - t), t, W.tok + sl, F->cs);
     } else {
         int* own = ht_pair_d_ + (size_t) sl * 4;
         gf::argmax_pair(lg, c0, own, F->cs);
@@ -1459,7 +1461,7 @@ bool Glm5Model::win_pipe_begin(int32_t first, std::string& err, const strata::ke
         W.per_token = false;
         W.piped = true;
         W.bank ^= 1;
-        W.pick_sampled = sp != nullptr && !sp->greedy;
+        W.pick_sampled = sp != nullptr && (!sp->greedy || sp->penalty_last_n > 0);   // (penalties: the sampler's pick)
         if (W.pick_sampled) W.pick_sp = *sp;
     }
     // the tokens past a wrong draft skip their heavy kernels (STRATA_GLM_WIN_SKIP=0: they run anyway)
@@ -1553,7 +1555,10 @@ bool Glm5Model::win_pipe_push(int32_t token, std::string& err) {
     float* row = W0.emb_h + (size_t) (W0.bank * kPipeMax + t) * E;
     tt->to_float(pack_emb_src_ + (size_t) token * ggml_row_size((ggml_type) pack_emb_type_, E), row, E);
     if (const float* img = image_row(p)) std::memcpy(row, img, (size_t) E * sizeof(float));
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->fast_->win.T = t + 1;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        m->fast_->win.pick_tok[W0.bank * kPipeMax + t] = token;   // (before token t is queued: its pick reads them)
+        m->fast_->win.T = t + 1;
+    }
     if (crew_ != nullptr && win_threads_on() && split_next_ != nullptr) {
         // each part's thread takes it in turn
         for (auto& wk : crew_->w) {

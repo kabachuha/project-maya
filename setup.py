@@ -26,7 +26,7 @@ WIN = os.name == "nt"
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
 
-PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
+PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil", "jsonschema>=4.18,<5"]
 
 
 # ------------------------------------------------------------------------------------------------ output
@@ -122,6 +122,51 @@ def out(cmd):
         return subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
     except (OSError, subprocess.TimeoutExpired):
         return ""
+
+
+_JOBS = []     # (Windows) the job objects of end_with_me: open while this process runs, closed by Windows when it ends
+
+
+def end_with_me(proc) -> bool:
+    """Windows: `proc` - and every process it starts (Maya's server: its engine, its vision encoder) - ends when this
+    process ends, however it ends: Task Manager or taskkill /F, the console window closed, a crash.  A job object
+    that kills its processes when its last handle - this process's, never closed here - closes.  Elsewhere nothing
+    to do (POSIX: the server's --parent-pipe).  False when it could not be set up."""
+    if not WIN:
+        return False
+    from ctypes import wintypes
+
+    class Basic(ctypes.Structure):                          # JOBOBJECT_BASIC_LIMIT_INFORMATION
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class Extended(ctypes.Structure):                       # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        _fields_ = [("Basic", Basic), ("Io", ctypes.c_uint64 * 6), ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        job =k32.CreateJobObjectW(None, None)
+        if not job:
+            return False
+        info = Extended()
+        info.Basic.LimitFlags = 0x2000                      # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)) or \
+                not k32.AssignProcessToJobObject(job, int(proc._handle)):   # (9: JobObjectExtendedLimitInformation)
+            k32.CloseHandle(job)
+            return False
+        _JOBS.append(job)
+        return True
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
 
 
 def done(path: Path) -> bool:
@@ -287,14 +332,40 @@ def gpu_info(pick=None):
     return {**g, "count": len(found)}
 
 
-def find_vcvars(cuda=True):
+VS2026_MIN_CUDA = (13, 2)       # NVIDIA's Windows install guide first lists VS 2026's toolset (MSVC 195x) in CUDA 13.2
+
+
+def nvcc_version(nvcc):
+    """(major, minor) from `nvcc --version` ('... release 13.2, V13.2.51'), or None when it cannot be run or read."""
+    if not nvcc:
+        return None
+    m = re.search(r"release (\d+)\.(\d+)", out([str(nvcc), "--version"]))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def nvcc_takes_vs2026(nvcc):
+    """True when that toolkit takes VS 2026's C++ toolset, so a 2026-only PC is usable with it.  NVIDIA's Windows
+    install guide names the supported MSVC per release: MSVC 195x / Visual Studio 2026 appears from CUDA 13.2 on,
+    while 13.1, 13.0 and every 12.x stop at 193x / VS 2022 - so the toolkit's own release says it."""
+    v = nvcc_version(nvcc)
+    return v is not None and v >= VS2026_MIN_CUDA    # unknown toolkit: False, the same requirement as CUDA 12.x
+
+
+def find_vcvars(cuda=True, nvcc=None):
+    """Visual Studio's vcvars64.bat for a build, newest first.
+    CUDA (the default) asks for 2019/2022 only ([16,18)): a newer one (2026 = version 18) installed next to them
+    must not be picked ("unsupported Microsoft Visual Studio version"), and with only a newer one there is none.
+    Given `nvcc` of CUDA 13.2 or newer - the release whose install guide first supports VS 2026's toolset - 2026
+    is taken as well, but an installed older VS stays the pick: such a PC often has a CUDA 12.x toolkit next to
+    the 13.2+ one, and 12.x takes only the older VS - the older one fits every toolkit the PC has.
+    ROCm's clang (the HIP build: cuda=False) takes a newer one too, 2019/2022 first."""
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.exists():
         return None
-    # CUDA 13 accepts Visual Studio 2019 and 2022 only: a newer one (2026 = version 18) installed next to them
-    # must not be picked ("unsupported Microsoft Visual Studio version"); with only a newer one there is none.
-    # ROCm's clang (the HIP build: cuda=False) takes a newer one too, 2019/2022 first
-    for versions in ([["-version", "[16.0,18.0)"]] if cuda else [["-version", "[16.0,18.0)"], []]):
+    ranges = [["-version", "[16.0,18.0)"]]
+    if not cuda or nvcc_takes_vs2026(nvcc):
+        ranges.append(["-version", "[18.0,)"])
+    for versions in ranges:
         p = out([str(vswhere), "-latest", "-products", "*", *versions, "-requires",
                  "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
         v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
@@ -323,7 +394,7 @@ def download(url, dst: Path, what=None):
     total = 0
     for attempt in range(5):
         try:
-            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"})
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "maya-setup"})
             total = int(urllib.request.urlopen(req, timeout=60).headers.get("Content-Length", 0))
             break
         except OSError as e:
@@ -337,7 +408,7 @@ def download(url, dst: Path, what=None):
     have = part.stat().st_size if part.exists() else 0
     for attempt in range(30):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={have}-"})
+            req = urllib.request.Request(url, headers={"User-Agent": "maya-setup", "Range": f"bytes={have}-"})
             with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
                 if have and r.status != 206:                     # the server ignored the range: start over
                     f.seek(0)
