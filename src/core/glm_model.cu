@@ -246,17 +246,25 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
 
 // a dense row's VRAM bytes as load_pack uploads it (0: not uploaded), and how: the fast path keeps the pack's big BF16
 // rows (kind 4) BF16 and the natively served rows (kind 0) quantized, dequantizes the rest to F32, and leaves
-// token_embd on the host (the embedding row is dequantized there from the shard mapping)
+// token_embd on the host (the embedding row is dequantized there from the shard mapping).  A small BF16 row takes
+// BOTH forms - F32 for the fast path's f32() lookups (the conv weights, the mHC scales) and BF16 for its b16()
+// lookups (the ssm gates, the mHC mixes): which of the two a small tensor is depends on the model's shapes, and a
+// duplicated 2-byte copy is cheaper than an unresolved-weights failure far from the pack.
 static uint64_t pack_row_vram(const std::string& name, const std::string& kind, const strata::TensorInfo* t, bool fast,
                               std::string* how = nullptr) {
+    const uint64_t n = (uint64_t) t->elements();
     if (fast && name == "token_embd.weight") return 0;
-    if (fast && kind == "4" && t->elements() >= 65536) {
-        if (how) *how = " bf16";
-        return ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
+    if (fast && kind == "4") {
+        if (n >= 65536) {
+            if (how) *how = " bf16";
+            return (n * 2 + 255u) & ~(uint64_t) 255u;
+        }
+        if (how) *how = " f32+bf16";
+        return ((n * 2 + 255u) & ~(uint64_t) 255u) + ((n * 4 + 255u) & ~(uint64_t) 255u);   // two aligned blocks
     }
     if (kind != "0" || name == "attn_k_b.weight" || name == "attn_v_b.weight") {
         if (how) *how = " f32";
-        return ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
+        return (n * 4 + 255u) & ~(uint64_t) 255u;
     }
     if (how) *how = " q" + std::to_string((int) t->type);
     return (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
@@ -3247,6 +3255,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             if (!dense) {
                 err = "pack: short read on dense.bin for " + r.name;
                 return false;
+            }
+            if (fast_mode_) {
+                // the small ones (keep16 sent the big rows to w16_ above) also stay BF16: the fast
+                // path looks several of them up by b16() and the rest by f32() - both succeed
+                { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), raw.size(),
+                                    cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+                w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
+                at += (r.bytes + 255u) & ~(uint64_t) 255u;
             }
             const uint16_t* src = (const uint16_t*) raw.data();
             uint32_t* dst = (uint32_t*) host.data();
