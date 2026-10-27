@@ -94,7 +94,7 @@ SMALL = dict(n_embd=128, n_vocab=512, n_layers=6, n_head=8, kda_head_dim=32, d_c
 #   * hot FFN gate/up scales (0.25 vs 0.05) so the SwiGLU clamps actually fire, and +8 spikes on
 #     every 8th ssm_dt channel so KDA decay gates actually reach the structural lower bound -
 #     the coverage audit's two zero branches on the gentle fixture (tools/cover_audit.py).
-BIG = dict(n_embd=256, n_vocab=512, n_layers=45, n_head=8, kda_head_dim=32, d_conv=4,
+BIG = dict(n_embd=256, n_vocab=512, n_layers=45, n_head=8, kda_head_dim=128, d_conv=4,
            q_lora=256, kv_lora=128, mla_k=64, mla_v=64, n_expert=32, n_exp_used=8,
            n_ff_exp=256, n_shared=1, n_ff_dense=512, dense_lead=3, hc=4, sinkhorn=5,
            idx_heads=8, idx_dim=64, idx_topk=256, kpool=4, ctx=1024, hot_ffn=0.25, dt_spikes=8.0,
