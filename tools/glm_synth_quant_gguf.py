@@ -50,7 +50,8 @@ def _s(text: str) -> bytes:
 
 # ------------------------------------------------------------------ the type map
 F16_OF = ("ssm_beta.weight", "ssm_f_a.weight", "ssm_f_b.weight", "ssm_g_a.weight", "ssm_g_b.weight",
-          "attn_k_b.weight", "attn_v_b.weight", "indexer.attn_k.weight", "indexer.attn_q_b.weight")
+          "attn_k_b.weight", "attn_v_b.weight", "indexer.attn_k.weight", "indexer.attn_q_b.weight",
+          "attn_kv_a_mqa.weight")   # the released quant keeps the absorbed KV projection unquantized
 F32_SUFFIX = ("attn_norm.weight", "ffn_norm.weight", "output_norm.weight", "hc_attn_fn.weight",
               "hc_attn_base.weight", "hc_attn_scale.weight", "hc_ffn_fn.weight", "hc_ffn_base.weight",
               "hc_ffn_scale.weight", "ssm_a", "ssm_dt.bias", "ssm_norm.weight", "ssm_conv1d_q.weight",
@@ -59,7 +60,7 @@ F32_SUFFIX = ("attn_norm.weight", "ffn_norm.weight", "output_norm.weight", "hc_a
               "indexer_compressor_gate.weight", "indexer_compressor_ape.weight", "ffn_gate_inp.weight",
               "exp_probs_b.bias", "nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight")
 Q8_SUFFIX = ("token_embd.weight", "output.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
-             "attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "attn_output.weight",
+             "attn_q_a.weight", "attn_q_b.weight", "attn_output.weight",
              "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "ffn_gate_shexp.weight",
              "ffn_up_shexp.weight", "ffn_down_shexp.weight", "nextn.eh_proj.weight")
 
@@ -215,6 +216,7 @@ def selftest(path: Path) -> None:
     assert by["blk.3.ffn_up_exps.weight"].type_name == "IQ3_S", "up exps type"
     assert by["blk.3.ffn_down_exps.weight"].type_name == "IQ4_XS", "down exps type"
     assert by["blk.3.attn_k_b.weight"].type_name == "F16", "absorbed MLA type"
+    assert by["blk.3.attn_kv_a_mqa.weight"].type_name == "F16", "the KV projection's type"
     assert by["blk.3.attn_q_a.weight"].type_name == "Q8_0", "attention projection type"
     assert by["token_embd.weight"].type_name == "Q8_0" and by["output.weight"].type_name == "Q8_0", "head/embed type"
     assert "blk.%d.nextn.eh_proj.weight" % S.BIG["n_layers"] in by, "the draft block present"

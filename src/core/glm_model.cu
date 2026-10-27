@@ -291,6 +291,10 @@ static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const s
     for (const char* n : kMtpRaw) {
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
+        if (!strata::kernels::native_mmvq_supported((int) t->type)) {
+            bytes += ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;   // the BF16 copy
+            continue;
+        }
         bytes += (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
                  ~(uint64_t) 255u;
     }
@@ -3761,27 +3765,12 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         ws_map_[n] = strata::core::WSlot{nullptr, strata::kernels::exl3::kTypeEXL3, &slot, m.k, m.n};
         return true;
     };
-    for (const char* n : raw_names) {
-        if (exl3_) {
-            if (!up_x3(P + n)) return false;
-            continue;
-        }
-        const strata::TensorInfo* t = find(P + n, si);
-        const size_t nb = strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]);
-        if (cudaMemcpy(base + at, src_of(t, si), nb, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: upload"; return false; }
-        ws_map_[P + n] = strata::core::WSlot{nullptr, (int) t->type, (const void*) (base + at), (int64_t) t->shape[0],
-                                             (int64_t) t->shape[1]};
-        at += (nb + 255u) & ~(uint64_t) 255u;
-    }
-    std::vector<uint16_t> b16;
-    for (const char* n : b16_names) {
-        if (x3(P + n)) {   // (an EXL3 pack quantizes the indexer's q_b: the fast path reads it from ws_map_)
-            if (!up_x3(P + n)) return false;
-            continue;
-        }
-        const strata::TensorInfo* t = find(P + n, si);
+    // a BF16 row: dequantized on the host, rounded to nearest even, into w16_ (the fast path's b16()
+    // and q_or_b16() lookups)
+    const auto up_b16 = [&](const std::string& n) -> bool {
+        const strata::TensorInfo* t = find(n, si);
         if (!to_host(t, si)) return false;
-        b16.resize(host.size());
+        std::vector<uint16_t> b16(host.size());
         for (size_t i = 0; i < host.size(); ++i) {   // round to nearest even
             uint32_t u;
             std::memcpy(&u, &host[i], 4);
@@ -3789,8 +3778,34 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             b16[i] = (uint16_t) (u >> 16);
         }
         if (cudaMemcpy(base + at, b16.data(), b16.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: upload"; return false; }
-        w16_[P + n] = (const uint16_t*) (base + at);
+        w16_[n] = (const uint16_t*) (base + at);
         at += ((uint64_t) b16.size() * 2 + 255u) & ~(uint64_t) 255u;
+        return true;
+    };
+    for (const char* n : raw_names) {
+        if (exl3_) {
+            if (!up_x3(P + n)) return false;
+            continue;
+        }
+        const strata::TensorInfo* t = find(P + n, si);
+        if (!strata::kernels::native_mmvq_supported((int) t->type)) {
+            // a projection the released quant keeps unquantized (the target file's attn_kv_a_mqa is
+            // F16): the BF16 copy the fast path's q_or_b16 reads, like the b16_names
+            if (!up_b16(P + n)) return false;
+            continue;
+        }
+        const size_t nb = strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]);
+        if (cudaMemcpy(base + at, src_of(t, si), nb, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: upload"; return false; }
+        ws_map_[P + n] = strata::core::WSlot{nullptr, (int) t->type, (const void*) (base + at), (int64_t) t->shape[0],
+                                             (int64_t) t->shape[1]};
+        at += (nb + 255u) & ~(uint64_t) 255u;
+    }
+    for (const char* n : b16_names) {
+        if (x3(P + n)) {   // (an EXL3 pack quantizes the indexer's q_b: the fast path reads it from ws_map_)
+            if (!up_x3(P + n)) return false;
+            continue;
+        }
+        if (!up_b16(P + n)) return false;
     }
     for (const char* n : f32_names) {
         const strata::TensorInfo* t = find(P + n, si);

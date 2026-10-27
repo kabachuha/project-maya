@@ -714,6 +714,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (it == ws_map_.end() || it->second.type == 0) {
                 const auto b = w16_.find(P + n);
                 if (b != w16_.end()) return WSlot{nullptr, gf::kTypeBF16, b->second, n_in, n_out};
+                if (it != ws_map_.end() && it->second.q != nullptr) return it->second;   // the dequantized F32 copy (the slow path's kind-4 rows)
             }
             return q(n);
         };

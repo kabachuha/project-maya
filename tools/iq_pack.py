@@ -80,6 +80,9 @@ GLM5NEXT_BF16 = (
     # the MLA norms and the 3-D absorbed projections that form the attention scores and values
     "attn_q_a_norm.weight", "attn_kv_a_norm.weight",
     "attn_k_b.weight", "attn_v_b.weight",
+    # the absorbed KV projection: the released quant keeps it F16 (the engine reads it as BF16,
+    # glm_fast_path.cu's q_or_b16)
+    "attn_kv_a_mqa.weight",
 )
 # The ONLY non-expert tensors a glm5-next pack may serve NATIVELY (quantized, read from the
 # GGUF by the Phase-4 driver's native reader): the attention projections and the dense/shared
