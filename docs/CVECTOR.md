@@ -128,8 +128,10 @@ eigensystem is more stable, and the GGUFs are stored F32 either way.
 
 `extract` drives the engine over its serve protocol (`CVEXTRACT <file> <ids...>`), so it needs:
 
-- **The whole trunk on one part** - no layer split (`STRATA_GLM_SPLIT=0`-style loading on a single
-  device that holds the model). On Maya-S24 (~93 GB) that is a big-GPU machine, not a 24 GB card.
+- **The model loaded, any placement** - single device or a layer split across several GPUs both work:
+  each part of a split captures its own rows (the head records the embedding, every part the rows after
+  its own layers) and the head assembles the file. On Maya-S24 (~93 GB) that is a big-GPU machine or a
+  multi-GPU split, not a 24 GB card.
 - **The reference path** - the tool sets `STRATA_GLM_SLOW=1` itself.
 - **The tokenizer** - `--tokenizer <pack>/tokenizer` (or a shard GGUF with the tokenizer inside).
 
@@ -162,7 +164,7 @@ Tuning knobs (all jukofyork defaults): `--num-samples`, `--seed`, `--tol` (0.5),
 | The math (planted direction recovered, noise filtered, midpoint/debias, `class1 ≈ -class0`) | `tools/test_cvec_create.py` | pass |
 | GGUF round-trip (1-based labels, `None` layers skipped, F32[`n_embd`], `layer_count`) | `tools/test_cvec_create.py` | pass |
 | The add kernel: `h += d` in every stream of every token, bitwise; non-steered layer and `cvec=0` no-ops | `ctest cvec_parity` | pass |
-| Extraction on a real GLM model (45-layer fixture): shape (45+1)×`n_embd`, bitwise-deterministic, last-token-sensitive | `ctest glm_cvec_extract_test` | pass |
+| Extraction on a real GLM model (45-layer fixture): shape (45+1)×`n_embd`, bitwise-deterministic, last-token-sensitive; a 2-part layer split gives the **bitwise same file** | `ctest glm_cvec_extract_test` | pass |
 | Load into the real Maya-S24 pack (shape/tensor match) | the 3090 | `glm cvec: 2 file(s), add mode, layers 1..44 (43 steered)` |
 | The rest of the suite | `ctest` (59 tests) | 56 pass; 3 pre-existing environmental failures (a missing Q2_0 fixture, a CPU without AVX512-VNNI, an nvcc-13 frontend crash in the untouched `glm_lora_kernels_test.cu`) |
 | Real steered generation | not on this box - the 93 GB model does not fit the 24 GB card | run it on the generation machine |

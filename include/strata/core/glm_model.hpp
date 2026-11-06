@@ -120,6 +120,13 @@ public:
     /// the first layer of each later part, devs.size() - 1 of them).
     bool load_pack_split(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& bounds,
                          const std::vector<int>& devs, std::string& err);
+    /// Test-only: for a part that load() loaded with the WHOLE trunk (the plain-GGUF fixture path), narrow
+    /// the range of layers it runs to [l0, l1) and link `next` into the split chain (this part takes
+    /// ownership; nullptr = the last part).  The weights and state of the layers it no longer runs stay
+    /// allocated but unused - the production split loads each part's own layers via load_pack_place, this
+    /// only re-ranges a full-trunk load so the split's per-part paths (the residual hop, cvec_extract's
+    /// per-part capture) are testable on the fixture.
+    void split_test_wire(int l0, int l1, Glm5Model* next);
     static constexpr int kMaxParts = 16;
     /// The fast decode path (src/core/glm_fast_path.cu) is the default for packs; STRATA_GLM_SLOW=1
     /// keeps the correctness-first per-op path (the reference the fast path is checked against).
@@ -785,8 +792,9 @@ public:
     // ---- the control vectors (the jukofyork algorithm; tools/cvec_create.py): a direction on the residual
     //      stream per trunk layer, added by strata::kernels::cvec_glm_apply right after each layer's FFN write.
     //      Loaded (STRATA_GLM_CVEC) in load_pack like the LoRA, applied on every path; the tables live in the
-    //      kernels (cvec.hpp), not here.  cvec_extract (the reference path) dumps, for one token, the mean-over-
-    //      streams residual after the embedding and after every layer, so the python side can form the deltas.
+    //      kernels (cvec.hpp), not here.  cvec_extract (the reference path, any layer split) dumps, for one
+    //      token, the mean-over-streams residual after the embedding and after every layer - each part of a
+    //      split captures its own rows - so the python side can form the deltas.
     bool cvec_cap_on_ = false;                              // step_layers records the per-layer residual means
     std::vector<float> cvec_cap_rows_;                      // (n_layers + 1) * n_embd, row l+1 = after layer l
     float* cvec_cap_dev_ = nullptr;                         // the device copy the capture kernels write (host->device on readout)

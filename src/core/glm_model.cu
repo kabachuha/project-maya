@@ -777,6 +777,12 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
     return true;
 }
 
+void Glm5Model::split_test_wire(int l0, int l1, Glm5Model* next) {
+    l0_ = l0;
+    l1_ = l1 > 0 ? l1 : g_.n_layers;
+    split_next_.reset(next);   // this part takes ownership (the destructor frees the tail first)
+}
+
 void Glm5Model::reset() {
     if (!loaded_) return;
     cudaSetDevice(dev_);
@@ -2002,31 +2008,47 @@ bool Glm5Model::cvec_extract(const std::vector<int32_t>& tokens, const std::stri
     const Glm5Geometry& g = g_;
     const size_t n = tokens.size();
     if (n == 0) { err = "cvec extract: empty token list"; return false; }
-    if (l0_ != 0 || l1_ != g.n_layers) {
-        err = "cvec extract: needs the whole trunk on one part (no layer split)";
+    if (l0_ != 0) {
+        err = "cvec extract: must be called on the split's head (the part that owns layer 0)";
         return false;
     }
-    cudaSetDevice(dev_);
+    // every part of the layer split gets a capture buffer on its own device: the part owning layers [l0, l1)
+    // records row 0 (the head only: the embedding) and rows l0 + 1 .. l1 (after each of its layers' FFN
+    // writes) - disjoint, and together the whole (n_layers + 1) * n_embd file
+    const size_t rows = ((size_t) g.n_layers + 1) * (size_t) g.n_embd;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        cudaSetDevice(m->dev_);
+        if (m->cvec_cap_dev_ == nullptr && cudaMalloc(&m->cvec_cap_dev_, rows * sizeof(float)) != cudaSuccess) {
+            m->cvec_cap_dev_ = nullptr;
+            err = "cvec extract: the capture buffer did not allocate";
+            return false;
+        }
+        if (cudaMemset(m->cvec_cap_dev_, 0, rows * sizeof(float)) != cudaSuccess) {
+            err = "cvec extract: the capture buffer did not clear";
+            return false;
+        }
+    }
     reset();   // a fresh sequence: each extraction is one standalone prompt, so the last token's residual sees
                // only this prompt (the serve loop reuses the model across CVEXTRACT lines, one per sample)
-    const size_t rows = ((size_t) g.n_layers + 1) * (size_t) g.n_embd;
-    if (cvec_cap_dev_ == nullptr && cudaMalloc(&cvec_cap_dev_, rows * sizeof(float)) != cudaSuccess) {
-        cvec_cap_dev_ = nullptr;
-        err = "cvec extract: the capture buffer did not allocate";
-        return false;
-    }
     cvec_cap_rows_.assign(rows, 0.0f);
-    // feed the prompt one token at a time (the reference path's own streaming); only the LAST token's
-    // per-layer residual means are recorded (cvec_cap_on_), so the file holds row 0 = the embedding and
-    // row l + 1 = the mean-over-streams residual after layer l
+    // feed the prompt one token at a time (the reference path's own streaming, hopping the residual across
+    // the parts); only the LAST token's per-layer residual means are recorded (cvec_cap_on_ on every part),
+    // so the file holds row 0 = the embedding and row l + 1 = the mean-over-streams residual after layer l
     for (size_t t = 0; t < n; ++t) {
-        cvec_cap_on_ = (t == n - 1);
+        const bool cap = (t == n - 1);
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->cvec_cap_on_ = cap;
         if (!step(tokens[t], err)) return false;
     }
-    cvec_cap_on_ = false;
-    if (cudaMemcpy(cvec_cap_rows_.data(), cvec_cap_dev_, rows * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
-        err = "cvec extract: the capture readback failed";
-        return false;
+    // read back each part's owned rows (a part owns [l0 == 0 ? 0 : l0 + 1, l1]) into the head's host array
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        const size_t r0 = (size_t) (m->l0_ == 0 ? 0 : m->l0_ + 1);
+        const size_t r1 = (size_t) m->l1_;
+        cudaSetDevice(m->dev_);
+        if (cudaMemcpy(cvec_cap_rows_.data() + r0 * (size_t) g.n_embd, m->cvec_cap_dev_ + r0 * (size_t) g.n_embd,
+                       (r1 - r0 + 1) * (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = "cvec extract: the capture readback failed";
+            return false;
+        }
     }
     std::FILE* f = std::fopen(file.c_str(), "wb");
     if (f == nullptr) { err = "cvec extract: cannot open " + file; return false; }
@@ -2133,8 +2155,9 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
     const float prescale = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
 
     // cvec extraction: the input residual (the embedding, all hc streams equal) is row 0 of the per-layer
-    // means the deltas are row[l + 1] - row[l]
-    if (cvec_cap_on_)
+    // means the deltas are row[l + 1] - row[l].  Only the part that owns layer 0 records it - a later part's
+    // input residual is its predecessor's last layer's output, already row l0 of the head's array
+    if (cvec_cap_on_ && l0_ == 0)
         mean_streams_kernel<<<blocks(g.n_embd), GM_THREADS>>>(R, cvec_cap_dev_, g.n_embd, g.hc, 1);
 
     for (int il = l0_; il < l1_; ++il) {

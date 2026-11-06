@@ -3086,7 +3086,7 @@ static int glm_pack_generate(const Options& o) {
         // CVEXTRACT <file> <id,id,...>: the control-vector extraction (tools/cvec_create.py) - run the reference
         // path over the tokens and write the per-layer mean-over-streams residual (row 0 = the embedding, row l + 1
         // = after layer l) to <file> as (n_layers + 1) * n_embd F32, so the python side can form the deltas.
-        // Needs the slow path (STRATA_GLM_SLOW=1) and the whole trunk on one part.
+        // Needs the slow path (STRATA_GLM_SLOW=1); any layer split works - each part captures its own rows.
         if (cmd == "CVEXTRACT") {
             std::string file, ids_s;
             ss >> file >> ids_s;

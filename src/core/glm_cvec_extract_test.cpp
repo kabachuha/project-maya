@@ -10,6 +10,9 @@
 //   3. NON-TRIVIAL: the captured residual is not all ~zero (something was recorded).
 //   4. LAST-TOKEN SENSITIVE: swapping only the final token moves the last layer's delta (row L - row L - 1)
 //      - the capture is at the right position, not a stale row.
+//   5. LAYER SPLIT: the same prompt through a two-part split (head 0..21, part2 22..44, one device each
+//      via split_test_wire) is BITWISE the single-part file - the per-part capture (row 0 the head's, row
+//      l + 1 the owner of layer l's) reassembles exactly what one part writes.
 //
 // No oracle: the f64 dump under data/glm5-big-dumps is logits only, not the per-layer residual.
 
@@ -85,7 +88,25 @@ int main(int argc, char** argv) {
         shift = std::max(shift, (double) std::fabs(da - dc));
     }
     require(shift > 1e-3, "swapping the last token did not move the last layer's delta (wrong capture position)");
-    std::printf("glm_cvec_extract_test: PASS (%zu floats, n_embd %d, deterministic, last-token shift %.3e)\n", R, N,
-                shift);
+
+    // ---- layer split: the same prompt through a two-part split (the head runs layers 0..21, part2 the
+    //      rest) must give the BITWISE same file - the split runs the same reference kernels (the residual
+    //      crossing the boundary is a bit-exact host hop), and each part captures its own rows: row 0 the
+    //      head's (the embedding), row l + 1 the owner of layer l's.  `a` used the original tokens, so
+    //      restore the final token the sensitivity check swapped
+    toks.back() = last0;
+    {
+        strata::core::Glm5Model* part2 = new strata::core::Glm5Model();
+        require(part2->load(gguf, 1024, err), "load part2: " + err);
+        part2->split_test_wire(22, L, nullptr);
+        model.split_test_wire(0, 22, part2);   // the model takes ownership; its destructor frees the tail
+        require(model.cvec_extract(toks, o3, err), "extract d (split): " + err);
+        const std::vector<float> d = read_f32(o3);
+        require(d.size() == R, "the file (split) is (n_layers + 1) * n_embd floats");
+        require(d == a, "the split extraction is bitwise the single-part one (the per-part capture)");
+    }
+    std::printf("glm_cvec_extract_test: PASS (%zu floats, n_embd %d, deterministic, last-token shift %.3e, "
+                "split == single-part)\n",
+                R, N, shift);
     return 0;
 }
