@@ -218,6 +218,65 @@ int main() {
         check(same, "add is h + d in every stream (bitwise)");
     }
 
+    // ---- 5. glm5-next add (cvec_glm_apply): after a trunk layer's OWN mHC write the stack already holds the
+    //        layer's output, so the kernel only ADDS layer's direction to every hc stream of every token - no
+    //        pending write to fold.  Bitwise like the qwen add, and a no-op off a non-steered layer or with the
+    //        per-request flag off (the graphs stay identical either way).
+    std::printf("glm add (cvec_glm_apply)\n");
+    {
+        const int64_t GL = 6;   // a steered layer
+        float* dRg = dalloc<float>((size_t) (T * HC * 4096));   // room for the largest case (T, GN = 4096)
+        for (int64_t GN : {4096, 300, 256, 1}) {   // 4096 = Maya-S24 n_embd; 300/256/1 = the d-loop edges
+            std::vector<float> gdir((size_t) (L * GN)), gs((size_t) L, 0.0f);
+            for (auto& x : gdir) x = nd(rng);
+            gs[(size_t) GL] = 1.0f;
+            if (!k::cvec_upload(gdir, gs, /*add*/ 1, 0, (int) (L - 1), GN, HC, err)) return 2;
+            const int64_t GD = HC * GN;
+            for (int64_t Tn : {1, 3}) {
+                std::vector<float> Rg((size_t) (Tn * GD));
+                for (auto& x : Rg) x = nd(rng) * 3.0f;
+                up(dRg, Rg);
+                k::cvec_glm_apply(dRg, GL, Tn, GD, nullptr);
+                ck(cudaDeviceSynchronize(), "glm add");
+                const auto got = down(dRg, Rg.size());
+                bool same = true;
+                for (int64_t t = 0; t < Tn; ++t)
+                    for (int64_t c = 0; c < HC; ++c)
+                        for (int64_t j = 0; j < GN; ++j) {
+                            const size_t i = (size_t) (t * GD + c * GN + j);
+                            same = same && got[i] == Rg[i] + gdir[(size_t) (GL * GN + j)];
+                        }
+                char what[96];
+                std::snprintf(what, sizeof what, "glm add n=%lld T=%lld: h + d in every stream (bitwise)",
+                              (long long) GN, (long long) Tn);
+                check(same, what);
+            }
+        }
+        // the two no-ops, against a fresh upload
+        {
+            const int64_t GN = 256, GD = HC * GN;
+            std::vector<float> gdir((size_t) (L * GN)), gs((size_t) L, 0.0f);
+            for (auto& x : gdir) x = nd(rng);
+            gs[(size_t) GL] = 1.0f;
+            if (!k::cvec_upload(gdir, gs, /*add*/ 1, 0, (int) (L - 1), GN, HC, err)) return 2;
+            std::vector<float> Rg((size_t) (T * GD));
+            for (auto& x : Rg) x = nd(rng);
+            up(dRg, Rg);
+            k::cvec_glm_apply(dRg, kOff, T, GD, nullptr);   // kOff has s = 0
+            ck(cudaDeviceSynchronize(), "glm off layer");
+            check(std::memcmp(down(dRg, Rg.size()).data(), Rg.data(), Rg.size() * 4) == 0,
+                  "glm add: a layer without a direction is untouched");
+            k::cvec_set_enabled(false);
+            up(dRg, Rg);
+            k::cvec_glm_apply(dRg, GL, T, GD, nullptr);
+            ck(cudaDeviceSynchronize(), "glm flag off");
+            check(std::memcmp(down(dRg, Rg.size()).data(), Rg.data(), Rg.size() * 4) == 0,
+                  "glm add: the per-request flag off leaves R unchanged");
+            k::cvec_set_enabled(true);
+        }
+        cudaFree(dRg);
+    }
+
     std::printf(g_fail ? "cvec_parity: %d FAILED\n" : "cvec_parity: all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

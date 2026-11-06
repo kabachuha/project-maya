@@ -782,6 +782,15 @@ public:
     Glm5Lora lora_;
     std::string lora_path_;                                 // STRATA_GLM_LORA: its GGUF (every part knows it)
     float lora_scale_ = 1.0f;                               // STRATA_GLM_LORA_SCALE: the user's scale
+    // ---- the control vectors (the jukofyork algorithm; tools/cvec_create.py): a direction on the residual
+    //      stream per trunk layer, added by strata::kernels::cvec_glm_apply right after each layer's FFN write.
+    //      Loaded (STRATA_GLM_CVEC) in load_pack like the LoRA, applied on every path; the tables live in the
+    //      kernels (cvec.hpp), not here.  cvec_extract (the reference path) dumps, for one token, the mean-over-
+    //      streams residual after the embedding and after every layer, so the python side can form the deltas.
+    bool cvec_cap_on_ = false;                              // step_layers records the per-layer residual means
+    std::vector<float> cvec_cap_rows_;                      // (n_layers + 1) * n_embd, row l+1 = after layer l
+    float* cvec_cap_dev_ = nullptr;                         // the device copy the capture kernels write (host->device on readout)
+    bool cvec_extract(const std::vector<int32_t>& tokens, const std::string& file, std::string& err);
     // ---- the DFlash drafter (src/core/glm_dflash.cu): the part with the head holds it, on its device
     std::unique_ptr<GlmDflash> dflash_;
     std::string dflash_path_;                              // STRATA_GLM_DFLASH: its GGUF (every part knows it)

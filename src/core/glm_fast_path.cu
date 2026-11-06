@@ -20,6 +20,7 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cvec.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
@@ -5224,6 +5225,9 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         gf::hc(h, s);
         if (F->prof_on) F->mark("hc_attn");
         if (il != l0_) std::swap(Rc, Ro);
+        // the control vector: layer il - 1's direction (its FFN write was just folded into this read), on the
+        // residual that is now layer il's input (Rc) - before the drafter reads it, so the draft sees the same
+        if (il != l0_) strata::kernels::cvec_glm_apply(Rc, (int64_t) (il - 1), 1, (int64_t) g.hc * g.n_embd, s);
         // Rc: the layer's input - the DFlash drafter's feature when it reads this layer
         dflash_capture(il, Rc, 1, p, F->cap, F->cap_rows, s);
         if (dumps) {
@@ -5343,6 +5347,8 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     }
     // the last layer's write half: R (in the OTHER buffer) = post x ffn + comb . R
     gf::hc_post(F->ffn, Rc, F->post, F->comb, g.n_embd, Ro, s);
+    // the control vector: the last layer's (l1_ - 1) direction, on the residual just written (Ro)
+    strata::kernels::cvec_glm_apply(Ro, (int64_t) (l1_ - 1), 1, (int64_t) g.hc * g.n_embd, s);
     if (F->prof_on) F->mark("hc_post_end");
     // keep the convention "the residual lives at state_" for the hop and the head: copy back
     if (Ro != state_)

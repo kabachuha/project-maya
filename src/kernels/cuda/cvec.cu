@@ -42,6 +42,21 @@ bool upload_here(std::string& err) {
 // the fused hyper-connection read's gate (fused_gr.cu), so a write done here is bitwise the one it would have folded
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
+// the glm5-next apply: after a trunk layer's FFN write the residual stack (T tokens, hc streams of n each,
+// stream-major, token stride r_ld) already holds the layer's output, so the whole job is to ADD layer's
+// direction to every stream of every token - no pending write to fold (the mHC write the fused read does is
+// the layer's own, done by the hc kernels).  One block per (stream, token).
+__global__ void cvec_glm_kernel(float* __restrict__ R, const float* __restrict__ dir, const float* __restrict__ s_l,
+                                const int* __restrict__ on, int64_t layer, int n, int64_t r_ld) {
+    const int c = blockIdx.x;
+    const int64_t t = blockIdx.y;
+    const bool steer = *on != 0 && s_l[layer] != 0.0f;   // uniform over the block
+    if (!steer) return;
+    float* r = R + t * r_ld + (int64_t) c * n;
+    const float* v = dir + layer * n;
+    for (int d = threadIdx.x; d < n; d += THREADS) r[d] += v[d];
+}
+
 // one block per (stream, token): the pending write, then h . v over the stream, then the update
 __global__ void cvec_kernel(float* __restrict__ R, const float* __restrict__ dir, const float* __restrict__ s_l,
                             const int* __restrict__ on, int mode, int64_t layer, int n, int hc, int64_t r_ld,
@@ -102,18 +117,19 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
                  int64_t n_embd, int64_t hc, std::string& err) {
     if (n_embd < 1 || n_embd > (int64_t) THREADS * MAXK) { err = "control vector: unsupported n_embd"; return false; }
     if (s.empty() || dir.size() != s.size() * (size_t) n_embd) { err = "control vector: bad table sizes"; return false; }
-    int prev = 0;   // a new vector replaces the old one on every device
-    cudaGetDevice(&prev);
-    for (int d = 0; d < kDevices; ++d) {
-        if (g_dev[d].dir == nullptr) continue;
-        cudaSetDevice(d);
-        cudaDeviceSynchronize();
-        cudaFree(g_dev[d].dir);
-        cudaFree(g_dev[d].s);
-        cudaFree(g_dev[d].on);
-        g_dev[d] = DevTables{};
+    // a new vector replaces the old one ON THIS DEVICE only: a layer split uploads per part (each part's
+    // load_pack on its own card), and freeing every device here would drop the tables the earlier parts
+    // already apply on theirs
+    {
+        DevTables& t0 = g_dev[cur_device()];
+        if (t0.dir != nullptr) {
+            cudaDeviceSynchronize();
+            cudaFree(t0.dir);
+            cudaFree(t0.s);
+            cudaFree(t0.on);
+            t0 = DevTables{};
+        }
     }
-    cudaSetDevice(prev);
     g_dir_host = dir;
     g_s_host = s;
     g_on_host = true;
@@ -161,6 +177,15 @@ void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* b
                                                             (int) g_cvec.n_embd, (int) g_cvec.hc, r_ld, bo, bo_ld,
                                                             inj, inj_ld, write ? 1 : 0);
     if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("cvec_apply: launch failed");
+}
+
+void cvec_glm_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, void* stream) {
+    if (!g_cvec.loaded() || T < 1) return;
+    const DevTables& t = g_dev[cur_device()];
+    if (t.dir == nullptr) throw std::runtime_error("cvec_glm_apply: the control vector is not on this device (cvec_replicate)");
+    const dim3 grid((unsigned) g_cvec.hc, (unsigned) T);
+    cvec_glm_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(R, t.dir, t.s, t.on, layer, (int) g_cvec.n_embd, r_ld);
+    if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("cvec_glm_apply: launch failed");
 }
 
 }  // namespace strata::kernels

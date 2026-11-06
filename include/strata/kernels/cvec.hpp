@@ -58,4 +58,11 @@ bool cvec_enabled();
 void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* bo, int64_t bo_ld, const float* inj,
                 int64_t inj_ld, bool write, void* stream);
 
+/// The glm5-next apply (add mode only): R already holds layer's complete output (the mHC write is the layer's
+/// own, done by the hc kernels), so this just ADDS layer's direction to every hc stream of every one of the T
+/// tokens' residual stacks (`R + t * r_ld`, stream-major).  No-op without a loaded vector or when the layer is
+/// not steered (s_l == 0) or the per-request flag is off.  Capture-safe like `cvec_apply` (the `on` flag is a
+/// device read).
+void cvec_glm_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, void* stream);
+
 }  // namespace strata::kernels

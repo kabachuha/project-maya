@@ -26,6 +26,8 @@
 #include "strata/kernels/router_sigmoid.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cvec.hpp"
+#include "strata/artifact/gguf_reader.hpp"
 
 #include "ggml.h"
 
@@ -637,6 +639,7 @@ Glm5Model::~Glm5Model() {
         cudaSetDevice(dev_);
     }
     if (d_tok_) cudaFree(d_tok_);
+    if (cvec_cap_dev_) cudaFree(cvec_cap_dev_);
     if (w_arena_) cudaFree(w_arena_);
     if (mtp_arena_) cudaFree(mtp_arena_);
     kv_stream_free(kv_);
@@ -1825,6 +1828,104 @@ static void cb_dump_h(const std::string& name, const void* host, int64_t n) {
     if (f) { std::fwrite(host, 4, (size_t) n, f); std::fclose(f); }
 }
 
+// STRATA_GLM_CVEC: the jukofyork control vectors (tools/cvec_create.py) - a comma-separated "path:scale"
+// list of controlvector GGUFs.  A full effect is a PAIR: the debias GGUF plus one concept GGUF (the concept
+// is RELATIVE to its debias and cannot be used alone).  Each file's direction.<label> (F32, n_embd) is the
+// direction of engine layer (label - 1): the 1-based label is jukofyork's (his layer_index + 1, the layer
+// whose own FFN write the direction is added after), mapped here onto the 0-based layer the kernel applies
+// on.  Every file's directions are summed (each times its scale), add mode; layers with no direction stay
+// unsteered.  Read once per part in load_pack (like the LoRA); the tables are per-device (cvec_upload).
+static bool glm_cvec_from_env(const Glm5Geometry& g, std::string& err) {
+    const char* env = getenv("STRATA_GLM_CVEC");
+    if (env == nullptr || env[0] == '\0') return true;   // none named: the stock model
+    const int64_t L = g.n_layers, N = g.n_embd;
+    std::vector<float> data((size_t) L * (size_t) N, 0.0f);
+    std::vector<bool> have((size_t) L, false);
+    const std::string list = env;
+    size_t at = 0;
+    int found_files = 0;
+    while (at <= list.size()) {
+        size_t comma = list.find(',', at);
+        if (comma == std::string::npos) comma = list.size();
+        const std::string item = list.substr(at, comma - at);
+        if (!item.empty()) {
+            std::string path = item;
+            float scale = 1.0f;
+            // a "path:scale": the scale is the text after the LAST ':' when it is entirely a number (a Windows
+            // drive's ':' leaves a non-number after it, so the whole item stays the path)
+            const size_t colon = item.rfind(':');
+            if (colon != std::string::npos && colon > 0) {
+                const char* sc = item.c_str() + colon + 1;
+                char* endp = nullptr;
+                const float scv = std::strtof(sc, &endp);
+                if (sc < endp && *endp == '\0') {
+                    path = item.substr(0, colon);
+                    scale = scv;
+                }
+            }
+            try {
+                strata::GgufFile f(path);
+                const strata::MetaValue* arch = f.get("general.architecture");
+                if (arch == nullptr || arch->s != "controlvector") {
+                    err = "cvec: " + path + " is not a controlvector GGUF (general.architecture)";
+                    return false;
+                }
+                if (const strata::MetaValue* hint = f.get("controlvector.model_hint"))
+                    if (hint->s != "glm5-next")
+                        std::fprintf(stderr, "glm cvec: %s was made for '%s', not glm5-next\n", path.c_str(),
+                                     hint->s.c_str());
+                int found = 0;
+                for (const strata::TensorInfo& t : f.tensors()) {
+                    if (t.name.rfind("direction.", 0) != 0) continue;
+                    const long l = std::strtol(t.name.c_str() + 10, nullptr, 10) - 1;   // 1-based -> 0-based layer
+                    if (l < 0 || l >= L) continue;   // layer 0 and past the trunk are not steered
+                    if (t.type != 0 || t.elements() != (uint64_t) N) {
+                        err = "cvec: " + path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
+                        return false;
+                    }
+                    const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
+                    for (int64_t j = 0; j < N; ++j) data[(size_t) l * N + j] += scale * src[j];
+                    have[(size_t) l] = true;
+                    ++found;
+                }
+                if (found == 0) {
+                    err = "cvec: " + path + " has no direction.<layer> tensor in layers 1.." + std::to_string(L - 1);
+                    return false;
+                }
+                ++found_files;
+            } catch (const std::exception& e) {
+                err = "cvec: " + path + ": " + e.what();
+                return false;
+            }
+        }
+        at = comma + 1;
+    }
+    if (found_files == 0) { err = "cvec: STRATA_GLM_CVEC named no files"; return false; }
+    // the steering range: trunk layers [1, n_layers - 1] (layer 0 has no direction; the MTP block, layer
+    // n_layers, is a different table) - overridable, as the qwen path's, by the FIRST/LAST env
+    int first = 1, last = (int) L - 1;
+    if (const char* v = getenv("STRATA_GLM_CVEC_FIRST"); v && v[0]) first = std::atoi(v);
+    if (const char* v = getenv("STRATA_GLM_CVEC_LAST"); v && v[0]) last = std::atoi(v);
+    if (first < 1) first = 1;
+    if (last >= (int) L) last = (int) L - 1;
+    std::vector<float> dir((size_t) L * (size_t) N, 0.0f), s((size_t) L, 0.0f);
+    int steered = 0;
+    for (int64_t l = first; l <= last; ++l) {
+        if (!have[(size_t) l]) continue;
+        s[(size_t) l] = 1.0f;   // add mode
+        std::copy(data.begin() + (size_t) l * N, data.begin() + (size_t) (l * N + N), dir.begin() + (size_t) l * N);
+        ++steered;
+    }
+    if (steered == 0) {
+        err = "cvec: no direction in layers " + std::to_string(first) + ".." + std::to_string(last);
+        return false;
+    }
+    if (!strata::kernels::cvec_upload(dir, s, 1, first, last, N, g.hc, err)) return false;   // mode 1 = add
+    std::fprintf(stderr, "glm cvec: %d file(s), add mode, layers %d..%d (%d steered)\n", found_files, first, last,
+                 steered);
+    return true;
+}
+
 // STRATA_GLM_TIMING=1: record a phase event and surface a failure AT THE SITE (the error would
 // otherwise latch and be blamed on whatever ran next)
 static bool tev_rec(void* ev, const char* what) {
@@ -1894,6 +1995,47 @@ bool Glm5Model::step(int32_t token, std::string& err) {
         prev = m;
     }
     cudaSetDevice(dev_);
+    return true;
+}
+
+bool Glm5Model::cvec_extract(const std::vector<int32_t>& tokens, const std::string& file, std::string& err) {
+    const Glm5Geometry& g = g_;
+    const size_t n = tokens.size();
+    if (n == 0) { err = "cvec extract: empty token list"; return false; }
+    if (l0_ != 0 || l1_ != g.n_layers) {
+        err = "cvec extract: needs the whole trunk on one part (no layer split)";
+        return false;
+    }
+    cudaSetDevice(dev_);
+    reset();   // a fresh sequence: each extraction is one standalone prompt, so the last token's residual sees
+               // only this prompt (the serve loop reuses the model across CVEXTRACT lines, one per sample)
+    const size_t rows = ((size_t) g.n_layers + 1) * (size_t) g.n_embd;
+    if (cvec_cap_dev_ == nullptr && cudaMalloc(&cvec_cap_dev_, rows * sizeof(float)) != cudaSuccess) {
+        cvec_cap_dev_ = nullptr;
+        err = "cvec extract: the capture buffer did not allocate";
+        return false;
+    }
+    cvec_cap_rows_.assign(rows, 0.0f);
+    // feed the prompt one token at a time (the reference path's own streaming); only the LAST token's
+    // per-layer residual means are recorded (cvec_cap_on_), so the file holds row 0 = the embedding and
+    // row l + 1 = the mean-over-streams residual after layer l
+    for (size_t t = 0; t < n; ++t) {
+        cvec_cap_on_ = (t == n - 1);
+        if (!step(tokens[t], err)) return false;
+    }
+    cvec_cap_on_ = false;
+    if (cudaMemcpy(cvec_cap_rows_.data(), cvec_cap_dev_, rows * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = "cvec extract: the capture readback failed";
+        return false;
+    }
+    std::FILE* f = std::fopen(file.c_str(), "wb");
+    if (f == nullptr) { err = "cvec extract: cannot open " + file; return false; }
+    if (std::fwrite(cvec_cap_rows_.data(), 4, cvec_cap_rows_.size(), f) != cvec_cap_rows_.size()) {
+        std::fclose(f);
+        err = "cvec extract: short write to " + file;
+        return false;
+    }
+    std::fclose(f);
     return true;
 }
 
@@ -1989,6 +2131,11 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
     strata::kernels::GlmHcWorkspace hcws;
     strata::kernels::glm_hc_workspace_init(hcs, A + sc_inv, hcws);
     const float prescale = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
+
+    // cvec extraction: the input residual (the embedding, all hc streams equal) is row 0 of the per-layer
+    // means the deltas are row[l + 1] - row[l]
+    if (cvec_cap_on_)
+        mean_streams_kernel<<<blocks(g.n_embd), GM_THREADS>>>(R, cvec_cap_dev_, g.n_embd, g.hc, 1);
 
     for (int il = l0_; il < l1_; ++il) {
         if (timing_ && !tev_rec(tev_a_, "a")) timing_ = false;
@@ -2217,6 +2364,12 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
 
         strata::kernels::glm_hc_post(A + sc_ffn, R, A + sc_post, A + sc_comb, hcs, S, nullptr);
         R = S;
+        // cvec extraction: the per-layer mean (row il + 1 = after layer il's FFN write, before any cvec)
+        if (cvec_cap_on_)
+            mean_streams_kernel<<<blocks(g.n_embd), GM_THREADS>>>(
+                R, cvec_cap_dev_ + (int64_t) (il + 1) * g.n_embd, g.n_embd, g.hc, 1);
+        // the control vector: layer il's direction, added to every stream of the (single) token's residual
+        strata::kernels::cvec_glm_apply(R, il, 1, g.hc * g.n_embd, nullptr);
         cb_dump("l_out-" + L, R, g.hc * g.n_embd);
         if (timing_) {
             if (!tev_rec(tev_d_, "d")) timing_ = false;
@@ -2654,6 +2807,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         std::fprintf(stderr, "glm lora: %s (rank %d, alpha %.6g, user scale %.6g)\n", lora_path_.c_str(), lora_.r,
                      lora_.alpha, lora_scale_);
     }
+    // the control vectors (STRATA_GLM_CVEC=<path:scale,path:scale>, STRATA_GLM_CVEC_FIRST/LAST): loaded onto
+    // this part's device, like the LoRA (every part of a split loads the whole set - a part only APPLIES the
+    // layers it runs, and cvec_upload keeps the tables per-device)
+    if (const char* cv = getenv("STRATA_GLM_CVEC"); cv != nullptr && cv[0] != '\0')
+        if (!glm_cvec_from_env(g_, err)) return false;
     // the layer split: this instance carries only ITS layers' rows (token_embd lives on the first
     // half, the head's tensors on the last); every per-layer array stays indexed by the ABSOLUTE
     // layer id, so all offsets and kernels are unchanged

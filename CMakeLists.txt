@@ -586,6 +586,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(glm_pack_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})
   target_include_directories(glm_model_big_test PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_model_big_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})
+  # the control-vector extraction (cvec_extract, the CVEXTRACT serve command) on the same big fixture
+  add_executable(glm_cvec_extract_test src/core/glm_cvec_extract_test.cpp)
+  target_include_directories(glm_cvec_extract_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(glm_cvec_extract_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})
   find_program(STRATA_PYTHON3 python3)
   if(STRATA_PYTHON3)
     add_test(NAME glm_model_big_gen
@@ -597,6 +601,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(glm_model_big_test PROPERTIES
                          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
                          FIXTURES_REQUIRED glm5_big_gguf)
+    add_test(NAME glm_cvec_extract_test
+             COMMAND glm_cvec_extract_test ${CMAKE_CURRENT_BINARY_DIR}/glm5-big-fixture.gguf)
+    set_tests_properties(glm_cvec_extract_test PROPERTIES FIXTURES_REQUIRED glm5_big_gguf
+                         TIMEOUT 300)
   endif()
 
   add_executable(gdn_parity src/kernels/gdn_parity.cpp)

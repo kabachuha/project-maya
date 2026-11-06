@@ -24,6 +24,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/glm_batch.hpp"
+#include "strata/kernels/cvec.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #if defined(STRATA_USE_HIP)
 #include "strata/prefill/gemm.hpp"
@@ -1739,6 +1740,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].start, s);
         hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
         S->mark("hc", s);
+        // the control vector: layer il - 1's direction (its FFN write was just folded into this read), on the
+        // chunk's residual rows (S->R), before the drafter reads them
+        if (il != l0_) strata::kernels::cvec_glm_apply(S->R, (int64_t) (il - 1), (int64_t) T, (int64_t) g.hc * E, s);
         // S->R: the layer's input rows - the DFlash drafter's features when it reads this layer (the stream means go
         // out through S->mixer, which this layer's mixer writes only after)
         dflash_capture(il, S->R, T, p0, S->mixer, T, s);
@@ -3059,6 +3063,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     if (!tail_skip) {
         gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
         S->mark("hc", s);
+        // the control vector: the last layer's (l1_ - 1) direction, on the chunk's residual just written
+        strata::kernels::cvec_glm_apply(S->R, (int64_t) (l1_ - 1), (int64_t) T, (int64_t) g.hc * E, s);
     }
     // ---- the NextN block's caches for these positions (the half that carries it): position p reads h_p and the
     //      embedding of the token at p + 1 - an image's row where p + 1 is one of its positions (next_img), as the

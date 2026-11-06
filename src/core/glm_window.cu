@@ -16,6 +16,7 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/cvec.hpp"
 
 #include "ggml.h"
 
@@ -863,6 +864,11 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
         const int k = il - l0_;
         hc_rows(il, true, rc_in[(size_t) k], t0, n);
         mark("hc");
+        // the control vector: layer il - 1's direction (its FFN write was just folded into this read), on the
+        // window's input rows (W.R[rc_in[k]^1] for t0 .. t0 + n - 1), before the drafter reads them
+        if (il != l0_)
+            strata::kernels::cvec_glm_apply(W.R[rc_in[(size_t) k] ^ 1] + (size_t) t0 * hcE, (int64_t) (il - 1),
+                                            (int64_t) n, (int64_t) hcE, s);
         // the layer's input rows - the drafter's features when it reads this layer
         dflash_capture(il, W.R[rc_mid[(size_t) k]] + (size_t) t0 * hcE, n, p0 + t0, F->cap, F->cap_rows, s);
         mark("capture");
@@ -970,6 +976,8 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
     for (int t = 0; t < T; ++t)
         gf::hc_post(W.ffn + (size_t) t * E, W.R[rc] + (size_t) t * hcE, W.post + (size_t) t * 8,
                     W.comb + (size_t) t * 16, E, W.R[rc ^ 1] + (size_t) t * hcE, s);
+    // the control vector: the last layer's (l1_ - 1) direction, on the window's output rows (W.R[rc^1])
+    strata::kernels::cvec_glm_apply(W.R[rc ^ 1], (int64_t) (l1_ - 1), (int64_t) T, (int64_t) hcE, s);
     W.out = rc ^ 1;
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {

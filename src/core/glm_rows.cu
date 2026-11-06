@@ -16,6 +16,7 @@
 #include "glm_fast_state.hpp"
 
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/cvec.hpp"
 
 #include "ggml.h"
 
@@ -283,7 +284,11 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
         h.norm_w = Ly.attn_norm;
         for (int i = 0; i < n; ++i) {
             hc_row(i, il == l0_ ? nullptr : rows(S->ffn, E, i));
-            if (il != l0_) std::swap(rw[i].Rc, rw[i].Ro);
+            if (il != l0_) {
+                std::swap(rw[i].Rc, rw[i].Ro);
+                // the control vector: layer il - 1's direction, on row i's residual (rw[i].Rc)
+                strata::kernels::cvec_glm_apply(rw[i].Rc, (int64_t) (il - 1), 1, (int64_t) g.hc * E, s);
+            }
         }
 
         if (Ly.recr) {
@@ -448,6 +453,8 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
     // the last layer's write half, per row; the residual back at the arena's start (the token path's convention)
     for (int i = 0; i < n; ++i) {
         gf::hc_post(rows(S->ffn, E, i), rw[i].Rc, rows(S->post, 8, i), rows(S->comb, 16, i), E, rw[i].Ro, s);
+        // the control vector: the last layer's (l1_ - 1) direction, on row i's residual (rw[i].Ro)
+        strata::kernels::cvec_glm_apply(rw[i].Ro, (int64_t) (l1_ - 1), 1, (int64_t) g.hc * E, s);
         if (rw[i].Ro != rw[i].state)
             cudaMemcpyAsync(rw[i].state, rw[i].Ro, (size_t) g.hc * E * sizeof(float), cudaMemcpyDeviceToDevice, s);
     }

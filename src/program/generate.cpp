@@ -1017,6 +1017,22 @@ static int glm_pack_generate(const Options& o) {
     if (!o.lora.empty()) set_env("STRATA_GLM_LORA", o.lora.c_str());
     if (o.lora_scale_set)
         set_env("STRATA_GLM_LORA_SCALE", std::to_string(o.lora_scale).c_str());
+    // the control vectors (--control-vector FILE / --control-vector-scaled FILE SCALE, else STRATA_GLM_CVEC):
+    // loaded with the model, like the LoRA; GLM applies them ADD mode only (the qwen "project" mode has no mHC
+    // analogue here), and a full effect is a debias GGUF plus one concept GGUF (the concept is relative to it)
+    if (o.cvec_mode == 0 && !o.cvec_files.empty())
+        std::fprintf(stderr, "maya generate: GLM control vectors run add mode only (ignoring --cvec-mode project)\n");
+    if (!o.cvec_files.empty()) {
+        std::string cv;
+        for (const auto& [path, scale] : o.cvec_files) {
+            if (!cv.empty()) cv += ",";
+            cv += path;
+            if (scale != 1.0f) cv += ":" + std::to_string(scale);
+        }
+        set_env("STRATA_GLM_CVEC", cv.c_str());
+    }
+    if (o.cvec_first > 0) set_env("STRATA_GLM_CVEC_FIRST", std::to_string(o.cvec_first).c_str());
+    if (o.cvec_last > 0) set_env("STRATA_GLM_CVEC_LAST", std::to_string(o.cvec_last).c_str());
     // the expert profile (Strata's profile.bin: setup passes data/expert-profile-glm.bin) and the routing trace
     // (--dump-routing: tools/make_profile.py's input), before the load reads the one and the first prompt the other
     if (!o.expert_profile.empty()) model.set_expert_profile(o.expert_profile);
@@ -1038,12 +1054,13 @@ static int glm_pack_generate(const Options& o) {
         // (+ the CPU lane setup's calibration reads: its threads and its PCIe share, as the engine started)
         std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast "
                     "experts=%d vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d vision_lend=%zu "
-                    "cpu_threads=%d pcie_share=%.2f logit_bias=1\n",
+                    "cpu_threads=%d pcie_share=%.2f cvec=%d logit_bias=1\n",
                     (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) model.kv_resident(),
                     (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
-                    model.dflash_ready() ? 1 : 0, model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share());
+                    model.dflash_ready() ? 1 : 0, model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share(),
+                    strata::kernels::cvec().loaded() ? 1 : 0);
         // the Monitor's map of each GPU: what each part holds on its card, in bytes (Glm5Model::VramReport) - the
         // server finds the card NVML numbers by its PCI address and adds what NVML sees besides
         for (const auto& r : model.vram_report())
@@ -3066,6 +3083,33 @@ static int glm_pack_generate(const Options& o) {
             std::fflush(stdout);
             continue;
         }
+        // CVEXTRACT <file> <id,id,...>: the control-vector extraction (tools/cvec_create.py) - run the reference
+        // path over the tokens and write the per-layer mean-over-streams residual (row 0 = the embedding, row l + 1
+        // = after layer l) to <file> as (n_layers + 1) * n_embd F32, so the python side can form the deltas.
+        // Needs the slow path (STRATA_GLM_SLOW=1) and the whole trunk on one part.
+        if (cmd == "CVEXTRACT") {
+            std::string file, ids_s;
+            ss >> file >> ids_s;
+            std::vector<int64_t> t64;
+            std::string e;
+            if (file.empty() || ids_s.empty() || !parse_i64_list(ids_s.c_str(), t64, e)) {
+                std::printf("ERR malformed CVEXTRACT line\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (model.fast()) {
+                std::printf("ERR CVEXTRACT needs the reference path (set STRATA_GLM_SLOW=1)\n");
+                std::fflush(stdout);
+                continue;
+            }
+            std::vector<int32_t> toks;
+            toks.reserve(t64.size());
+            for (int64_t t : t64) toks.push_back((int32_t) t);
+            if (model.cvec_extract(toks, file, err)) std::printf("CVOK\n");
+            else std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+            continue;
+        }
         if (cmd == "LOGP") {
             int64_t n_ctx = 0;
             std::string ids_s;
@@ -3135,6 +3179,7 @@ static int glm_pack_generate(const Options& o) {
             int req_threads = 0;
             int req_chunks = 0;   // ... and its disk reads' pieces (0: as the engine started)
             int req_rid = -1;
+            int req_cvec = 1;   // cvec=0|1: this request's control vector (on when absent, if one is loaded)
             req_spec = 0;
             req_spec_min_p = -1.0;
             req_spec_n_min = -1;
@@ -3165,6 +3210,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "cpu_threads") { req_threads = std::atoi(v.c_str()); }
                 else if (k == "read_chunks") { req_chunks = std::atoi(v.c_str()); }
                 else if (k == "rid") { req_rid = std::atoi(v.c_str()); }
+                else if (k == "cvec") { req_cvec = std::atoi(v.c_str()); }   // 0|1: switch a loaded vector for this request
                 else if (k == "spec") { req_spec = std::atoi(v.c_str()); }
                 else if (k == "spec_min_p") { req_spec_min_p = std::atof(v.c_str()); }
                 else if (k == "spec_n_min") { req_spec_n_min = std::atoi(v.c_str()); }
@@ -3272,6 +3318,9 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
             model.set_image_rows(cur_img_pos, cur_img_rows);
+            // the control vector's per-request switch (a loaded one is ON by default; cvec=0 turns it off):
+            // syncs the device flag between requests, so the captured graphs are unchanged
+            strata::kernels::cvec_set_enabled(req_cvec != 0);
             run_request(toks, max_new, rq);
             model.set_image_rows({}, {});
             continue;
