@@ -164,15 +164,27 @@ Tuning knobs (all jukofyork defaults): `--num-samples`, `--seed`, `--tol` (0.5),
 `--skip-end` (1 - the trailing layer he skips), `--model-hint` (`glm5-next`), `--device-experts` (opt
 into the GPU expert pool).
 
-Troubleshooting a `misaligned address` during extraction: it is almost always the **device expert pool**
-faulting (see the routed-experts note above), reported late at the next layer's id read-back. The default
-CPU path avoids it. To confirm, run the extraction with `--device-experts` **and** `export
-STRATA_GLM_SYNCCHECK=1` first - the engine then syncs after each layer's expert compute and names the
-faulting kernel, layer and device instead of the innocent `cudaMemcpy`:
+Troubleshooting a `misaligned address` during extraction: it is an **async fault reported late**, at the
+next MoE layer's expert-id read-back (the first sync after the faulting kernel), so the named `cudaMemcpy`
+is innocent. Two known sources: the **device expert pool** (see the routed-experts note; the default CPU
+path avoids it) and, on the reference path, a **LoRA** adapter. To pinpoint the real kernel, run the
+extraction with `export STRATA_GLM_SYNCCHECK=1` (add `--device-experts` if you suspect the pool) - the
+engine then syncs after each layer's expert compute and names the faulting kernel, layer and device:
 
 ```
 SYNCCHECK: fault in the device expert pool (quantize + native_expert_grouped + axpy) at layer 28 on CUDA1: misaligned address
 ```
+
+(If it names a LoRA kernel instead, drop the `--lora` flag for the extraction - the vectors are the base
+model's, and LoRA steering is applied separately at generation time.)
+
+Troubleshooting a **stall / "no progress for 180 s" / "engine closed the pipe"**: the serve watchdog
+(issue #29) kills the engine when its heartbeat stops for `STRATA_WATCHDOG_S` seconds (default 180). A
+full-prompt CVEXTRACT on the slow reference path legitimately runs past that, and the reference path beats
+the watchdog per token now (`cvec extract: token N` in the stage) - so a current build should not be
+killed mid-extraction. If you still see it (a single token over the limit, or a genuinely stuck engine),
+raise or disable it with `export STRATA_WATCHDOG_S=600` (or `=0` to turn it off) and re-run; the stall
+report's stage line then tells you where it stopped.
 
 ---
 

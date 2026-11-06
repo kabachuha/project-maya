@@ -27,6 +27,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/core/progress.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 
 #include "ggml.h"
@@ -2053,6 +2054,12 @@ bool Glm5Model::cvec_extract(const std::vector<int32_t>& tokens, const std::stri
     // the parts); only the LAST token's per-layer residual means are recorded (cvec_cap_on_ on every part),
     // so the file holds row 0 = the embedding and row l + 1 = the mean-over-streams residual after layer l
     for (size_t t = 0; t < n; ++t) {
+        // the serve watchdog (issue #29) kills the engine when the heartbeat stops for STRATA_WATCHDOG_S
+        // seconds, and the reference path beats it nowhere else: a full-prompt CVEXTRACT on the slow path
+        // (per-layer syncs, experts off NVMe) legitimately runs past the limit.  Beat per token (one token
+        // is far under the limit) and show the progress in the stage, so the watchdog sees it is moving.
+        strata::core::progress_beat();
+        strata::core::progress_at("cvec extract: token", (int64_t) (t + 1));
         const bool cap = (t == n - 1);
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->cvec_cap_on_ = cap;
         if (!step(tokens[t], err)) return false;
