@@ -212,6 +212,15 @@ def extract(a: argparse.Namespace, triplets, class_names, renderer, tokenizer,
         print(f"resuming: {start}/{T} already extracted")
     env = os.environ.copy()
     env["STRATA_GLM_SLOW"] = "1"
+    # The reference path (STRATA_GLM_SLOW=1) computes the routed experts on the DEVICE expert pool
+    # (native_expert_grouped) - but that pool's blob pointers carry no guaranteed 16-byte alignment, so a
+    # vectorised dequant faults with "misaligned address" on some quantisations (the fault is async and
+    # surfaces, misattributed, at the NEXT MoE layer's expert-id read-back).  The CPU native path is the
+    # robust fallback for extraction (correctness-first, one-time, averaged over many prompts so the
+    # CPU/GPU rounding difference is immaterial).  Force it unless --device-experts (use the faster
+    # device pool on a model whose quantisation is known to align).
+    if not getattr(a, "device_experts", False):
+        env["STRATA_GLM_CPU_EXPERTS"] = "1"
     engine_args = [a.exe, "--serve", "--glm-pack", str(a.pack), *a.engine_arg]
     p = subprocess.Popen(engine_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
                          bufsize=1, env=env)
@@ -382,6 +391,10 @@ def _add_common(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--start-layer", type=int, default=0, help="first layer index to analyse (default 0)")
     ap.add_argument("--skip-end", type=int, default=1, help="trailing layers to skip (default 1, jukofyork)")
     ap.add_argument("--model-hint", default=MODEL_HINT)
+    ap.add_argument("--device-experts", action="store_true",
+                    help="use the device expert pool instead of the CPU native path (faster, but it can fault "
+                         "with 'misaligned address' on some quantisations; the default CPU path is the robust "
+                         "fallback for extraction)")
 
 
 def main() -> int:

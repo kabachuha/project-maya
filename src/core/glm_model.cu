@@ -460,6 +460,24 @@ static bool pack_dequant_tensor(const strata::TensorInfo& t, const uint8_t* src,
     return true;
 }
 
+// STRATA_GLM_SYNCCHECK=1: catch a kernel's execution fault at its OWN launch site.  CUDA faults are
+// asynchronous and sticky, so a faulting kernel (e.g. native_expert_grouped's misaligned dequant) is
+// otherwise reported, misattributed, at the next synchronisation - the NEXT MoE layer's expert-id
+// read-back - which makes the cause look like an innocent cudaMemcpy.  Off by default (a stream sync
+// per MoE layer would slow the reference path); the sync is on the CURRENT device (step() sets it).
+static bool sync_check(const char* what, int layer, std::string& err) {
+    if (getenv("STRATA_GLM_SYNCCHECK") == nullptr) return true;
+    int dev = 0;
+    (void) cudaGetDevice(&dev);
+    cudaError_t e_ = cudaStreamSynchronize(0);
+    if (e_ != cudaSuccess) {
+        err = std::string("SYNCCHECK: fault in ") + what + " at layer " + std::to_string(layer) + " on CUDA" +
+              std::to_string(dev) + ": " + cudaGetErrorString(e_);
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 // ================================ geometry ================================
@@ -2704,6 +2722,9 @@ bool strata::core::Glm5Model::pack_moe_tail_device(std::string& err, const std::
         axpy_kernel<<<blocks(g.n_embd), GM_THREADS>>>(A + sc_moe, rw[(size_t) i],
                                                       dev_hit_out_ + (size_t) i * g.n_embd, g.n_embd);
     { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    // STRATA_GLM_SYNCCHECK=1: this is where a device-pool fault (e.g. native_expert_grouped's misaligned
+    // dequant) is caught at its own layer, not deferred to the next MoE layer's id read-back
+    if (!sync_check("the device expert pool (quantize + native_expert_grouped + axpy)", layer, err)) return false;
     return true;
 }
 

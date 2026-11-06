@@ -134,6 +134,14 @@ eigensystem is more stable, and the GGUFs are stored F32 either way.
   multi-GPU split, not a 24 GB card.
 - **The reference path** - the tool sets `STRATA_GLM_SLOW=1` itself.
 - **The tokenizer** - `--tokenizer <pack>/tokenizer` (or a shard GGUF with the tokenizer inside).
+- **The routed experts** - the reference path can compute the MoE experts on the GPU (the *device expert
+  pool*, `native_expert_grouped`) or on the CPU (the *native path*). The tool **defaults to the CPU path**
+  (`STRATA_GLM_CPU_EXPERTS=1`): the device pool's per-expert blob pointers carry no guaranteed 16-byte
+  alignment, so a vectorised dequant can fault with `misaligned address` on some quantisations - a fault
+  that is async and only surfaces, misattributed, at the *next* MoE layer's expert-id read-back. The CPU
+  path is the robust fallback and, for extraction (averaged over many prompts), the CPU/GPU rounding
+  difference is immaterial. Pass **`--device-experts`** to use the faster GPU pool on a model whose
+  quantisation is known to align.
 
 Cost: **3 × `--num-samples` forward passes** over the sampled prompts (baseline + both classes per
 triplet), each a full prompt on the *slow* path. `--num-samples 32` is a verification-sized run;
@@ -153,7 +161,18 @@ python tools/cvec_create.py create  --samples /tmp/samples --out /tmp/cvec
 ```
 
 Tuning knobs (all jukofyork defaults): `--num-samples`, `--seed`, `--tol` (0.5), `--start-layer` (0),
-`--skip-end` (1 - the trailing layer he skips), `--model-hint` (`glm5-next`).
+`--skip-end` (1 - the trailing layer he skips), `--model-hint` (`glm5-next`), `--device-experts` (opt
+into the GPU expert pool).
+
+Troubleshooting a `misaligned address` during extraction: it is almost always the **device expert pool**
+faulting (see the routed-experts note above), reported late at the next layer's id read-back. The default
+CPU path avoids it. To confirm, run the extraction with `--device-experts` **and** `export
+STRATA_GLM_SYNCCHECK=1` first - the engine then syncs after each layer's expert compute and names the
+faulting kernel, layer and device instead of the innocent `cudaMemcpy`:
+
+```
+SYNCCHECK: fault in the device expert pool (quantize + native_expert_grouped + axpy) at layer 28 on CUDA1: misaligned address
+```
 
 ---
 
