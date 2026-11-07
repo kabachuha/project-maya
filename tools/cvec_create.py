@@ -367,8 +367,8 @@ def export_gguf(directions: list[np.ndarray | None], n_layers: int, n_embd: int,
 
 
 def create(a: argparse.Namespace, class_names: list[str]) -> None:
-    A = np.load(a.samples / "A.npy", mmap_mode="r")
-    B = np.load(a.samples / "B.npy", mmap_mode="r")
+    A = np.load(a.samples / "A.npy", mmap_mode="r", allow_pickle=True)
+    B = np.load(a.samples / "B.npy", mmap_mode="r", allow_pickle=True)
     n_layers, n_embd = A.shape[1], A.shape[2]
     print(f"A/B: {A.shape} (num_triplets, n_layers, n_embd)")
     directions = analyze(A, B, n_layers, a.start_layer, a.skip_end, a.tol)
