@@ -36,6 +36,12 @@ python tools/cvec_create.py run \
 | `/tmp/cvec-compassion/sadism.gguf` | steer toward sadism (~the negative of the above) |
 | `/tmp/cvec-compassion/samples/` | `A.npy`, `B.npy`, `meta.json` (re-run `create` without re-extracting) |
 
+Note: `A.npy` / `B.npy` are **raw float32 memmaps, not `.npy` files** (no header) - the extraction writes
+them one triplet at a time so a run can be resumed. Read them with `np.memmap(..., shape=<from meta.json>)`,
+not `np.load` (which fails with `UnpicklingError`). `create` does this for you; it also refuses a samples
+dir where the file size disagrees with `meta.json` (a stale file from a different `--num-samples`) or the
+extraction is incomplete (`done < T`).
+
 Apply them to a generation:
 
 ```sh

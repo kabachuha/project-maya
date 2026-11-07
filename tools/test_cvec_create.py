@@ -12,6 +12,8 @@ What it checks (the algorithm is jukofyork's, ported to numpy in tools/cvec_crea
 """
 from __future__ import annotations
 
+import argparse
+import json
 import pathlib
 import sys
 import tempfile
@@ -154,9 +156,73 @@ def test_gguf_loader_contract():
         print("  loader contract: arch=controlvector, direction.<l> F32[n_embd] (1-based), None skipped OK")
 
 
+def test_samples_memmap_roundtrip_and_create():
+    # extract() writes A.npy / B.npy as RAW float32 memmaps (no .npy header) plus a meta.json; create() must
+    # map them back with the shape meta.json recorded (np.load CANNOT read them - this was the "invalid load
+    # key" bug).  Simulate a finished extraction on synthetic contrastive data, then run create() end-to-end:
+    # the mapped values round-trip exactly and the three GGUFs come out.  A stale file (meta shape != file
+    # size) and an incomplete extraction (done < T) must be rejected, not silently misread.
+    T, n_layers, n_embd = S, L, E
+    # class-minus-baseline arrays, exactly the way extract() stores them in A / B
+    base, c0, c1 = _make_contrastive(1.0, 2.0)
+    A_data = np.ascontiguousarray((c0 - base).astype(np.float32))
+    B_data = np.ascontiguousarray((c1 - base).astype(np.float32))
+    with tempfile.TemporaryDirectory() as td:
+        sdir = pathlib.Path(td)
+        # what extract() does: raw memmaps (one triplet at a time) + a meta.json
+        A = np.memmap(sdir / "A.npy", dtype=np.float32, mode="w+", shape=(T, n_layers, n_embd))
+        B = np.memmap(sdir / "B.npy", dtype=np.float32, mode="w+", shape=(T, n_layers, n_embd))
+        A[:] = A_data
+        B[:] = B_data
+        A.flush(); B.flush()
+        meta = {"done": T, "T": T, "n_layers": n_layers, "n_embd": n_embd,
+                "class_names": ["alpha", "beta"], "seed": 0, "trait": "test"}
+        (sdir / "meta.json").write_text(json.dumps(meta))
+        # the mapped readback is exactly what was written
+        back = cv._load_samples(sdir, "A", meta)
+        assert np.array_equal(np.asarray(back), A_data), "raw memmap round-trip is not exact"
+        # create() runs end-to-end and writes the three GGUFs
+        out = pathlib.Path(td) / "ggufs"
+        cv.create(argparse.Namespace(samples=sdir, out=out, start_layer=0, skip_end=1,
+                                     tol=0.5, model_hint="glm5-next"), ["alpha", "beta"])
+        for nm in ("debias", "alpha", "beta"):
+            assert (out / f"{nm}.gguf").exists(), f"{nm}.gguf missing"
+        # a stale file (meta describes a bigger shape than the file holds) is rejected, not misread
+        stale = dict(meta, done=T * 2, T=T * 2)
+        (sdir / "meta.json").write_text(json.dumps(stale))
+        try:
+            cv._load_samples(sdir, "A", stale)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("stale A.npy (size != meta shape) should raise SystemExit")
+        # an incomplete extraction is rejected by create()
+        incomplete = dict(meta, done=T - 1)
+        (sdir / "meta.json").write_text(json.dumps(incomplete))
+        try:
+            cv.create(argparse.Namespace(samples=sdir, out=out, start_layer=0, skip_end=1,
+                                         tol=0.5, model_hint="glm5-next"), ["alpha", "beta"])
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("incomplete extraction (done < T) should raise SystemExit")
+        # a missing meta.json is rejected with a clear message
+        (sdir / "meta.json").unlink()
+        try:
+            cv.create(argparse.Namespace(samples=sdir, out=out, start_layer=0, skip_end=1,
+                                         tol=0.5, model_hint="glm5-next"), ["alpha", "beta"])
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("missing meta.json should raise SystemExit")
+    print("  samples round-trip: raw memmap + meta.json -> create() -> 3 GGUFs; "
+          "stale / incomplete / missing-meta all rejected")
+
+
 def _all():
     tests = [test_planted_direction_and_debias, test_discriminant_ratio_filters_noise,
-             test_gguf_export_roundtrip, test_gguf_loader_contract]
+             test_gguf_export_roundtrip, test_gguf_loader_contract,
+             test_samples_memmap_roundtrip_and_create]
     for t in tests:
         print(f"{t.__name__}:")
         t()

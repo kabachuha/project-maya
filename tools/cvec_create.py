@@ -366,9 +366,31 @@ def export_gguf(directions: list[np.ndarray | None], n_layers: int, n_embd: int,
     return True
 
 
+def _load_samples(samples: pathlib.Path, name: str, meta: dict) -> np.memmap:
+    # A.npy / B.npy are RAW float32 memmaps (no .npy header): the extraction writes them one triplet at a
+    # time (resumable), so np.load cannot read them - they must be mapped back with the shape meta.json
+    # recorded.  A size check catches a stale file from a different run (different --num-samples).
+    T, n_layers, n_embd = meta["T"], meta["n_layers"], meta["n_embd"]
+    path = samples / f"{name}.npy"
+    expected = (T * n_layers * n_embd) * np.dtype(np.float32).itemsize
+    actual = path.stat().st_size
+    if actual != expected:
+        raise SystemExit(f"{path.name} is {actual} bytes but meta.json describes shape "
+                         f"({T}, {n_layers}, {n_embd}) = {expected} bytes - a stale file from a different "
+                         f"run; re-run `extract` (or `run`) so A/B and meta.json agree")
+    return np.memmap(path, dtype=np.float32, mode="r", shape=(T, n_layers, n_embd))
+
+
 def create(a: argparse.Namespace, class_names: list[str]) -> None:
-    A = np.load(a.samples / "A.npy", mmap_mode="r", allow_pickle=True)
-    B = np.load(a.samples / "B.npy", mmap_mode="r", allow_pickle=True)
+    meta_path = a.samples / "meta.json"
+    if not meta_path.exists():
+        raise SystemExit(f"{meta_path} is missing - run `extract` (or `run`) first")
+    meta = json.loads(meta_path.read_text())
+    if meta.get("done", 0) < meta["T"]:
+        raise SystemExit(f"extraction is incomplete ({meta['done']}/{meta['T']} triplets) - resume it "
+                         f"with `extract --resume` before `create`")
+    A = _load_samples(a.samples, "A", meta)
+    B = _load_samples(a.samples, "B", meta)
     n_layers, n_embd = A.shape[1], A.shape[2]
     print(f"A/B: {A.shape} (num_triplets, n_layers, n_embd)")
     directions = analyze(A, B, n_layers, a.start_layer, a.skip_end, a.tol)
