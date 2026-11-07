@@ -198,18 +198,50 @@ def _run_cvextract(proc, tmpfile: str, ids: list[int]) -> None:
     raise SystemExit("engine closed the pipe during CVEXTRACT")
 
 
+def _open_samples(out: pathlib.Path, T: int, n_layers: int, n_embd: int, resume: bool):
+    # Open (or create) the raw A/B memmaps for the samples dir.  A fresh run maps them "w+" - which
+    # TRUNCATES an existing file - so a resume must map them "r+" instead, keeping the extracted rows
+    # (otherwise the already-done triplets are wiped to zero and then skipped).  A resume first checks
+    # that meta.json and the files belong to THIS run (same T / n_layers / n_embd, files the right
+    # size), so it can never silently mix rows from two different runs.
+    meta_path = out / "meta.json"
+    start, mode = 0, "w+"
+    if resume and meta_path.exists():
+        old = json.loads(meta_path.read_text())
+        start = int(old.get("done", 0))
+        bad = [(k, old.get(k), v) for k, v in (("T", T), ("n_layers", n_layers), ("n_embd", n_embd))
+               if old.get(k) != v]
+        if bad:
+            raise SystemExit(f"cannot resume: {meta_path.name} records "
+                             + ", ".join(f"{k}={o}" for k, o, _ in bad) + " but this run is "
+                             + ", ".join(f"{k}={v}" for k, _, v in bad)
+                             + " - a different run; delete the samples dir and re-run without --resume")
+        want = T * n_layers * n_embd * np.dtype(np.float32).itemsize
+        exist = [nm for nm in ("A", "B") if (out / f"{nm}.npy").exists()]
+        for nm in exist:
+            if (out / f"{nm}.npy").stat().st_size != want:
+                raise SystemExit(f"cannot resume: {nm}.npy in {out} is "
+                                 f"{(out / f'{nm}.npy').stat().st_size} bytes, not {want} (the size for shape "
+                                 f"({T}, {n_layers}, {n_embd})) - delete the samples dir and re-run "
+                                 f"without --resume")
+        if len(exist) == 2:
+            mode = "r+"
+            print(f"resuming: {start}/{T} already extracted")
+        else:
+            start = 0
+            print(f"resume requested but A.npy / B.npy are incomplete ({', '.join(exist) or 'none'}) "
+                  f"- starting fresh")
+    A = np.memmap(out / "A.npy", dtype=np.float32, mode=mode, shape=(T, n_layers, n_embd))
+    B = np.memmap(out / "B.npy", dtype=np.float32, mode=mode, shape=(T, n_layers, n_embd))
+    return A, B, start, meta_path
+
+
 def extract(a: argparse.Namespace, triplets, class_names, renderer, tokenizer,
             n_embd: int, n_layers: int) -> None:
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     T = len(triplets)
-    A = np.memmap(out / "A.npy", dtype=np.float32, mode="w+", shape=(T, n_layers, n_embd))
-    B = np.memmap(out / "B.npy", dtype=np.float32, mode="w+", shape=(T, n_layers, n_embd))
-    meta_path = out / "meta.json"
-    start = 0
-    if a.resume and meta_path.exists():
-        start = int(json.loads(meta_path.read_text()).get("done", 0))
-        print(f"resuming: {start}/{T} already extracted")
+    A, B, start, meta_path = _open_samples(out, T, n_layers, n_embd, a.resume)
     env = os.environ.copy()
     env["STRATA_GLM_SLOW"] = "1"
     # The reference path (STRATA_GLM_SLOW=1) computes the routed experts on the DEVICE expert pool

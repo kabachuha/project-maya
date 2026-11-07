@@ -219,10 +219,67 @@ def test_samples_memmap_roundtrip_and_create():
           "stale / incomplete / missing-meta all rejected")
 
 
+def test_resume_keeps_extracted_rows():
+    # extract --resume must keep the already-extracted rows (map with "r+") and continue at `done`.
+    # (The old code mapped with "w+" - which TRUNCATES - before the resume check: the done rows were
+    # wiped to zero and then skipped.)  A resume whose meta.json / files come from a different run must
+    # be rejected, not silently mixed; a resume with the files missing starts fresh.
+    T, n_layers, n_embd = 16, 4, 8
+    with tempfile.TemporaryDirectory() as td:
+        out = pathlib.Path(td)
+        A, B, start, meta_path = cv._open_samples(out, T, n_layers, n_embd, resume=False)
+        assert start == 0
+        # simulate `done` extracted triplets (row i carries a marker) + a meta.json checkpoint
+        done = 6
+        for i in range(done):
+            A[i] = float(i + 1)
+        A.flush()
+        meta_path.write_text(json.dumps({"done": done, "T": T, "n_layers": n_layers, "n_embd": n_embd,
+                                         "class_names": ["alpha", "beta"], "seed": 0, "trait": "test"}))
+        del A, B
+        # resume: the done rows survive, start == done
+        A, B, start, _ = cv._open_samples(out, T, n_layers, n_embd, resume=True)
+        assert start == done
+        for i in range(done):
+            assert np.allclose(A[i], float(i + 1)), f"row {i} was wiped by the resume (got {A[i][0]})"
+        del A, B
+        # a resume from a different run (different T) is rejected
+        meta_path.write_text(json.dumps({"done": 0, "T": T * 2, "n_layers": n_layers, "n_embd": n_embd}))
+        try:
+            cv._open_samples(out, T, n_layers, n_embd, resume=True)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("resume with a different T in meta.json should raise SystemExit")
+        # a resume with a different layer geometry is rejected (even at the same total file size)
+        meta_path.write_text(json.dumps({"done": 0, "T": T, "n_layers": n_layers * 2, "n_embd": n_embd // 2}))
+        try:
+            cv._open_samples(out, T, n_layers, n_embd, resume=True)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("resume with a different geometry should raise SystemExit")
+        # a resume whose file size is wrong is rejected
+        (out / "A.npy").write_bytes(b"\x00" * 16)
+        meta_path.write_text(json.dumps({"done": 0, "T": T, "n_layers": n_layers, "n_embd": n_embd}))
+        try:
+            cv._open_samples(out, T, n_layers, n_embd, resume=True)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("resume with a wrong A.npy size should raise SystemExit")
+        # a resume with the files missing starts fresh (start 0, files recreated)
+        (out / "A.npy").unlink(); (out / "B.npy").unlink()
+        A, B, start, _ = cv._open_samples(out, T, n_layers, n_embd, resume=True)
+        assert start == 0 and (out / "A.npy").exists()
+    print("  resume: done rows survive (r+), start == done; "
+          "different-run / wrong-size / missing-file all handled")
+
+
 def _all():
     tests = [test_planted_direction_and_debias, test_discriminant_ratio_filters_noise,
              test_gguf_export_roundtrip, test_gguf_loader_contract,
-             test_samples_memmap_roundtrip_and_create]
+             test_samples_memmap_roundtrip_and_create, test_resume_keeps_extracted_rows]
     for t in tests:
         print(f"{t.__name__}:")
         t()
