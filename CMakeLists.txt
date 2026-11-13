@@ -188,6 +188,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(ds4_ablate_test tests/ds4_ablate_test.cpp)
   target_link_libraries(ds4_ablate_test PRIVATE strata_artifact)
   add_test(NAME ds4_ablate_test COMMAND ds4_ablate_test)
+  # the DeepSeek engine's --control-vector loader (ds4_cvec.hpp): the same conventions as the GLM engine's
+  add_executable(ds4_cvec_test tests/ds4_cvec_test.cpp)
+  target_link_libraries(ds4_cvec_test PRIVATE strata_artifact)
+  add_test(NAME ds4_cvec_test COMMAND ds4_cvec_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------

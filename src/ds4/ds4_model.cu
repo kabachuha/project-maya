@@ -14,6 +14,7 @@
 #include "ds4_borrow.hpp"
 #include "ds4_cpu_exl3.hpp"
 #include "ds4_ablate.hpp"
+#include "ds4_cvec.hpp"
 #include "ds4_engram_io.hpp"
 
 #include "ds4_gguf.cuh"
@@ -33,6 +34,7 @@
 #include "ds4_ram_slice.hpp"
 #include "ds4_vision.cuh"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "strata/kernels/cvec.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -604,6 +606,7 @@ struct Dev {
     float* d_proj_norm = nullptr;
     cudaEvent_t ev_seed = nullptr;
     float* abl_r = nullptr;   // abliteration: the direction (unit, [dim]) every write of this device loses (or null)
+    float* cap = nullptr;     // control-vector extraction: the stream-mean scratch (dim floats, lazily allocated)
     // threads / tensor parallelism: its group and its index in it, the group's all-reduces it took part in, xfer_put's
     // block counter, the hand-off to the next group (host-mapped: h | pre | topk | cand, then its flag), the window
     // MoE's grouping scratch
@@ -1003,6 +1006,10 @@ struct Model::Impl {
     std::vector<float> abl_dir;
     float abl_scale = 0.0f;
     std::string abl_what;
+    // control-vector extraction (cvec_extract): while cap_last_, the last token's stream means (row 0 the
+    // embedding's, row il + 1 layer il's) land in cap_host_ as the layers run
+    std::atomic<bool> cap_last_{false};
+    std::vector<float> cap_host_;
     Pack pk;
     Geo g;
     std::vector<Dev> devs;
@@ -2039,6 +2046,25 @@ struct Model::Impl {
     void ablate(const Dev& d, float* y, int T, cudaStream_t s) const {
         if (d.abl_r != nullptr) project_out(y, d.abl_r, abl_scale, g.dim, T, s);
     }
+    // control-vector extraction: the window's last row's streams mean (the stream the vector would steer) into
+    // cap_host_'s row (row 0: the embedding's, row il + 1: layer il's) - the hc_mean the DSpark taps use, a D2H
+    // of the one row (the capture is once per extraction, so the wait is not on the hot path)
+    bool cap_row(Dev& d, int row, int T, cudaStream_t s, std::string& err) {
+        const int D = g.dim, H = g.hc;
+        if (d.cap == nullptr && !dalloc(d, d.cap, (size_t) D, err)) return false;
+        hc_mean(d.h + (size_t) (T - 1) * H * D, 1, H, D, d.cap, D, s);
+        if (cudaStreamSynchronize(s) != cudaSuccess) {
+            err = "the control-vector extraction's capture wait failed";
+            return false;
+        }
+        std::vector<float> h((size_t) D);
+        if (cudaMemcpy(h.data(), d.cap, (size_t) D * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = "the control-vector extraction's capture read failed";
+            return false;
+        }
+        std::memcpy(cap_host_.data() + (size_t) row * D, h.data(), (size_t) D * sizeof(float));
+        return true;
+    }
     static const Layer& member(const Layer& l, int m) { return m == 0 ? l : l.mates[(size_t) m - 1]; }
     // bytes of a VRAM slot of l's experts (a member's part of each, in a group)
     static size_t unit(const Layer& l) { return l.nm > 1 ? l.hblob : l.blob; }
@@ -2891,6 +2917,23 @@ struct Model::Impl {
                 CK(cudaSetDevice(d.id));
                 CK(cudaMemcpy(d.abl_r, abl_dir.data(), abl_dir.size() * sizeof(float), cudaMemcpyHostToDevice));
             }
+        }
+        // control vectors (llama.cpp's --control-vector): the directions read once (ds4_cvec.hpp), the kernel's
+        // tables on every device (applied after each steered layer's MoE write, on top of what ablate() projects
+        // out of the write itself)
+        if (!o.cvec_files.empty() && !o.vision_only) {
+            std::vector<float> dir, s;
+            int cfirst = 0, clast = 0;
+            std::string summary;
+            if (!cvec::build(o.cvec_files, g.nl, g.dim, o.cvec_mode, o.cvec_first, o.cvec_last, o.cvec_single, dir, s,
+                             cfirst, clast, summary, err))
+                return false;
+            if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, cfirst, clast, g.dim, g.hc, err)) return false;
+            for (Dev& d : devs) {
+                CK(cudaSetDevice(d.id));
+                if (!strata::kernels::cvec_replicate(err)) return false;
+            }
+            std::fprintf(stderr, "ds4: control vectors: %s (%zu file(s))\n", summary.c_str(), o.cvec_files.size());
         }
         // (MAYA_DS4_Q8_BATCH: its line now, at load; MAYA_DS4_Q8_CHECK=1: the batched rounding checked on every device first)
         if (pk.gguf) {
@@ -14034,6 +14077,44 @@ struct Model::Impl {
         return ok;
     }
 
+    // control-vector extraction (CVEXTRACT): the stream means per layer over `tokens`, to `file` (see cvec_extract
+    // in the header).  The tokens go through the decode path one at a time (the windows' stream means are what the
+    // vectors steer); only the last token's rows are captured (cap_last_): row 0 the embedding's, row il + 1 the
+    // layer il's.  The loaded control vectors are off for the run (their kernel then leaves the streams untouched,
+    // bit for bit) and back on after, so a steered engine captures the stock model
+    bool cvec_extract(const int* tokens, int n, const std::string& file, std::string& err) {
+        if (n < 1) {
+            err = "nothing to extract";
+            return false;
+        }
+        cap_host_.assign((size_t) (g.nl + 1) * (size_t) g.dim, 0.0f);
+        reset();
+        begin_request();   // (DISK_SKIP_AUTO: a request, though a one of its own)
+        const bool was_on = strata::kernels::cvec_enabled();
+        strata::kernels::cvec_set_enabled(false);
+        bool ok = true;
+        for (int i = 0; i < n && ok; ++i) {
+            cap_last_.store(i + 1 == n, std::memory_order_release);
+            ok = step(tokens[i], false, err);
+            if ((i & 63) == 63 || i + 1 == n)
+                std::fprintf(stderr, "INFO ds4 cvec extract: token %d of %d\n", i + 1, n);
+        }
+        cap_last_.store(false, std::memory_order_release);
+        strata::kernels::cvec_set_enabled(was_on);
+        if (!ok) return false;
+        std::FILE* f = std::fopen(file.c_str(), "wb");
+        if (f == nullptr) {
+            err = file + ": not writable";
+            return false;
+        }
+        const bool okw = std::fwrite(cap_host_.data(), 4, cap_host_.size(), f) == cap_host_.size() && std::fclose(f) == 0;
+        if (!okw) {
+            err = file + ": the extraction did not write";
+            return false;
+        }
+        return true;
+    }
+
 
     // DS4_AR2=1 / 2 (0 / unset: off): a group of two's chunk all-reduces - the attention output's and the MoE's - in
     // ar2_kernel: the put and the sums pipelined in pieces, the other member's rows read 16 bytes a lane.  1:
@@ -14430,6 +14511,8 @@ struct Model::Impl {
             if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
             ablate(d, c.acc, T, s);
             hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
+            if (strata::kernels::cvec().covers(l.il))
+                strata::kernels::cvec_apply(c.h, l.il, T, (int64_t) H * D, nullptr, 0, nullptr, 0, false, s);
             CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
             prof_mark(d, 3);
             kick(s);
@@ -14468,6 +14551,8 @@ struct Model::Impl {
         if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
         ablate(d, c.acc, T, s);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
+        if (strata::kernels::cvec().covers(l.il))
+            strata::kernels::cvec_apply(c.h, l.il, T, (int64_t) H * D, nullptr, 0, nullptr, 0, false, s);
         CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         prof_mark(d, 3);
         kick(s);   // (Windows HIP: the experts and the layer's end submitted now, not at the next layer's wait)
@@ -16400,6 +16485,7 @@ struct Model::Impl {
             CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, d.st));
             embed(d.emb_rows, T, d.h, D, H, d.st);
             init_pre(d.pre, T, d.st);
+            if (cap_last_.load(std::memory_order_acquire) && !cap_row(d, 0, T, d.st, err)) return false;
         }
         std::vector<float> dump;
         if (dump_h != nullptr) dump.resize((size_t) T * g.nl * H * D);
@@ -16502,6 +16588,8 @@ struct Model::Impl {
                     CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, s));
                     embed(d.emb_rows, T, d.h, D, H, s);
                     init_pre(d.pre, T, s);
+                    if (mi == 0 && cap_last_.load(std::memory_order_acquire) && !cap_row(d, 0, T, s, err))
+                        return false;
                 } else {
                     const Dev& a = devs[(size_t) L[(size_t) il - 1].dev];
                     xfer_get(hand_xfer(a.hand, d, T, false), a.hand_flag, wp.win, s);
@@ -17075,6 +17163,11 @@ struct Model::Impl {
             ablate(d, d.moe_out, T, s);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
+            if (strata::kernels::cvec().covers(l.il))
+                strata::kernels::cvec_apply(d.h, l.il, T, (int64_t) H * D, nullptr, 0, nullptr, 0, false, s);
+            if (mi == 0 && l.il < g.nl && cap_last_.load(std::memory_order_acquire) &&
+                !cap_row(d, l.il + 1, T, s, err))
+                return false;
             if (!fuse) CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
             prof_mark(d, 5);
             return true;
@@ -17198,6 +17291,10 @@ struct Model::Impl {
         ablate(d, d.moe_out, T, s);
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
+        if (strata::kernels::cvec().covers(l.il))
+            strata::kernels::cvec_apply(d.h, l.il, T, (int64_t) H * D, nullptr, 0, nullptr, 0, false, s);
+        if (mi == 0 && l.il < g.nl && cap_last_.load(std::memory_order_acquire) && !cap_row(d, l.il + 1, T, s, err))
+            return false;
         if (!fuse) CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         // (h_part / h_x are written again only after the next layer's route has synchronized, which follows these)
         return true;
@@ -17408,6 +17505,9 @@ void Model::set_penalties(int last_n, float repeat, float freq, float present) {
     p_->pen_present = present;
 }
 bool Model::logits(std::vector<float>& out) { return p_->logits(out); }
+bool Model::cvec_extract(const int* tokens, int n, const std::string& file, std::string& err) {
+    return p_->cvec_extract(tokens, n, file, err);
+}
 int Model::image_token() const { return p_->img_tok; }
 int Model::dim() const { return p_->g.dim; }
 bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<uint16_t>& span, std::string& err) {

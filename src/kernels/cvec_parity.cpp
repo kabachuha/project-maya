@@ -218,6 +218,73 @@ int main() {
         check(same, "add is h + d in every stream (bitwise)");
     }
 
+    // ---- 5. a wide model (n past the old bound THREADS * 16 = 4096: DeepSeek-V4.1's dim 5120, its kMaxDim 8192's
+    // neighbour): the same invariants with MAXK = 32 in registers, the tail k's skipped by d < n
+    {
+        const int64_t N2 = 7168;
+        std::vector<float> dir2((size_t) (L * N2), 0.0f), s2((size_t) L, 0.0f), R2((size_t) (T * HC * N2));
+        double nrm = 0.0;
+        for (int64_t j = 0; j < N2; ++j) {
+            const float x = nd(rng);
+            dir2[(size_t) (kLayer * N2 + j)] = x;
+            nrm += (double) x * x;
+        }
+        nrm = std::sqrt(nrm);
+        for (int64_t j = 0; j < N2; ++j) dir2[(size_t) (kLayer * N2 + j)] /= (float) nrm;
+        s2[(size_t) kLayer] = 2.0f;
+        for (auto& x : R2) x = nd(rng) * 3.0f;
+        std::printf("project, n = %lld (MAXK = 32)\n", (long long) N2);
+        if (!k::cvec_upload(dir2, s2, /*project*/ 0, 4, 44, N2, HC, err)) {
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return 2;
+        }
+        float* dR2 = dalloc<float>(R2.size());
+        up(dR2, R2);
+        k::cvec_apply(dR2, kLayer, T, HC * N2, nullptr, 0, nullptr, 0, false, nullptr);
+        ck(cudaDeviceSynchronize(), "project wide");
+        {
+            const auto got = down(dR2, R2.size());
+            double worst = 0.0;
+            for (int64_t t = 0; t < T; ++t)
+                for (int64_t c = 0; c < HC; ++c) {
+                    const float* h = R2.data() + t * HC * N2 + c * N2;
+                    const float* v = dir2.data() + kLayer * N2;
+                    double dot = 0.0;
+                    for (int64_t j = 0; j < N2; ++j) dot += (double) h[j] * v[j];
+                    for (int64_t j = 0; j < N2; ++j)
+                        worst = std::fmax(worst, std::fabs(got[(size_t) (t * HC * N2 + c * N2 + j)] -
+                                                          (h[j] - 2.0 * dot * v[j])));
+                }
+            std::printf("    max |err| %.3g\n", worst);
+            check(worst < 1e-4, "project matches h - s (h.v) v at n = 7168");
+        }
+        // add: bitwise (the kernel's update is a plain fma-free sum, as at every n)
+        s2[(size_t) kLayer] = 1.0f;
+        if (!k::cvec_upload(dir2, s2, /*add*/ 1, 4, 44, N2, HC, err)) return 2;
+        up(dR2, R2);
+        k::cvec_apply(dR2, kLayer, T, HC * N2, nullptr, 0, nullptr, 0, false, nullptr);
+        ck(cudaDeviceSynchronize(), "add wide");
+        {
+            const auto got = down(dR2, R2.size());
+            bool ok = true;
+            for (int64_t t = 0; t < T; ++t)
+                for (int64_t c = 0; c < HC; ++c)
+                    for (int64_t j = 0; j < N2; ++j)
+                        ok = ok && got[(size_t) (t * HC * N2 + c * N2 + j)] == R2[(size_t) (t * HC * N2 + c * N2 + j)] +
+                                                                     dir2[(size_t) (kLayer * N2 + j)];
+            check(ok, "add is h + d in every stream at n = 7168 (bitwise)");
+        }
+        // off: untouched
+        k::cvec_set_enabled(false);
+        up(dR2, R2);
+        k::cvec_apply(dR2, kLayer, T, HC * N2, nullptr, 0, nullptr, 0, false, nullptr);
+        ck(cudaDeviceSynchronize(), "off wide");
+        check(std::memcmp(down(dR2, R2.size()).data(), R2.data(), R2.size() * 4) == 0,
+              "off at n = 7168: R unchanged (bitwise)");
+        k::cvec_set_enabled(true);
+        ck(cudaFree(dR2), "free");
+    }
+
     std::printf(g_fail ? "cvec_parity: %d FAILED\n" : "cvec_parity: all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

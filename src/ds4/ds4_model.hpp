@@ -58,6 +58,14 @@ struct Options {
     std::string ablate;
     int ablate_layer = 0;
     float ablate_scale = 0.0f;
+    // control vectors (ds4_cvec.hpp): the direction files and their scales (summed), the steered range (<= 0:
+    // llama.cpp's default, 1 .. the last layer), the mode (0 project, 1 add), the single layer's direction
+    // (project mode's single:L; -1: per-layer)
+    std::vector<std::pair<std::string, float>> cvec_files;
+    int cvec_first = -1;
+    int cvec_last = -1;
+    int cvec_mode = 1;
+    int cvec_single = -1;
 };
 
 /// A picture in the prompt: its span's rows (every position of the span carries the image token), BF16 [span][dim]
@@ -139,6 +147,13 @@ public:
     void set_penalties(int last_n, float repeat, float freq, float present);
     /// The last feed's logit rows on the host (rows x vocab floats).
     bool logits(std::vector<float>& out);
+
+    /// The model's per-layer residual-stream means over `tokens` (tools/cvec_create.py's CVEXTRACT): row 0 the
+    /// embedding's stream mean, row l + 1 the stream mean after the 0-based layer l's MoE write, n_layers + 1 rows
+    /// of dim F32 to `file`.  The model is reset first and the tokens fed one at a time (the decode path, whose
+    /// stream means the vectors steer); the loaded control vectors are switched off for the run (and back on
+    /// after), so the capture is the stock model's.
+    bool cvec_extract(const int* tokens, int n, const std::string& file, std::string& err);
 
     /// The DSpark drafter (speculative decoding): its block size (0: not loaded), drafts for the positions after `y`
     /// (y: the token at pos(), not fed yet) with their confidences, and the verification of [y, drafts]: how many of the

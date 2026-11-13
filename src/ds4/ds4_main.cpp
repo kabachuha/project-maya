@@ -39,6 +39,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -98,6 +99,8 @@ void usage() {
                  "           [--suffix-draft N]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
+                 "           [--control-vector-scaled FILE:SCALE[,...] | --control-vector FILE\n"
+                 "            [--control-vector-layer-range A B] [--cvec-mode add|project] [--cvec-dir per-layer|single:L]]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
 }
@@ -923,9 +926,42 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     }
     while (in.next(line)) {
         if (line == "QUIT") break;
+        if (line.rfind("CVEXTRACT ", 0) == 0) {
+            // CVEXTRACT <file> <id,id,...>: the model's per-layer residual-stream means over the ids (tools/
+            // cvec_create.py's control-vector extraction): row 0 the embedding, row l + 1 after the 0-based layer
+            // l's MoE write - n_layers + 1 rows of dim F32.  The model is reset, and the loaded control vectors
+            // are off for the run (back on after), so the capture is the stock model's
+            const std::string rest = line.substr(10);
+            const size_t sp = rest.find(' ');
+            bool bad = sp == std::string::npos;
+            const std::string file = bad ? "" : rest.substr(0, sp);
+            std::string idstr;
+            for (size_t i = sp + 1; i < rest.size(); ++i)
+                if (rest[i] != ' ') idstr += rest[i];
+            for (char ch : idstr)
+                if (!std::isdigit((unsigned char) ch) && ch != ',') {
+                    bad = true;
+                    break;
+                }
+            if (bad || idstr.empty() || idstr.find_first_not_of(",") == std::string::npos) {
+                std::printf("ERR malformed CVEXTRACT line: CVEXTRACT <file> <id,id,...>\n");
+                std::fflush(stdout);
+                continue;
+            }
+            const std::vector<int> ids = parse_ids(idstr);
+            std::string e;
+            if (m.cvec_extract(ids.data(), (int) ids.size(), file, e)) {
+                std::printf("CVOK %zu %s\n", ids.size(), file.c_str());
+            } else {
+                std::printf("ERR CVEXTRACT %s\n", e.c_str());
+            }
+            std::fflush(stdout);
+            continue;
+        }
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
+            std::printf("ERR unsupported command '%s' (GEN, GENI, CVEXTRACT, STOP and QUIT)\n",
+                        line.substr(0, line.find(' ')).c_str());
             std::fflush(stdout);
             continue;
         }
@@ -1430,6 +1466,46 @@ int main(int argc, char** argv) {
         else if (a == "--ablate") o.ablate = val("--ablate");
         else if (a == "--ablate-layer") o.ablate_layer = (int) num("--ablate-layer", 1, 4096, true);
         else if (a == "--ablate-scale") o.ablate_scale = (float) num("--ablate-scale", 1e-6, 1e6, false);
+        else if (a == "--control-vector") o.cvec_files.push_back({val("--control-vector"), 1.0f});
+        else if (a == "--control-vector-scaled") {
+            // FILE:SCALE, comma-separated; the LAST colon splits, so a Windows path (C:\...) keeps its drive
+            std::stringstream list(val("--control-vector-scaled"));
+            std::string item;
+            while (std::getline(list, item, ',')) {
+                const size_t colon = item.rfind(':');
+                char* end = nullptr;
+                const float sc = colon == std::string::npos ? 0.0f : std::strtof(item.c_str() + colon + 1, &end);
+                if (colon == std::string::npos || colon == 0 || end == item.c_str() + colon + 1 || *end != '\0') {
+                    std::fprintf(stderr, "--control-vector-scaled: expected FILE:SCALE, got '%s'\n", item.c_str());
+                    return 2;
+                }
+                o.cvec_files.push_back({item.substr(0, colon), sc});
+            }
+        }
+        else if (a == "--control-vector-layer-range") {
+            o.cvec_first = std::atoi(val("--control-vector-layer-range").c_str());
+            o.cvec_last = std::atoi(val("--control-vector-layer-range").c_str());
+        }
+        else if (a == "--cvec-mode") {
+            const std::string m = val("--cvec-mode");
+            if (m == "project") o.cvec_mode = 0;
+            else if (m == "add") o.cvec_mode = 1;
+            else {
+                std::fprintf(stderr, "--cvec-mode: add or project, got '%s'\n", m.c_str());
+                return 2;
+            }
+        }
+        else if (a == "--cvec-dir") {
+            const std::string d = val("--cvec-dir");
+            if (d == "per-layer")
+                o.cvec_single = -1;
+            else if (d.rfind("single:", 0) == 0)
+                o.cvec_single = std::atoi(d.c_str() + 7);
+            else {
+                std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str());
+                return 2;
+            }
+        }
         else if (a == "--serve") serve_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
