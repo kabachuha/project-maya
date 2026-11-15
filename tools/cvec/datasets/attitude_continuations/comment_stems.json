@@ -1,0 +1,24 @@
+{
+  "pre": [
+    "You are",
+    "You're",
+    "Act as",
+    "Behave like",
+    "Respond as",
+    "Imagine you are",
+    "Take on the role of",
+    "Write as"
+  ],
+  "post": [
+    "a friend of the person telling the story",
+    "a laid-back commenter",
+    "an interested listener of everyday stories",
+    "a person in a family group chat",
+    "a neighbor across the fence",
+    "a friend in a group chat",
+    "a casual observer of daily life",
+    "a person leaving a quick comment online",
+    "an easygoing friend",
+    "a regular of the neighborhood group chat"
+  ]
+}
