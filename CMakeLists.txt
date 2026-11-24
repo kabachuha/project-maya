@@ -1005,6 +1005,33 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
       set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS MAYA_HIPBLASLT_AVAILABLE=1)
       target_link_libraries(maya-mm3 PRIVATE roc::hipblaslt)
     endif()
+    # GLM-4.5+/GLM-4.6 (glm4moe GGUF, tools/glm46/pack_gguf.py): its own engine (src/glm46), forked from maya-mm3's -
+    # GQA with per-head Q/K norms and a partial rope, the dense lead, the sigmoid router with a bias, the shared
+    # expert - on maya-ds4's ggml block-type kernels (src/ds4/ds4_iq) for the pack's quantized weights
+    set(_glm46_gguf_sources src/glm46/glm46_gguf.cu src/glm46/glm46_gv.cu src/ds4/ds4_iq.cu src/ds4/ds4_lt.cu)
+    set(_glm46_gguf_cpu_sources src/glm46/glm46_cpu_gg.cpp src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
+    set(_glm46_nv_sources src/glm46/glm46_exl3.cu src/glm46/glm46_dspark.cu src/glm46/glm46_vision.cu src/glm46/glm46_tp.cu)
+    add_executable(maya-glm46 src/glm46/glm46_main.cpp src/glm46/glm46_model.cu src/glm46/glm46_kernels.cu
+                             src/glm46/glm46_cpu.cpp src/glm46/glm46_host.cpp ${_glm46_nv_sources}
+                             ${_glm46_gguf_sources} ${_glm46_gguf_cpu_sources})
+    target_include_directories(maya-glm46 PRIVATE ${_maya_gpu_include_directories} include src/glm46 third_party/ggml)
+    target_link_libraries(maya-glm46 PRIVATE maya_kernels maya_kernels_cpu maya_spec maya_artifact ${_maya_gpu_runtime_target}
+                                           ${_maya_gpu_blas_target})
+    target_compile_definitions(maya-glm46 PRIVATE MAYA_DS4_IQ_ONLY)
+    if(MAYA_ENABLE_HIP AND MAYA_HIPBLASLT_AVAILABLE)
+      set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS MAYA_HIPBLASLT_AVAILABLE=1)
+      target_link_libraries(maya-glm46 PRIVATE roc::hipblaslt)
+    endif()
+    if(MAYA_BUILD_TESTS)
+      # maya-glm46's own kernels (no model): the full causal GQA attention over BF16 K / V rows (the kernel this
+      # engine adds), the q/k/v biases, the plain SwiGLU and the sigmoid router - against double references
+      add_executable(glm46_kernels_test tests/glm46_kernels_test.cu src/glm46/glm46_kernels.cu)
+      target_include_directories(glm46_kernels_test PRIVATE ${_maya_gpu_include_directories} include src/glm46
+                                                           third_party/ggml)
+      target_link_libraries(glm46_kernels_test PRIVATE ${_maya_gpu_runtime_target} maya_kernels_cpu)
+      add_test(NAME glm46_kernels_test COMMAND glm46_kernels_test)
+      set_tests_properties(glm46_kernels_test PROPERTIES TIMEOUT 300)
+    endif()
     # Tencent's Hy4-flash (a GGUF set, tools/hy4/pack_gguf.py): its own engine (src/hy4) on maya-ds4's ggml block-type
     # kernels (src/ds4/ds4_iq) and maya-mm3's OS helpers; NVIDIA, and AMD on Linux
     if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)

@@ -9,7 +9,7 @@ namespace maya::kernels {
 namespace {
 
 constexpr int THREADS = 256;
-constexpr int MAXK = 16;   // n_embd up to 4096, held in registers between the dot and the update
+constexpr int MAXK = 32;   // n_embd up to 8192 (DeepSeek-V4.1's dim 5120 and GLM-4.6's included), held in registers between the dot and the update; a model with fewer values just skips the tail (d < n)
 
 Cvec g_cvec;                 // the description; its device pointers are the uploading device's
 bool g_on_host = false;
