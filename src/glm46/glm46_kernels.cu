@@ -2155,6 +2155,66 @@ void rms(const float* x, const float* w1, int rows, int D, float eps, float* y, 
     check("rms");
 }
 
+// the NextN (MTP) block's input: row r -> [RMS(emb_r, enorm) | RMS(h_r, hnorm)] in one 2D-wide F32 row (the eh_proj's
+// input, and the two halves' own norms - the block's input is a token's embedding and the trunk's carrier side by side)
+__global__ void mtp_in_kernel(const float* emb, const float* h, const float* wemb, const float* wh, int D, float eps,
+                              float* cat) {
+    __shared__ float red[33], red2[33];
+    const float* e = emb + (size_t) blockIdx.x * D;
+    const float* hr = h + (size_t) blockIdx.x * D;
+    float* out = cat + (size_t) blockIdx.x * 2 * D;
+    float se = 0.0f, sh = 0.0f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        se = fmaf(e[i], e[i], se);
+        sh = fmaf(hr[i], hr[i], sh);
+    }
+    const float re = rsqrtf(block_sum(se, red) / (float) D + eps);
+    const float rh = rsqrtf(block_sum(sh, red2) / (float) D + eps);
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        out[i] = e[i] * re * wemb[i];
+        out[D + i] = hr[i] * rh * wh[i];
+    }
+}
+void mtp_in(const float* emb, const float* h, const float* wemb, const float* wh, int rows, int D, float eps, float* cat,
+            cudaStream_t s) {
+    if (rows <= 0) return;
+    mtp_in_kernel<<<rows, 256, 0, s>>>(emb, h, wemb, wh, D, eps, cat);
+    check("mtp_in");
+}
+
+// the first index of a row's largest value (the host's argmax: strictly larger wins, so the lowest id on a tie)
+__global__ void argmax_kernel(const float* x, int n, int* out) {
+    __shared__ float val[256];
+    __shared__ int idx[256];
+    float bv = -INFINITY;
+    int bi = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        if (x[i] > bv) {
+            bv = x[i];
+            bi = i;
+        }
+    val[threadIdx.x] = bv;
+    idx[threadIdx.x] = bi;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (threadIdx.x < st) {
+            const float ov = val[threadIdx.x + st];
+            const int oi = idx[threadIdx.x + st];
+            if (ov > val[threadIdx.x] || (ov == val[threadIdx.x] && oi < idx[threadIdx.x])) {
+                val[threadIdx.x] = ov;
+                idx[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *out = idx[0];
+}
+void argmax_row(const float* x, int n, int* out, cudaStream_t s) {
+    if (n <= 0) return;
+    argmax_kernel<<<1, 256, 0, s>>>(x, n, out);
+    check("argmax_row");
+}
+
 void rope_inv_freq(float theta, int n_rot, float* inv) {
     for (int i = 0; i < n_rot / 2; ++i)
         inv[i] = (float) (1.0 / std::pow((double) theta, (double) (float) (2 * i) / (double) n_rot));

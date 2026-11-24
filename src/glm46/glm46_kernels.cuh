@@ -18,6 +18,11 @@ namespace glm46::k {
 /// y = x * rsqrt(mean(x^2) + eps) * w1 per row of D (w1 = 1 + the stored weight: Gemma's); y16 (if given) the same
 /// rounded to FP16.  x and y may alias.
 void rms(const float* x, const float* w1, int rows, int D, float eps, float* y, uint16_t* y16, cudaStream_t s);
+/// The NextN (MTP) block's input rows: [rms(emb_r, wemb) | rms(h_r, wh)] of 2D each (cat [rows][2D] F32).
+void mtp_in(const float* emb, const float* h, const float* wemb, const float* wh, int rows, int D, float eps,
+            float* cat, cudaStream_t s);
+/// The first index of a row's largest value (the host argmax's rule: the lowest id on a tie).
+void argmax_row(const float* x, int n, int* out, cudaStream_t s);
 
 /// The rotary's inverse frequencies theta^(-2i / n_rot), i < n_rot / 2 (host, F32 as transformers computes them).
 void rope_inv_freq(float theta, int n_rot, float* inv /*[n_rot / 2]*/);

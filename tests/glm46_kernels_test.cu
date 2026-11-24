@@ -192,12 +192,79 @@ int test_ops() {
     return 0;
 }
 
+// the NextN block's input rows ([rms(emb, enorm) | rms(h, hnorm)]) and the head's argmax (the lowest id on a tie)
+int test_mtp() {
+    const int rows = 3, D = 128;
+    std::vector<float> emb((size_t) rows * D), h((size_t) rows * D), we(D), wh(D);
+    for (int r = 0; r < rows; ++r)
+        for (int i = 0; i < D; ++i) {
+            emb[(size_t) r * D + i] = (float) ((r * 37 + i * 11) % 53 - 26) / 8.0f;
+            h[(size_t) r * D + i] = (float) ((r * 29 + i * 7) % 41 - 20) / 5.0f;
+        }
+    for (int i = 0; i < D; ++i) {
+        we[(size_t) i] = 1.0f + 0.01f * (float) (i % 5);
+        wh[(size_t) i] = 1.0f - 0.01f * (float) (i % 3);
+    }
+    float* de = nullptr;
+    float* dh = nullptr;
+    float* dwe = nullptr;
+    float* dwh = nullptr;
+    float* dc = nullptr;
+    CK(cudaMalloc(&de, (size_t) rows * D * 4));
+    CK(cudaMalloc(&dh, (size_t) rows * D * 4));
+    CK(cudaMalloc(&dwe, (size_t) D * 4));
+    CK(cudaMalloc(&dwh, (size_t) D * 4));
+    CK(cudaMalloc(&dc, (size_t) rows * 2 * D * 4));
+    CK(cudaMemcpy(de, emb.data(), (size_t) rows * D * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dh, h.data(), (size_t) rows * D * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dwe, we.data(), (size_t) D * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dwh, wh.data(), (size_t) D * 4, cudaMemcpyHostToDevice));
+    glm46::k::mtp_in(de, dh, dwe, dwh, rows, D, 1e-5f, dc, nullptr);
+    std::vector<float> cat((size_t) rows * 2 * D);
+    CK(cudaMemcpy(cat.data(), dc, (size_t) rows * 2 * D * 4, cudaMemcpyDeviceToHost));
+    double worst = 0.0;
+    for (int r = 0; r < rows; ++r) {
+        double se = 0, sh = 0;
+        for (int i = 0; i < D; ++i) {
+            se += (double) emb[(size_t) r * D + i] * emb[(size_t) r * D + i];
+            sh += (double) h[(size_t) r * D + i] * h[(size_t) r * D + i];
+        }
+        const double re = 1.0 / std::sqrt(se / D + 1e-5), rh = 1.0 / std::sqrt(sh / D + 1e-5);
+        for (int i = 0; i < D; ++i) {
+            worst = std::max(worst, std::fabs((double) cat[(size_t) r * 2 * D + i] -
+                                              emb[(size_t) r * D + i] * re * we[(size_t) i]));
+            worst = std::max(worst, std::fabs((double) cat[(size_t) r * 2 * D + i + D] -
+                                              h[(size_t) r * D + i] * rh * wh[(size_t) i]));
+        }
+    }
+    check(worst < 1e-5, "mtp_in ([rms(emb, enorm) | rms(h, hnorm)])");
+    // the argmax: a strict max, then a tie that must take the lower id
+    std::vector<float> x = {-1.0f, 2.0f, 0.5f, 2.0f, -3.0f, 0.0f};
+    float* dx = nullptr;
+    int* di = nullptr;
+    CK(cudaMalloc(&dx, x.size() * 4));
+    CK(cudaMalloc(&di, 4));
+    CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+    glm46::k::argmax_row(dx, (int) x.size(), di, nullptr);
+    int at = -1;
+    CK(cudaMemcpy(&at, di, 4, cudaMemcpyDeviceToHost));
+    check(at == 1, "argmax_row (a tie takes the lower id)");
+    x[0] = 9.0f;
+    CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+    glm46::k::argmax_row(dx, (int) x.size(), di, nullptr);
+    CK(cudaMemcpy(&at, di, 4, cudaMemcpyDeviceToHost));
+    check(at == 0, "argmax_row (the strict max)");
+    cudaFree(de); cudaFree(dh); cudaFree(dwe); cudaFree(dwh); cudaFree(dc); cudaFree(dx); cudaFree(di);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     std::printf("maya-glm46 kernels against double references\n");
     if (test_attn() != 0) ++g_fail;
     test_ops();
+    test_mtp();
     std::printf(g_fail == 0 ? "ALL PASS\n" : "%d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
 }

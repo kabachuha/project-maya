@@ -420,6 +420,29 @@ struct Model::Impl {
     std::unique_ptr<CpuLane> lane;
     std::unique_ptr<Draft> draftm;   // the DSpark draft (on the head's GPU)
     double draft_plan = 0.0;         // plan_memory's room for it (bytes: the draft, its taps, a margin)
+    // --mtp (the pack's NextN block, L[mtp_il], on the head's GPU): the native drafter (src/core/glm_mtp.cu's design).
+    // Its cache's entry p pairs the trunk's post-output-norm hidden h_p with the token at p + 1; the block reads both
+    // and drafts the token at p + 2.  mtp_hx (the carrier) is the h of the last row the sequence kept; the drafting
+    // chain then feeds the block's own shnorm output back in.  Every trunk forward writes the entries its rows can
+    // (mtp_after), the verify window's kept prefix is commit_rows', and the drafts the trunk rejects leave rows that
+    // are rewritten - in order, before any query past them - by the rounds after.
+    int mtp_il = -1;                 // (the layer index; -1: no block or off)
+    int mtp_cap = 0;                 // a round's drafts at most (0: no drafting - a plain token path)
+    x3::Mat mtp_eh;                  // nextn.eh_proj ([2 dim] -> dim)
+    float *mtp_enorm = nullptr, *mtp_hnorm = nullptr, *mtp_shnorm = nullptr;
+    float* mtp_hx = nullptr;         // the carrier [dim] (the head's GPU)
+    long long mtp_hx_pos = -1;       // the position whose h it holds (-1: none)
+    long long mtp_pos0 = 0;          // the last forward's first position and rows (commit_rows')
+    int mtp_T = 0;
+    float* mtp_car = nullptr;        // [kWin][dim] the last forward's carriers (a window's are kept for its commit)
+    float* mtp_slice = nullptr;      // [kMtpRows][dim] a prompt chunk's slice carriers
+    float* mtp_cat = nullptr;        // [kMtpRows][2 dim] the block's input rows
+    uint16_t* mtp_cat16 = nullptr;   // ... as FP16 for a chunk's GEMM
+    float* mtp_res = nullptr;        // [kMtpRows][dim] the block's residual rows
+    float* mtp_carry = nullptr;      // [dim] the chain's carrier (the block's shnorm output)
+    float *mtp_embD = nullptr, *mtp_embH = nullptr;   // a token's embedding row (device / pinned host)
+    int *mtp_tok_d = nullptr, *mtp_tok_h = nullptr;   // the head's pick (device / pinned host)
+    static constexpr int kMtpRows = 64;   // the prompt's entries a pass (its block reads that many rows' experts)
     int last_done = 0;               // the last forward's tokens in the cache
     int chunk_run = 0;               // (the prefill calibration: a forward's chunk, at most o.chunk - 0: o.chunk)
     int run_chunk() const { return chunk_run > 0 ? std::min(chunk_run, o.chunk) : o.chunk; }
@@ -1053,8 +1076,8 @@ struct Model::Impl {
         const size_t idxpos = (size_t) g.ix_dim * 2;                         // ... and its index key
         const double reserve = (o.reserve_gb < 0 ? 1.0 : o.reserve_gb) * GB + 1.0 * GB;
         size_t blob_max = 0;
-        for (int li = 0; li < g.n_layers; ++li)
-            if (g.moe[(size_t) li]) blob_max = std::max(blob_max, blob_estimate(li));
+        for (size_t li = 0; li < L.size(); ++li)
+            if (li >= (size_t) g.n_layers || g.moe[li]) blob_max = std::max(blob_max, blob_estimate((int) li));
         // the DSpark draft's room on the head's GPU: what its load will hold (Draft::plan_bytes, its MXFP8 matrices as
         // stored), its taps buffer and 0.1 GB beside (was a flat 3 GB: MiniMax-M3.1-Flash's draft holds 2.5 GB, its taps
         // 0.13 GB at --chunk 1024, 0.5 GB at 4096); a draft geometry the pack does not give: 3 GB
@@ -1075,6 +1098,9 @@ struct Model::Impl {
                 const Tensor* h = pk.get(gguf ? "language_model.lm_head.weight" : "language_model.lm_head.trellis");
                 b += (h ? (double) h->bytes : 0.0) + 32.0 * g.vocab * 4;
                 b += draft_plan;
+                if (mtp_il >= 0)   // (--mtp: its rows, carriers and the chain's scratch)
+                    b += (double) kMtpRows * (2.0 * g.dim * 4 + 2.0 * g.dim * 4 + 2.0 * g.dim * 2) +
+                         (double) kWin * g.dim * 4 + 3.0 * g.dim * 4;
             }
             // (the vision tower: no room - it stays in host memory, a picture's room lent by the staging slots)
             if (gguf) b += (double) gg::scratch_bytes();   // (the GGUF kernels' activations, FP16 bands, cuBLAS)
@@ -1204,6 +1230,42 @@ struct Model::Impl {
                 o.dspark = false;
             }
         }
+        // --mtp (on by default): the pack's NextN block - blk.<n_layers>.* as a full layer, beside nextn.eh_proj /
+        // enorm / hnorm / shared_head_norm.  Its cache's entry p pairs the trunk's hidden h_p with the token at p + 1;
+        // the block drafts, the trunk's verify window decides (the native GLM drafter, src/core/glm_mtp.cu's design)
+        if (o.mtp && g.nextn > 0) {
+            const std::string N = "blk." + std::to_string(g.n_layers) + ".";
+            const bool full = pk.get(N + "attn_q.weight") && pk.get(N + "ffn_gate_inp.weight") &&
+                              pk.get(N + "ffn_gate_exps.weight") && pk.get(N + "nextn.eh_proj.weight") &&
+                              pk.get(N + "nextn.enorm.weight") && pk.get(N + "nextn.hnorm.weight") &&
+                              pk.get(N + "nextn.shared_head_norm.weight");
+            if (!full) {
+                info.push_back("NOTE: --mtp: the pack's NextN block is incomplete - no drafts (pack it again)");
+                o.mtp = false;
+            }
+        } else if (o.mtp && g.nextn <= 0) {
+            info.push_back("NOTE: --mtp: this pack has no NextN (MTP) block - no drafts (tools/glm46/pack_gguf.py packs "
+                           "the GGUF's when it has one)");
+            o.mtp = false;
+        }
+        if (o.mtp && g.nextn > 1) {
+            info.push_back("NOTE: --mtp: the pack has " + std::to_string(g.nextn) + " NextN blocks - the first is the "
+                           "drafter");
+        }
+        if (o.mtp && o.mtp_drafts <= 0) {
+            info.push_back("NOTE: --mtp-drafts 0: no MTP drafts (--mtp-drafts N turns them on)");
+            o.mtp = false;
+        }
+        if (o.mtp && o.seqs > 1) {   // (--parallel: the conversations' rows are not one round's window)
+            info.push_back("NOTE: --parallel " + std::to_string(o.seqs) + ": no --mtp drafts - the conversations decode "
+                           "together without them");
+            o.mtp = false;
+        }
+        if (o.mtp && o.tp > 0) {   // (the tensor-parallel path is refused by the CLI; the layer split drafts)
+            o.mtp = false;
+        }
+        mtp_il = o.mtp ? g.n_layers : -1;
+        mtp_cap = mtp_il >= 0 ? std::max(0, std::min(o.mtp_drafts, kWin - 1)) : 0;
         int ndev = 0;
         CK(cudaGetDeviceCount(&ndev));
         if (o.gpus.empty())
@@ -1252,6 +1314,11 @@ struct Model::Impl {
                 if (!old && i + 1 == D.size()) {
                     const Tensor* h = pk.get(gguf ? "language_model.lm_head.weight" : "language_model.lm_head.trellis");
                     cap[i] -= (h ? (double) h->bytes : 0.0) + 32.0 * g.vocab * 4 + (o.dspark ? 3.0 * (1u << 30) : 0.0);
+                    // (--mtp: the NextN block rides on the last GPU too - its dense part and its experts)
+                    if (mtp_il >= 0)
+                        cap[i] -= (double) dense_bytes(mtp_il) +
+                                  (double) g.n_exp * (double) blob_estimate(mtp_il) +
+                                  ns * (kvr * (double) k::kv_bytes(o.kv_k, o.kv_v, (size_t) g.n_kv));
                 }
                 cap[i] = std::max(cap[i], 0.05 * (double) D[i].free0);
                 total += cap[i];
@@ -1259,7 +1326,7 @@ struct Model::Impl {
             for (double x : w) wsum += x;
             double acc = 0, wacc = 0;
             size_t di = 0;
-            L.assign((size_t) g.n_layers, {});
+            L.assign((size_t) g.n_layers + (mtp_il >= 0 ? 1 : 0), {});
             const auto& sp = o.layer_split;
             if (!sp.empty() && (sp.size() + 1 != D.size() || !std::is_sorted(sp.begin(), sp.end()) || sp.front() < 1 ||
                                 sp.back() >= g.n_layers || std::adjacent_find(sp.begin(), sp.end()) != sp.end())) {
@@ -1277,6 +1344,10 @@ struct Model::Impl {
                 }
                 L[(size_t) li].dev = (int) di;
                 D[di].layers.push_back(li);
+            }
+            if (mtp_il >= 0) {   // (the NextN block on the head's GPU: the shared head's own - no hop)
+                L[(size_t) mtp_il].dev = (int) (D.size() - 1);
+                D.back().layers.push_back(mtp_il);
             }
         }
         inv_freq.resize((size_t) g.n_rot / 2);
@@ -1343,7 +1414,7 @@ struct Model::Impl {
                 const std::string N = "blk." + std::to_string(li) + ".";
                 size_t n = 0;
                 std::vector<void*> ow;
-                l.moe = g.moe[(size_t) li] != 0;
+                l.moe = li >= g.n_layers || g.moe[(size_t) li] != 0;   // (the NextN block is always a MoE layer)
                 // glm4moe: plain RMSNorm weights (the GGUF's, 1.0 a value at load: not Gemma's 1 + w)
                 l.in1 = upload_f32(pk, N + "attn_norm.weight", norm_add(), ow, n, err);
                 l.post1 = upload_f32(pk, N + "post_attention_norm.weight", norm_add(), ow, n, err);
@@ -1375,6 +1446,18 @@ struct Model::Impl {
                     l.mu = upload_mat(pk, N + "ffn_up", ow, err);
                     l.md = upload_mat(pk, N + "ffn_down", ow, err);
                     if (!err.empty()) return false;
+                }
+                if (li == mtp_il) {   // the NextN block's own projections: eh_proj, its two input norms, its output's
+                    mtp_eh = upload_mat(pk, N + "nextn.eh_proj", ow, err);
+                    mtp_enorm = upload_f32(pk, N + "nextn.enorm.weight", 0.0f, ow, n, err);
+                    mtp_hnorm = upload_f32(pk, N + "nextn.hnorm.weight", 0.0f, ow, n, err);
+                    mtp_shnorm = upload_f32(pk, N + "nextn.shared_head_norm.weight", 0.0f, ow, n, err);
+                    if (!err.empty()) return false;
+                    if (mtp_eh.n != g.dim || mtp_eh.k != 2 * g.dim) {
+                        err = N + "nextn.eh_proj: [" + std::to_string(mtp_eh.n) + "][" + std::to_string(mtp_eh.k) +
+                              "], not [dim][" + std::to_string(2 * g.dim) + "]";
+                        return false;
+                    }
                 }
                 for (void* x : ow) {
                     owned.push_back(x);
@@ -1412,6 +1495,16 @@ struct Model::Impl {
                     owned.push_back(x);
                     owned_dev.push_back(dv);
                 }
+            }
+            if (di + 1 == D.size() && mtp_cap > 0) {   // (--mtp: the NextN block's rows and the chain's scratch)
+                if (!A(mtp_hx, (size_t) g.dim) || !A(mtp_car, (size_t) kWin * g.dim) ||
+                    !A(mtp_cat, (size_t) kMtpRows * 2 * g.dim) || !A(mtp_res, (size_t) kMtpRows * g.dim) ||
+                    !A(mtp_cat16, (size_t) kMtpRows * 2 * g.dim) || !A(mtp_slice, (size_t) kMtpRows * g.dim) ||
+                    !A(mtp_carry, (size_t) g.dim) ||
+                    !A(mtp_embD, (size_t) kMtpRows * g.dim) || !A(mtp_tok_d, 1))
+                    return false;
+                CK(cudaMallocHost(&mtp_embH, (size_t) kMtpRows * g.dim * sizeof(float)));
+                CK(cudaMallocHost(&mtp_tok_h, sizeof(int)));
             }
             own_since(n0, dv);
             acct[dv][kAW] += g_up - up0;
@@ -1546,7 +1639,7 @@ struct Model::Impl {
             }
         }
         // the profile: routings [layer][expert] (a wrong size is ignored)
-        prof.assign((size_t) g.n_layers * g.n_exp, 0);
+        prof.assign(L.size() * g.n_exp, 0);   // (the NextN block's routings last)
         bool have_prof = false;
         if (!o.profile.empty()) {
             if (std::FILE* f = std::fopen(o.profile.c_str(), "rb")) {
@@ -1826,8 +1919,8 @@ struct Model::Impl {
                 if (!dalloc(d.id, l.exp_tab, tab.size(), err)) return false;
                 CK(cudaMemcpy(l.exp_tab, tab.data(), tab.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice));
                 if (d.prof_d == nullptr) {
-                    if (!dalloc(d.id, d.prof_d, (size_t) g.n_layers * g.n_exp, err)) return false;
-                    CK(cudaMemset(d.prof_d, 0, (size_t) g.n_layers * g.n_exp * sizeof(unsigned)));
+                    if (!dalloc(d.id, d.prof_d, L.size() * g.n_exp, err)) return false;
+                    CK(cudaMemset(d.prof_d, 0, L.size() * g.n_exp * sizeof(unsigned)));
                 }
                 l.hf = true;
                 ++nhf;
@@ -1935,6 +2028,14 @@ struct Model::Impl {
         }
         for (size_t di = 0; di < D.size(); ++di)   // (the pipeline's stages: the GPUs holding layers)
             if (!D[di].layers.empty()) stage_dev.push_back((int) di);
+        if (mtp_cap > 0) {
+            info.push_back("MTP draft: the NextN block on CUDA" + std::to_string(D[(size_t) head_dev].id) + ", up to " +
+                           std::to_string(mtp_cap) + " drafts a round, verified by the trunk's window (--mtp off: no "
+                           "drafts)");
+            std::fprintf(stderr, "maya-glm46: MTP draft on: the NextN block, up to %d drafts a round\n", mtp_cap);
+        } else if (mtp_il >= 0) {
+            info.push_back("MTP draft: off (--mtp) - the NextN block is loaded but no rounds draft with it");
+        }
         st.load_s = now() - t0;
         return true;
     }
@@ -2198,7 +2299,7 @@ struct Model::Impl {
                 pw[e] = wt;
                 ++prof[li * g.n_exp + x];
                 if (lane && on_cpu(l, d, x) && !stage_it[(size_t) x]) {
-                    if (cpu_seen.empty()) cpu_seen.assign((size_t) g.n_layers * g.n_exp, 0);
+                    if (cpu_seen.empty()) cpu_seen.assign(L.size() * g.n_exp, 0);
                     if (cpu_of[(size_t) x] < 0) ++cpu_seen[li * g.n_exp + x];
                     if (cpu_of[(size_t) x] < 0) consider_promotion(l, d, x);
                     if (cpu_of[(size_t) x] < 0) {
@@ -2267,7 +2368,7 @@ struct Model::Impl {
     // a non-resident expert's use: its decayed score, now
     float score(long long key, bool add) {
         if (use_score.empty()) {
-            use_score.assign((size_t) g.n_layers * 1024, 0.0f);
+            use_score.assign(L.size() * 1024, 0.0f);
             use_last.assign(use_score.size(), 0);
         }
         float& sc = use_score[(size_t) key];
@@ -2567,7 +2668,7 @@ struct Model::Impl {
             if (lane && on_cpu(l, d, top[i]) && to_stage > 0 && pooled(l, top[i])) {
                 --to_stage;   // (staged: locate below)
             } else if (lane && on_cpu(l, d, top[i])) {   // (not in VRAM nor in a staging slot: the CPU lane's)
-                if (cpu_seen.empty()) cpu_seen.assign((size_t) g.n_layers * g.n_exp, 0);
+                if (cpu_seen.empty()) cpu_seen.assign(L.size() * g.n_exp, 0);
                 ++cpu_seen[li * g.n_exp + top[i]];
                 consider_promotion(l, d, top[i]);
                 ph[i] = 0;
@@ -2801,6 +2902,180 @@ struct Model::Impl {
         }
         cvec_step(l, d, T);
         pmark(d, kPExperts);
+        return true;
+    }
+
+    // ---------------------------------------------------------------- the NextN (MTP) block (--mtp)
+    // The block is a normal layer (L[mtp_il]: attention over its own KV cache, its MoE) whose residual rows are
+    // eh_proj's output instead of an embedding: mtp_res, not d.h.  Its input at position p is
+    // [rms(emb(token at p + 1), enorm) | rms(h_p, hnorm)], h_p the trunk's post-output-norm hidden (llama.cpp's
+    // t_h_nextn, so hnorm is the input's second norm).  Its output's shnorm is the chain's next carrier and the
+    // shared head's input (the trunk's output.weight).
+    bool mtp_embed(const int* next, int rows, std::string& err) {
+        if (rows <= 0) return true;
+        if (rows > kMtpRows) {
+            err = "mtp: " + std::to_string(rows) + " rows";
+            return false;
+        }
+        const Tensor* emb = pk.get("token_embd.weight");
+        for (int r = 0; r < rows; ++r) {
+            const int id = next[r];
+            if (id < 0 || id >= g.vocab) {
+                err = "mtp: token id " + std::to_string(id) + " outside the vocabulary";
+                return false;
+            }
+            if (!gg::host_row(emb->dtype, pk.data(*emb), g.dim, id, mtp_embH + (size_t) r * g.dim)) {
+                err = "mtp: the token embedding's type " + emb->dtype + " is not read here";
+                return false;
+            }
+        }
+        Dev& d = D[(size_t) L[(size_t) mtp_il].dev];
+        CK(cudaSetDevice(d.id));
+        CK(cudaMemcpyAsync(mtp_embD, mtp_embH, (size_t) rows * g.dim * 4, cudaMemcpyHostToDevice, d.s));
+        return true;
+    }
+
+    // the block's T rows in mtp_res (their positions in d.pos): the layer's own math over those residual rows
+    bool mtp_block(int T, int last_pos, std::string& err) {
+        Layer& l = L[(size_t) mtp_il];
+        Dev& d = D[(size_t) l.dev];
+        CK(cudaSetDevice(d.id));
+        float* const h0 = d.h, *out0 = d.out;
+        d.h = mtp_res;
+        const bool ok = layer(mtp_il, T, last_pos, err);
+        const float* fin = d.h;   // (a chunk's MoE layer leaves its residual in the buffer it swapped d.h with)
+        if (ok && fin != mtp_res)
+            CK(cudaMemcpyAsync(mtp_res, fin, (size_t) T * g.dim * 4, cudaMemcpyDeviceToDevice, d.s));
+        d.h = h0;
+        d.out = out0;
+        return ok;
+    }
+
+    // entries p0 .. p0 + rows - 1: each row's input from the carrier rows and the token at its position + 1
+    bool mtp_entries(int pos0, int rows, const float* car, const int* next, std::string& err) {
+        if (rows <= 0) return true;
+        if (!mtp_embed(next, rows, err)) return false;
+        Layer& l = L[(size_t) mtp_il];
+        Dev& d = D[(size_t) l.dev];
+        CK(cudaSetDevice(d.id));
+        k::mtp_in(mtp_embD, car, mtp_enorm, mtp_hnorm, rows, g.dim, g.eps, mtp_cat, d.s);
+        k::to_f16(mtp_cat, rows, 2 * g.dim, 2 * g.dim, mtp_cat16, 2 * g.dim, d.s);
+        x3::gemm_rows(mtp_eh, mtp_cat16, 2 * g.dim, rows, mtp_res, g.dim, 0.0f, d.s);
+        for (int r = 0; r < rows; ++r) d.pos_h[r] = pos0 + r;
+        CK(cudaMemcpyAsync(d.pos, d.pos_h, (size_t) rows * sizeof(int), cudaMemcpyHostToDevice, d.s));
+        return mtp_block(rows, pos0 + rows - 1, err);
+    }
+
+    // the chain's one step at position p: the block drafts (its shnorm output feeds the next step and the head)
+    bool mtp_step(int p, int tok, const float* car, bool head_on, int* out, std::string& err) {
+        if (!mtp_embed(&tok, 1, err)) return false;
+        Layer& l = L[(size_t) mtp_il];
+        Dev& d = D[(size_t) l.dev];
+        CK(cudaSetDevice(d.id));
+        k::mtp_in(mtp_embD, car, mtp_enorm, mtp_hnorm, 1, g.dim, g.eps, mtp_cat, d.s);
+        {
+            x3::MvJob j;
+            j.m = &mtp_eh;
+            j.xf = mtp_cat;
+            j.y = mtp_res;
+            if (!x3::mv(&j, 1, d.s)) {
+                err = "mtp: eh_proj";
+                return false;
+            }
+        }
+        // (GLM46_MTP_DUMP=FILE: the first steps' inputs and outputs, F32 - tools/glm46/mtp_parity.py's reference check)
+        static int ndump = 0;
+        const char* dpath = ::glm46::env("GLM46_MTP_DUMP");
+        const bool dump = dpath != nullptr && dpath[0] != '\0' && ndump < 3;
+        std::vector<float> dcat, dpre;
+        if (dump) {
+            dcat.resize((size_t) 2 * g.dim);
+            dpre.resize((size_t) g.dim);
+            CK(cudaMemcpyAsync(dcat.data(), mtp_cat, (size_t) 2 * g.dim * 4, cudaMemcpyDeviceToHost, d.s));
+            CK(cudaMemcpyAsync(dpre.data(), mtp_res, (size_t) g.dim * 4, cudaMemcpyDeviceToHost, d.s));
+        }
+        k::set_int(d.pos, p, d.s);
+        if (!mtp_block(1, p, err)) return false;
+        k::rms(mtp_res, mtp_shnorm, 1, g.dim, g.eps, mtp_carry, nullptr, d.s);
+        if (!head_on) return true;
+        {
+            x3::MvJob j;
+            j.m = &head;
+            j.xf = mtp_carry;
+            j.y = d.lg;
+            if (!x3::mv(&j, 1, d.s)) {
+                err = "mtp: the shared head";
+                return false;
+            }
+        }
+        if (dump) {
+            std::vector<float> dpost((size_t) g.dim), dcar((size_t) g.dim), dlg((size_t) g.vocab);
+            CK(cudaMemcpyAsync(dpost.data(), mtp_res, (size_t) g.dim * 4, cudaMemcpyDeviceToHost, d.s));
+            CK(cudaMemcpyAsync(dcar.data(), mtp_carry, (size_t) g.dim * 4, cudaMemcpyDeviceToHost, d.s));
+            CK(cudaMemcpyAsync(dlg.data(), d.lg, (size_t) g.vocab * 4, cudaMemcpyDeviceToHost, d.s));
+            CK(cudaStreamSynchronize(d.s));
+            if (std::FILE* f = std::fopen(dpath, ndump == 0 ? "wb" : "ab")) {
+                const int hdr[5] = {p, tok, g.dim, g.vocab, (int) 4};
+                std::fwrite("MTPD", 1, 4, f);
+                std::fwrite(hdr, 4, 5, f);
+                std::fwrite(dcat.data(), 4, dcat.size(), f);
+                std::fwrite(dpre.data(), 4, dpre.size(), f);
+                std::fwrite(dpost.data(), 4, dpost.size(), f);
+                std::fwrite(dcar.data(), 4, dcar.size(), f);
+                std::fwrite(dlg.data(), 4, dlg.size(), f);
+                std::fclose(f);
+            }
+            ++ndump;
+        }
+        k::argmax_row(d.lg, g.vocab, mtp_tok_d, d.s);
+        CK(cudaMemcpyAsync(mtp_tok_h, mtp_tok_d, sizeof(int), cudaMemcpyDeviceToHost, d.s));
+        CK(cudaStreamSynchronize(d.s));
+        const int e = x3::launch_errors();
+        if (e) {
+            err = "mtp: EXL3 launch errors: " + std::to_string(e);
+            return false;
+        }
+        *out = *mtp_tok_h;
+        return true;
+    }
+
+    // after a trunk forward of T tokens at pos0: the block's cache entries its rows fill - the one before the first
+    // (that token's predecessor's carrier is the previous forward's) and pos0 .. pos0 + T - 2.  The last row's carrier
+    // is kept for the next forward's first entry; a window's T rows' carriers for commit_rows.
+    bool mtp_after(const int* ids, int T, int pos0, std::string& err) {
+        if (mtp_cap <= 0 || T <= 0) return true;
+        Layer& l = L[(size_t) mtp_il];
+        Dev& d = D[(size_t) l.dev];
+        CK(cudaSetDevice(d.id));
+        const float* fin = D[(size_t) head_dev].h;   // (the last trunk layer is on the head's GPU: the final rows)
+        if (pos0 >= 1 && mtp_hx_pos == pos0 - 1) {
+            if (!mtp_entries(pos0 - 1, 1, mtp_hx, ids, err)) return false;
+        }
+        for (int s = 0; s + 1 < T; s += kMtpRows) {
+            const int n = std::min(kMtpRows, T - 1 - s);
+            k::rms(fin + (size_t) s * g.dim, norm1, n, g.dim, g.eps, mtp_slice, nullptr, d.s);
+            if (!mtp_entries(pos0 + s, n, mtp_slice, ids + s + 1, err)) return false;
+        }
+        if (T <= kWin)   // (a verify window's rows: kept for commit_rows)
+            k::rms(fin, norm1, T, g.dim, g.eps, mtp_car, nullptr, d.s);
+        k::rms(fin + (size_t) (T - 1) * g.dim, norm1, 1, g.dim, g.eps, mtp_hx, nullptr, d.s);
+        mtp_hx_pos = pos0 + T - 1;
+        mtp_pos0 = pos0;
+        mtp_T = T;
+        return true;
+    }
+
+    // the drafting chain: step i at the anchor's position - 1 + i; the first reads the sequence's carrier, the later
+    // ones the block's own output, and each step's token its predecessor's draft
+    bool mtp_chain(int anchor, int pos, int n, std::vector<int>& drafts, std::string& err) {
+        drafts.clear();
+        if (n <= 0 || mtp_hx_pos != pos - 1 || pos < 1) return true;   // (no carrier: a plain step, no drafts)
+        int d0 = anchor;
+        for (int i = 0; i < n; ++i) {
+            const float* car = i == 0 ? mtp_hx : mtp_carry;
+            if (!mtp_step(pos - 1 + i, d0, car, true, &d0, err)) return false;
+            drafts.push_back(d0);
+        }
         return true;
     }
 
@@ -3262,6 +3537,10 @@ struct Model::Impl {
             if (!draftm->context(taps, T, pos0, err)) return false;
             pmark(D[(size_t) head_dev], kPDraft);
         }
+        if (mtp_cap > 0 && !rows) {   // (--mtp: the block's cache entries this forward's rows fill)
+            CK(cudaSetDevice(D[(size_t) head_dev].id));
+            if (!mtp_after(ids, T, pos0, err)) return false;
+        }
         return true;
     }
 };
@@ -3454,6 +3733,7 @@ std::vector<std::string> Model::vram_lines() const { return tpe ? tpe->vram_line
 
 int Model::draft_block() const {
     if (tpe) return tpe->draft_block();
+    if (p->mtp_cap > 0) return p->mtp_cap;   // (--mtp: the model's own NextN block)
     return p->draftm ? p->draftm->geo().block : 0;
 }
 
@@ -3478,18 +3758,42 @@ void Model::set_images(std::vector<Image> images) {
 
 bool Model::draft(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, std::string& err) {
     if (tpe) return tpe->draft(anchor, pos, n, drafts, conf, err);
-    if (!p->draftm) {
-        err = "no DSpark draft loaded (--dspark)";
+    if (!p->mtp_cap && !p->draftm) {
+        err = "no draft loaded (--mtp: the model's NextN block)";
         return false;
+    }
+    if (p->mtp_cap > 0) {
+        // (--mtp: greedy, the trunk's verify window decides; no confidence model - every draft stands for verification)
+        cudaSetDevice(p->D[(size_t) p->head_dev].id);
+        if (!p->mtp_chain(anchor, pos, std::min(n, p->mtp_cap), drafts, err)) return false;
+        conf.assign(drafts.size(), 1.0f);
+        return true;
     }
     cudaSetDevice(p->D[(size_t) p->head_dev].id);
     return p->draftm->propose(anchor, pos, n, drafts, conf, nullptr, err);
+}
+
+void Model::commit_rows(int keep) {
+    if (tpe || p->mtp_cap <= 0 || keep <= 0 || p->mtp_T <= 0 || p->mtp_T > kWin || keep > p->mtp_T) return;
+    Dev& d = p->D[(size_t) p->head_dev];
+    cudaSetDevice(d.id);
+    cudaMemcpyAsync(p->mtp_hx, p->mtp_car + (size_t) (keep - 1) * p->g.dim, (size_t) p->g.dim * sizeof(float),
+                    cudaMemcpyDeviceToDevice, d.s);
+    p->mtp_hx_pos = p->mtp_pos0 + keep - 1;
 }
 
 bool Model::draft_sampled(int anchor, int pos, int n, const DraftSampling& ds, const std::vector<float>& u,
                           std::vector<int>& drafts, std::vector<float>& conf,
                           std::vector<std::vector<std::pair<int, float>>>& q, std::string& err) {
     if (tpe) return tpe->draft_sampled(anchor, pos, n, ds, u, drafts, conf, q, err);
+    if (p->mtp_cap > 0) {
+        // (--mtp: the draft is a point mass - q(d) = 1.  The serve loop's rule min(1, p(d) / q(d)) then keeps it with
+        //  the target's own probability, and max(0, p - q) subtracts it: every token is the target's own draw)
+        if (!draft(anchor, pos, n, drafts, conf, err)) return false;
+        q.assign(drafts.size(), {});
+        for (size_t i = 0; i < drafts.size(); ++i) q[i].push_back({drafts[(size_t) i], 1.0f});
+        return true;
+    }
     if (!p->draftm) {
         err = "no DSpark draft loaded (--dspark)";
         return false;

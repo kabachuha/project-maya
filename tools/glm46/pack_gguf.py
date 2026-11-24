@@ -5,8 +5,9 @@ architecture: ReadyArt/GLM-4.6-Derestricted-GGUF and the like), beside the model
 
 writes <model>/maya-glm46/:
   glm46.txt      the geometry under config.json's names (from the GGUF's glm4moe.* keys; the trunk's layer count is
-                 block_count less nextn_predict_layers - the NextN block is not served yet), format gguf, quant_name,
-                 model_dir, qkv_bias / norms_plus_one
+                 block_count less nextn_predict_layers), format gguf, quant_name, model_dir, qkv_bias / norms_plus_one;
+                 nextn 1 when the GGUF carries the NextN (MTP) block - its full layer at blk.<trunk> and nextn.eh_proj /
+                 enorm / hnorm / shared_head_norm are packed too, and the engine drafts with it (--mtp, on)
   tensors.txt    every trunk tensor as the GGUF stores it, `file <i> <shard>` lines then
                  `t <name> <dtype> <file> <offset> <bytes> <dims...>` - dims outermost first (a matrix [out][in]),
                  dtype ggml's type name (Q8_0, IQ3_S, IQ4_XS ...), offset absolute in the shard
@@ -102,6 +103,7 @@ def geometry_of(shards: list[pathlib.Path]) -> tuple[dict, dict]:
         "eot_token_id": int(md.get("tokenizer.ggml.eot_token_id", md.get("tokenizer.ggml.eos_token_id", 2))),
         "qkv_bias": 1 if md.get("glm4moe.attention.qkv_bias", True) is not False else 0,
         "norms_plus_one": 0,
+        "nextn": nextn,
         "model_dir": str(shards[0].parent),
     }
     if geom["vocab_size"] <= 0:
@@ -134,8 +136,9 @@ def main() -> int:
         g = G.GGUFFile(p)
         for t in g.tensors:
             if t.name.startswith("blk."):
-                if int(t.name.split(".", 2)[1]) >= trunk:
-                    continue   # (the NextN block: not served; its tensors stay in the GGUF)
+                li = int(t.name.split(".", 2)[1])
+                if li > trunk or (li == trunk and geom["nextn"] <= 0):
+                    continue   # (beyond the NextN block: not served; the GGUF keeps them)
             nbytes = t.expected_bytes()
             if nbytes is None:
                 raise SystemExit(f"{p.name}: {t.name} is {t.type_name}, no block geometry")
@@ -160,7 +163,8 @@ def main() -> int:
         if rc != 0:
             print("NOTE: the tokenizer export failed (one-shot --ids runs still work)", file=sys.stderr)
     print(f"pack: {out} - {kept} tensors from {len(shards)} shard(s); trunk {trunk} layers "
-          f"({geom['num_hidden_layers'] - len([1 for x in geom['moe_layer_freq'].split(',') if x == '0'])} MoE), "
+          f"({geom['num_hidden_layers'] - len([1 for x in geom['moe_layer_freq'].split(',') if x == '0'])} MoE)"
+          f"{', the NextN (MTP) block' if geom['nextn'] > 0 else ''}, "
           f"dim {geom['hidden_size']}, {geom['num_attention_heads']}/{geom['num_key_value_heads']} heads, "
           f"{geom['num_local_experts']} experts ({geom['num_experts_per_tok']} a token)")
     return 0

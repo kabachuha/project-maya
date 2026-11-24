@@ -43,6 +43,10 @@ struct Options {
                                   // -2: this host's, CpuLane::auto_workers - one a physical core, the first the caller's,
                                   // 2 cores left free where there are no SMT siblings); --cpu-threads N: N - 1 of them
     bool dspark = false;          // load the DSpark draft (the pack's dspark/) on the head's GPU
+    // --mtp (on by default, and only when the pack carries the NextN block): the model's own multi-token-prediction
+    // block drafts, the verify window checks - the native drafter (glm_mtp's design: entries pair h_p with token p+1)
+    bool mtp = true;
+    int mtp_drafts = 3;           // a round's drafts at most (--mtp-drafts)
     bool vision = true;           // load the vision tower (the pack's vision.*) on gpus[vision_gpu], before the experts
     bool vision_auto = true;      // (vision not asked for by name: a pack without a tower runs text only, no error)
     bool vision_must = false;     // (--images: a tower that does not load is an error; else vision off with a NOTE)
@@ -204,6 +208,10 @@ public:
     /// confidences.
     int draft_block() const;
     bool draft(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, std::string& err);
+    /// (--mtp) after a verify window of T rows at pos0: the kept prefix (the anchor and the drafts the trunk agreed
+    /// with) is the sequence's last row - the next round drafts from it, and the later rows the window wrote into the
+    /// draft block's cache are stale until rewritten (never read past a query's own position).
+    void commit_rows(int keep);
     /// ... each draft drawn from the draft's distribution (ds; u[i] the draw of position i, uniform in [0, 1)) instead
     /// of its argmax, q[i] that distribution ((id, probability), the most likely first) - the target keeps a draft d
     /// with min(1, p(d) / q(d)) and else draws from max(0, p - q), which leaves every token the target's own sample.

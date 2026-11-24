@@ -23,6 +23,7 @@ struct Geo {
     std::vector<int> moe;   // per trunk layer: 1 a MoE layer, 0 a dense one
     int bos, eos, eot;
     bool qkv_bias = true;   // glm4moe: the q / k / v projections carry a bias
+    int nextn = 0;          // 1: the pack carries the NextN (MTP) block (blk.<n_layers>.*) - the native drafter
     // (inherited from maya-mm3: the MiniMax indexer / swigluoai numbers its TP and DSpark sources still name; glm4moe
     //  has neither an indexer nor a clamp, and this engine refuses --tp / loads no DSpark draft - the files stay as
     //  they were, so an arch without them compiles)
@@ -51,6 +52,7 @@ struct Geo {
         eos = (int) p.num("eos_token_id");
         eot = (int) p.num("eot_token_id", eos);
         qkv_bias = p.num("qkv_bias", 1.0) != 0.0;
+        nextn = (int) p.num("nextn", 0);
         const auto no = [&](const std::string& what) {
             err = "geometry not covered: " + what;
             return false;

@@ -723,6 +723,7 @@ int serve(glm46::Model& m, const std::vector<int>& eos, int chunk, bool spec_on,
                 more = emit(x);
                 state.push_back(x);
             }
+            m.commit_rows((int) (d_acc - acc0) + 1);   // (--mtp: the kept prefix's carrier for the next round)
             if (L != nullptr) {   // (the round's window, its kept drafts and its time; a trusted one's as if drafted)
                 const int acc = (int) (d_acc - acc0);
                 L->policy.observe(from_lk, k + 1, acc, match, now() * 1e3 - t_round + (trusted ? L->draft_ms : 0.0));
@@ -737,7 +738,7 @@ int serve(glm46::Model& m, const std::vector<int>& eos, int chunk, bool spec_on,
             tok = next;
         }
         if (spec && d_off > 0)
-            std::fprintf(stderr, "maya glm46 serve: DSpark kept %lld of %lld drafts\n", d_acc, d_off);
+            std::fprintf(stderr, "maya glm46 serve: the drafts kept %lld of %lld\n", d_acc, d_off);
         if (L != nullptr && L->windows > lk_w0)
             std::fprintf(stderr, "maya glm46 serve: prompt lookup: %lld rounds (%lld without a draft), %lld of its %lld "
                          "drafts kept (in the above)\n", L->windows - lk_w0, L->trusted - lk_t0, L->accepted - lk_a0,
@@ -1650,7 +1651,7 @@ int usage() {
                  "                [--vision on|off] [--vision-gpu I] [--images FILE] [--layer-split auto|L,L,...]\n"
                  "                [--tp 1|2|4] [--cache-gb X] [--kv-cache F|K,V (bf16 int8 fp8 fp4; default int8)]\n"
                  "                [--kv-rot on|off] [--kv-streaming on|off] [--expert-profile FILE]\n"
-                 "                [--score REF [--write-ref OUT]] [--cpu-threads N] [--dspark on|off]\n"
+                 "                [--score REF [--write-ref OUT]] [--cpu-threads N] [--mtp on|off|--mtp-drafts N]\n"
                  "                [--kv-resident N] [--tp-chunk N] [--tp-ffn-rows N] [--dspark-cost X] [--suffix-draft N]\n"
                  "                [--prefill-gemm blas|hipblaslt|auto] [--prefill-tune FILE] [--no-prefill-tune]\n"
                  "                [--calibrate-prefill OUT.json [--ids @prompt]] [--calibrate-decode OUT.json] [--verbose]\n"
@@ -1752,6 +1753,15 @@ int main(int argc, char** argv) {
             const std::string v = val();
             o.dspark = v != "off" && v != "none";
         }
+        else if (a == "--mtp") {   // (on by default where the pack carries the NextN block)
+            const std::string v = val();
+            if (v != "on" && v != "off") {
+                std::fprintf(stderr, "--mtp: on or off, got '%s'\n", v.c_str());
+                std::exit(2);
+            }
+            o.mtp = v == "on";
+        }
+        else if (a == "--mtp-drafts") o.mtp_drafts = std::max(0, std::min(8, std::atoi(val().c_str())));
         else if (a == "--expert-profile") learned = val();
         else if (a == "--vision") {   // (on by default when the pack has the tower; --vision on: it must)
             o.vision = val() != "off";
@@ -1867,7 +1877,7 @@ int main(int argc, char** argv) {
                      o.ablate_layer != 0 ? "--ablate-layer" : "--ablate-scale");
         std::exit(2);
     }
-    // (glm4moe in this engine: one GPU or the layer split; the K / V rows BF16; no DSpark / NextN draft yet)
+    // (glm4moe in this engine: one GPU or the layer split; the K / V rows BF16; the model's own NextN block drafts)
     if (o.tp > 0) {
         std::fprintf(stderr, "--tp: glm4moe's tensor-parallel path is not served - a single GPU, or --layer-split\n");
         std::exit(2);
@@ -1993,7 +2003,7 @@ int main(int argc, char** argv) {
         const std::string kvf = o.kv_k == o.kv_v ? std::string(glm46::k::kv_name(o.kv_k))
                                                  : std::string(glm46::k::kv_name(o.kv_k)) + "," + glm46::k::kv_name(o.kv_v);
         if (m.seqs() > 1) return serve_multi(m, eos, o.chunk, kvf, profile_out);
-        return serve(m, eos, o.chunk, o.dspark, dspark_conf, dspark_cost, kvf, profile_out, suffix_draft);
+        return serve(m, eos, o.chunk, o.mtp, dspark_conf, dspark_cost, kvf, profile_out, suffix_draft);
     }
     const auto& st = m.stats();
     std::fprintf(stderr, "maya-glm46: loaded in %.1f s, %ld of %ld experts in VRAM, %.1f GB pinned pool\n", st.load_s,
@@ -2216,6 +2226,7 @@ int main(int argc, char** argv) {
             ++rounds;
             offered += k;
             accepted += j;
+            m.commit_rows(j + 1);   // (--mtp: the kept prefix's carrier for the next round)
             if (j < k && drafts[(size_t) j] == m.eos()) break;
             if (j > 0 && out.back() == m.eos()) break;
             next = argmax(lg.data() + (size_t) j * m.vocab());
@@ -2223,7 +2234,7 @@ int main(int argc, char** argv) {
         }
         t1 = now();
         for (size_t i = 0; i < out.size(); ++i) std::printf("%d%s", out[i], i + 1 < out.size() ? " " : "\n");
-        std::fprintf(stderr, "decode (DSpark): %zu tokens in %.2f s (%.2f tok/s), %d rounds, %d of %d drafts kept "
+        std::fprintf(stderr, "decode (--mtp): %zu tokens in %.2f s (%.2f tok/s), %d rounds, %d of %d drafts kept "
                      "(%.2f a round), drafting %.1f ms a draft (%d drafts)\n", out.size(), t1 - t0, out.size() / (t1 - t0),
                      rounds, accepted, offered, rounds ? (double) accepted / rounds : 0.0,
                      drafted ? 1e3 * t_draft / drafted : 0.0, drafted);

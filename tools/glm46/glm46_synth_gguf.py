@@ -8,7 +8,8 @@ with the dimensions scaled down and values from a seeded RNG.
 Geometry (small enough for one 3090; the kernels' hard bounds respected):
     dim 512, 12 query heads / 1 KV head (kG = 12, the GLM-4.5/4.6 ratio), head 128, rope 64,
     9 trunk layers (3 dense + 6 MoE), 8 experts a token's 2, expert FF 256, dense/shared FF 256,
-    vocab 512, theta 1e4, rms eps 1e-5, routed scale 2.5
+    vocab 512, theta 1e4, rms eps 1e-5, routed scale 2.5; beside them the NextN (MTP) block - a full MoE
+    layer at blk.9 and nextn.eh_proj / enorm / hnorm / shared_head_norm (block_count 10, nextn 1)
 
 Quantization goes through ggml's own quantizer (ggml_quantize_chunk of libggml, via ctypes) - the
 same code llama.cpp's quantize tool uses, so the blocks are canonical.
@@ -43,6 +44,11 @@ G = dict(
     n_embd=512, n_layers=9, n_head=12, n_kv=1, hd=128, n_rot=64, vocab=512,
     n_exp=8, k_exp=2, ff=256, ff_dense=256, ff_shared=256, dense_lead=3,
     theta=1e4, eps=1e-5, scale=2.5, bos=0, eos=1,
+    # (--mtp-identity: the NextN block reads as the trunk's own head one step early - a zero block whose eh_proj is
+    #  [0 | I] and whose norms are ones - so its draft is the trunk's next-token argmax and the repetitive synthetic
+    #  output accepts it: the smoke test of the verify / commit / chain path.  Off: a random block, as a real pack's
+    #  structure is (tools/glm46/mtp_parity.py checks its math))
+    mtp_identity=False,
 )
 
 
@@ -148,7 +154,7 @@ def metadata() -> list[tuple[str, bytes]]:
         ("general.architecture", kv_str("glm4moe")),
         ("general.name", kv_str("GLM-4.6 synthetic")),
         ("general.size_label", kv_str("synth")),
-        ("glm4moe.block_count", kv_u32(G["n_layers"])),
+        ("glm4moe.block_count", kv_u32(G["n_layers"] + 1)),
         ("glm4moe.context_length", kv_u32(4096)),
         ("glm4moe.embedding_length", kv_u32(G["n_embd"])),
         ("glm4moe.attention.head_count", kv_u32(G["n_head"])),
@@ -167,7 +173,7 @@ def metadata() -> list[tuple[str, bytes]]:
         ("glm4moe.expert_weights_scale", kv_f32(G["scale"])),
         ("glm4moe.expert_weights_norm", kv_bool(True)),
         ("glm4moe.leading_dense_block_count", kv_u32(G["dense_lead"])),
-        ("glm4moe.nextn_predict_layers", kv_u32(0)),
+        ("glm4moe.nextn_predict_layers", kv_u32(1)),
         ("tokenizer.ggml.model", kv_str("gpt2")),
         ("tokenizer.ggml.pre", kv_str("glm4")),
         ("tokenizer.ggml.tokens", struct.pack("<I", ARRAY) + struct.pack("<I", STRING) + struct.pack("<Q", G["vocab"]) +
@@ -197,35 +203,60 @@ def build(lib: str, seed: int) -> tuple[list[tuple[str, bytes]], list[tuple[str,
     def norm(n):
         return (1.0 + rng.standard_normal(n) * 0.02).astype(np.float32)
 
+    ident = bool(G["mtp_identity"])
     add("token_embd.weight", w(G["vocab"], G["n_embd"], s=0.02), GGML_Q8_0)
-    add("output_norm.weight", norm(G["n_embd"]), GGML_F32)
+    add("output_norm.weight", np.ones(G["n_embd"], np.float32) if ident else norm(G["n_embd"]), GGML_F32)
     add("output.weight", w(G["vocab"], G["n_embd"], s=0.02), GGML_Q8_0)
-    for i in range(G["n_layers"]):
+
+    def nrm(n):
+        return np.ones(n, np.float32) if ident else norm(n)
+
+    def block(i: int, moe: bool, identity: bool = False) -> None:
         P = f"blk.{i}."
-        add(P + "attn_norm.weight", norm(G["n_embd"]), GGML_F32)
-        add(P + "post_attention_norm.weight", norm(G["n_embd"]), GGML_F32)
-        add(P + "attn_q_norm.weight", norm(G["hd"]), GGML_F32)
-        add(P + "attn_k_norm.weight", norm(G["hd"]), GGML_F32)
-        add(P + "attn_q.weight", w(G["n_head"] * G["hd"], G["n_embd"]), GGML_Q8_0)
-        add(P + "attn_q.bias", w(G["n_head"] * G["hd"], s=0.02), GGML_F32)
-        add(P + "attn_k.weight", w(G["n_kv"] * G["hd"], G["n_embd"]), GGML_Q8_0)
-        add(P + "attn_k.bias", w(G["n_kv"] * G["hd"], s=0.02), GGML_F32)
-        add(P + "attn_v.weight", w(G["n_kv"] * G["hd"], G["n_embd"]), GGML_Q8_0)
-        add(P + "attn_v.bias", w(G["n_kv"] * G["hd"], s=0.02), GGML_F32)
-        add(P + "attn_output.weight", w(G["n_embd"], G["n_head"] * G["hd"]), GGML_Q8_0)
-        if i < G["dense_lead"]:
-            add(P + "ffn_gate.weight", w(G["ff_dense"], G["n_embd"]), GGML_Q8_0)
-            add(P + "ffn_up.weight", w(G["ff_dense"], G["n_embd"]), GGML_Q8_0)
-            add(P + "ffn_down.weight", w(G["n_embd"], G["ff_dense"]), GGML_Q8_0)
+        zero = (lambda *shape: np.zeros(shape, np.float32)) if identity else w
+        add(P + "attn_norm.weight", nrm(G["n_embd"]) if not identity else np.ones(G["n_embd"], np.float32), GGML_F32)
+        add(P + "post_attention_norm.weight", nrm(G["n_embd"]) if not identity else np.ones(G["n_embd"], np.float32), GGML_F32)
+        add(P + "attn_q_norm.weight", nrm(G["hd"]) if not identity else np.ones(G["hd"], np.float32), GGML_F32)
+        add(P + "attn_k_norm.weight", nrm(G["hd"]) if not identity else np.ones(G["hd"], np.float32), GGML_F32)
+        add(P + "attn_q.weight", zero(G["n_head"] * G["hd"], G["n_embd"]), GGML_Q8_0)
+        add(P + "attn_q.bias", zero(G["n_head"] * G["hd"]), GGML_F32)
+        add(P + "attn_k.weight", zero(G["n_kv"] * G["hd"], G["n_embd"]), GGML_Q8_0)
+        add(P + "attn_k.bias", zero(G["n_kv"] * G["hd"]), GGML_F32)
+        add(P + "attn_v.weight", zero(G["n_kv"] * G["hd"], G["n_embd"]), GGML_Q8_0)
+        add(P + "attn_v.bias", zero(G["n_kv"] * G["hd"]), GGML_F32)
+        add(P + "attn_output.weight", zero(G["n_embd"], G["n_head"] * G["hd"]), GGML_Q8_0)
+        if not moe:
+            add(P + "ffn_gate.weight", zero(G["ff_dense"], G["n_embd"]), GGML_Q8_0)
+            add(P + "ffn_up.weight", zero(G["ff_dense"], G["n_embd"]), GGML_Q8_0)
+            add(P + "ffn_down.weight", zero(G["n_embd"], G["ff_dense"]), GGML_Q8_0)
         else:
-            add(P + "ffn_gate_inp.weight", w(G["n_exp"], G["n_embd"], s=0.1), GGML_F32)
+            add(P + "ffn_gate_inp.weight", zero(G["n_exp"], G["n_embd"]), GGML_F32)
             add(P + "exp_probs_b.bias", (2.0 - 4.0 * np.arange(G["n_exp"]) / max(1, G["n_exp"] - 1)).astype(np.float32), GGML_F32)
-            add(P + "ffn_gate_exps.weight", w(G["n_exp"], G["ff"], G["n_embd"]), GGML_IQ3_S)
-            add(P + "ffn_up_exps.weight", w(G["n_exp"], G["ff"], G["n_embd"]), GGML_IQ3_S)
-            add(P + "ffn_down_exps.weight", w(G["n_exp"], G["n_embd"], G["ff"]), GGML_IQ4_XS)
-            add(P + "ffn_gate_shexp.weight", w(G["ff_shared"], G["n_embd"]), GGML_Q8_0)
-            add(P + "ffn_up_shexp.weight", w(G["ff_shared"], G["n_embd"]), GGML_Q8_0)
-            add(P + "ffn_down_shexp.weight", w(G["n_embd"], G["ff_shared"]), GGML_Q8_0)
+            add(P + "ffn_gate_exps.weight", zero(G["n_exp"], G["ff"], G["n_embd"]), GGML_IQ3_S)
+            add(P + "ffn_up_exps.weight", zero(G["n_exp"], G["ff"], G["n_embd"]), GGML_IQ3_S)
+            add(P + "ffn_down_exps.weight", zero(G["n_exp"], G["n_embd"], G["ff"]), GGML_IQ4_XS)
+            add(P + "ffn_gate_shexp.weight", zero(G["ff_shared"], G["n_embd"]), GGML_Q8_0)
+            add(P + "ffn_up_shexp.weight", zero(G["ff_shared"], G["n_embd"]), GGML_Q8_0)
+            add(P + "ffn_down_shexp.weight", zero(G["n_embd"], G["ff_shared"]), GGML_Q8_0)
+
+    for i in range(G["n_layers"]):
+        block(i, i >= G["dense_lead"])
+    # the NextN (MTP) block: a full MoE layer beside nextn.eh_proj ([emb | h] -> dim), enorm / hnorm (the two input
+    # norms) and shared_head_norm (its output's norm before the trunk's shared head)
+    P = f"blk.{G['n_layers']}."
+    if ident:   # (its block is zero: eh_proj [0 | I] passes the carrier, the head reads it as the trunk's own would)
+        block(G["n_layers"], True, identity=True)
+        eh = np.zeros((G["n_embd"], 2 * G["n_embd"]), np.float32)
+        eh[:, G["n_embd"]:] = np.eye(G["n_embd"], dtype=np.float32)
+        add(P + "nextn.eh_proj.weight", eh, GGML_Q8_0)
+        for nm in ("nextn.enorm", "nextn.hnorm", "nextn.shared_head_norm"):
+            add(P + nm + ".weight", np.ones(G["n_embd"], np.float32), GGML_F32)
+    else:
+        block(G["n_layers"], True)
+        add(P + "nextn.eh_proj.weight", w(G["n_embd"], 2 * G["n_embd"]), GGML_Q8_0)
+        add(P + "nextn.enorm.weight", norm(G["n_embd"]), GGML_F32)
+        add(P + "nextn.hnorm.weight", norm(G["n_embd"]), GGML_F32)
+        add(P + "nextn.shared_head_norm.weight", norm(G["n_embd"]), GGML_F32)
     return metadata(), ts
 
 
@@ -237,7 +268,8 @@ def selftest(path: Path) -> None:
     by = {t.name: t for t in gf.tensors}
     md = gf.metadata
     assert md["general.architecture"] == "glm4moe", "architecture key"
-    assert md["glm4moe.block_count"] == G["n_layers"], "block count"
+    assert md["glm4moe.block_count"] == G["n_layers"] + 1, "block count"
+    assert md["glm4moe.nextn_predict_layers"] == 1, "nextn"
     assert md["glm4moe.expert_count"] == G["n_exp"] and md["glm4moe.expert_used_count"] == G["k_exp"], "experts"
     assert by["blk.0.attn_q.weight"].type_name == "Q8_0", "attention projection type"
     assert by["blk.0.ffn_gate.weight"].type_name == "Q8_0", "dense FFN type"
@@ -247,6 +279,9 @@ def selftest(path: Path) -> None:
     assert by[f"blk.{G['dense_lead']}.ffn_gate_shexp.weight"].type_name == "Q8_0", "shared expert type"
     assert by["token_embd.weight"].type_name == "Q8_0" and by["output.weight"].type_name == "Q8_0", "head/embed type"
     assert by["blk.0.attn_q.bias"].type_name == "F32", "the q bias type"
+    P = f"blk.{G['n_layers']}."
+    assert by[P + "nextn.eh_proj.weight"].type_name == "Q8_0", "the NextN eh_proj type"
+    assert by[P + "ffn_gate_exps.weight"].type_name == "IQ3_S", "the NextN block's experts type"
     print(f"selftest ok: {len(gf.tensors)} tensors, {path.stat().st_size / 1e6:.2f} MB")
 
 
@@ -256,7 +291,11 @@ def main() -> int:
     ap.add_argument("--lib", default="/home/khrapov/AI4/llama.cpp/build/bin/libggml-base.so",
                     help="a libggml with ggml_quantize_chunk")
     ap.add_argument("--seed", type=int, default=777)
+    ap.add_argument("--mtp-identity", action="store_true",
+                    help="the NextN block as a zero block whose eh_proj is [0 | I] (its draft is the trunk's next "
+                         "token read one step early: the verify / commit path's smoke test)")
     a = ap.parse_args()
+    G["mtp_identity"] = a.mtp_identity
     md, tensors = build(a.lib, a.seed)
     write_gguf_typed(Path(a.out), md, tensors)
     selftest(Path(a.out))

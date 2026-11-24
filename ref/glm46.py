@@ -155,6 +155,100 @@ class Glm46:
                 d["md"] = self.g.tensor(P + "ffn_down.weight")
             self.L.append(d)
 
+    def mtp_load(self) -> None:
+        """The pack's NextN (MTP) block: blk.<trunk>.* as a full MoE layer, beside nextn.eh_proj / enorm / hnorm /
+        shared_head_norm (the head is the trunk's output.weight)."""
+        c = self.cfg
+        if c.trunk >= c.n_layer:
+            self.mtp = None
+            return
+        P = f"blk.{c.trunk}."
+        d = {
+            "attn_norm": self.g.tensor(P + "attn_norm.weight"),
+            "post1": self.g.tensor(P + "post_attention_norm.weight"),
+            "q": self.g.tensor(P + "attn_q.weight"),
+            "qb": self.g.tensor(P + "attn_q.bias"),
+            "k": self.g.tensor(P + "attn_k.weight"),
+            "kb": self.g.tensor(P + "attn_k.bias"),
+            "v": self.g.tensor(P + "attn_v.weight"),
+            "vb": self.g.tensor(P + "attn_v.bias"),
+            "o": self.g.tensor(P + "attn_output.weight"),
+            "qn": self.g.tensor(P + "attn_q_norm.weight"),
+            "kn": self.g.tensor(P + "attn_k_norm.weight"),
+            "gate": self.g.tensor(P + "ffn_gate_inp.weight"),
+            "gbias": self.g.tensor(P + "exp_probs_b.bias"),
+            "sg": self.g.tensor(P + "ffn_gate_shexp.weight"),
+            "su": self.g.tensor(P + "ffn_up_shexp.weight"),
+            "sd": self.g.tensor(P + "ffn_down_shexp.weight"),
+            "eh": self.g.tensor(P + "nextn.eh_proj.weight"),
+            "enorm": self.g.tensor(P + "nextn.enorm.weight"),
+            "hnorm": self.g.tensor(P + "nextn.hnorm.weight"),
+            "shnorm": self.g.tensor(P + "nextn.shared_head_norm.weight"),
+        }
+        self.mtp = d
+        self._mk = None   # the block's own K / V rows, (n_kv, hd, T)
+        self._mv = None
+
+    def _mtp_block(self, x: np.ndarray, pos: np.ndarray) -> np.ndarray:
+        """The block's rows x (n_embd, T) at positions pos, appended to its own K/V; the residual out (n_embd, T)."""
+        c, L = self.cfg, self.mtp
+        h = rms_norm(x, L["attn_norm"], c.eps)
+        q = L["q"] @ h + L["qb"][:, None]
+        k = L["k"] @ h + L["kb"][:, None]
+        v = L["v"] @ h + L["vb"][:, None]
+        qh = rope(per_head_rms(split_heads(q, c.hd, c.n_head), L["qn"], c.eps), pos, c.n_rot, self.inv)
+        kh = rope(per_head_rms(split_heads(k, c.hd, c.n_kv), L["kn"], c.eps), pos, c.n_rot, self.inv)
+        vh = split_heads(v, c.hd, c.n_kv)
+        self._mk = kh if self._mk is None else np.concatenate([self._mk, kh], axis=2)
+        self._mv = vh if self._mv is None else np.concatenate([self._mv, vh], axis=2)
+        groups = c.n_head // c.n_kv
+        att = causal_attn(qh, self._mk.repeat(groups, axis=0), np.repeat(self._mv, groups, axis=0), 1.0 / np.sqrt(c.hd))
+        x = x + L["o"] @ att.reshape(c.n_head * c.hd, att.shape[-1])
+        h2 = rms_norm(x, L["post1"], c.eps)
+        logits = L["gate"] @ h2
+        probs = 1.0 / (1.0 + np.exp(-logits)) if c.gating_sigmoid else np.exp(logits)
+        sel = probs + L["gbias"][:, None]
+        w = np.zeros((h2.shape[1], c.n_exp), dtype=np.float64)
+        for t in range(h2.shape[1]):
+            order = np.argsort(-sel[:, t], kind="stable")
+            top = order[:c.k_exp]
+            wt = probs[top, t]
+            if c.norm_w:
+                wt = wt / max(wt.sum(), 6.103515625e-5)
+            w[t, top] = wt * c.w_scale
+        y = np.zeros_like(h2)
+        for e in range(c.n_exp):
+            rows = np.nonzero(w[:, e] > 0.0)[0]
+            if rows.size == 0:
+                continue
+            gg = self.expert(c.trunk, "gate", e) @ h2[:, rows]
+            uu = self.expert(c.trunk, "up", e) @ h2[:, rows]
+            dd = self.expert(c.trunk, "down", e) @ swiglu(gg, uu)
+            y[:, rows] += dd * w[rows, e][None, :]
+        y += L["sd"] @ swiglu(L["sg"] @ h2, L["su"] @ h2)
+        return x + y
+
+    def mtp_prefill(self, ids: list[int], h_rows: np.ndarray) -> None:
+        """The prompt's entries p = 0 .. T-2: [emb(ids[p+1]) | h_p] run through the block (its K/V built)."""
+        c, L = self.cfg, self.mtp
+        rows = len(ids) - 1
+        if rows <= 0:
+            return
+        e = rms_norm(self.emb[ids[1:rows + 1]].T.astype(np.float64), L["enorm"], c.eps)
+        hh = rms_norm(h_rows[:rows].T.astype(np.float64), L["hnorm"], c.eps)
+        R = L["eh"] @ np.concatenate([e, hh], axis=0)
+        self._mtp_block(R, np.arange(rows, dtype=np.float64))
+
+    def mtp_step(self, p: int, tok: int, carrier: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """One chain step at position p: the block reads (h_p = carrier, the token) and drafts; (logits, carry)."""
+        c, L = self.cfg, self.mtp
+        e = rms_norm(self.emb[[tok]].T.astype(np.float64), L["enorm"], c.eps)
+        hh = rms_norm(carrier[:, None].astype(np.float64), L["hnorm"], c.eps)
+        R = L["eh"] @ np.concatenate([e, hh], axis=0)
+        x = self._mtp_block(R, np.array([float(p)]))
+        carry = rms_norm(x, L["shnorm"], c.eps)
+        return (self.out_w @ carry).T[0], carry.T[0]
+
     def expert(self, i, role, e):
         P = f"blk.{i}."
         name = {"gate": P + "ffn_gate_exps.weight", "up": P + "ffn_up_exps.weight",
@@ -259,6 +353,7 @@ class Glm46:
                 dumpf.write(struct.pack("<ii", i, T))
                 dumpf.write(np.ascontiguousarray(x.T, dtype="<f4").tobytes())
         h = rms_norm(x, self.out_norm, c.eps)
+        self.last_h = h.T.copy()                                       # (T, n_embd) the MTP's carrier
         if dumpf is not None:
             dumpf.close()
         return (self.out_w @ h).T                                      # (T, vocab)
