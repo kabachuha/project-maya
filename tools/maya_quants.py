@@ -20,9 +20,10 @@ FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
 # ("ik2": thinkingmachines' Inkling 2 on maya-ik2 - the setup's is Inkling-2-Mini, an experimental preview; the 594B
 #  Inkling-2-Small runs by hand, docs/INKLING2.md)
-MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
-         "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash", "ik2": "Inkling-2-Mini"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
-SHOWN = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
+MODEL = {"glm": "GLM-5.3-Flash", "glm46": "GLM-4.6", "deepseek": "DeepSeek-V4.1-Flash-1017",
+         "minimax": "MiniMax-M3.1-Flash", "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash",
+         "ik2": "Inkling-2-Mini"}   # ("glm46": zai-org's GLM-4.5 / GLM-4.6, on maya-glm46)
+SHOWN = {"glm": "GLM-5.3-Flash", "glm46": "GLM-4.6", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
          "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)", "hy4": "Hy4-Flash",
          "ik2": "Inkling 2 Mini"}   # the model's name on screen (the chat header: serve/web/lib.js's
                                                          # modelName(id, true), "Qwen-3.8-Flash-Next"); its ids stay
@@ -50,6 +51,9 @@ MODEL_DEFAULTS = {
     # Inkling-2-Small (maya-ik2, docs/INKLING2.md): thinkingmachines' card and files name no sampling (no
     # generation_config.json), so plain sampling - temperature 1.0, top_p 1.0; "auto" its template's own effort (0.9)
     "ik2": ({"temperature": 1.0, "top_p": 1.0}, "auto"),
+    # GLM-4.6 (maya-glm46, glm4moe): zai-org/GLM-4.6's card - a sampling temperature of 1.0 for general work
+    # (top_p 0.95 and top_k 40 for code); no effort named, so the template's own ("auto", as MiniMax's)
+    "glm46": ({"temperature": 1.0, "top_p": 0.95}, "auto"),
     # Inkling-2-Mini (the setup's Inkling 2, an experimental preview; model_key "ik2-mini"), its author's values (PR
     # #1095): thinkingmachines/Inkling-2-Mini's generation_config.json - temperature 1.0, top_p 1.0, no top-k, no
     # penalties; the level its template's own default, 0.9 - "high" by name (the page offers none / low / medium /
@@ -320,6 +324,8 @@ def family_of(cfg: dict) -> str:
     "glm"."""
     inst = cfg.get("installer") or {}
     exe = Path(str(cfg.get("exe", ""))).name
+    if inst.get("family") == "glm46" or exe.startswith("maya-glm46"):   # (zai-org's GLM-4.5 / GLM-4.6)
+        return "glm46"
     if inst.get("family") == "hy4" or exe.startswith("maya-hy4"):
         return "hy4"
     if inst.get("family") == "ik2" or exe.startswith("maya-ik2"):   # (Inkling-2-Mini: the setup's; Inkling-2-Small: by hand)

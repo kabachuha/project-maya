@@ -779,6 +779,22 @@ QWEN_UD_DIR = "Qwen3.8-Flash-Next-UD-IQ2_XS"       # (its folder in the models f
 QWEN_UD_MANIFEST = ROOT / "tools" / "qwen" / "download_unsloth.json"
 QWEN_UD_MODEL_NAME = "qwen3.8-flash-next"
 QWEN_QUANTS = ("q5_k_m", QWEN_UD)
+# GLM-4.6 (zai-org's GLM-4.5 / GLM-4.6, llama.cpp's glm4moe architecture: 92 trunk layers plus a NextN block, GQA
+# 96 / 8 heads, 160 experts top-8, a dense 3-layer lead) on its own engine maya-glm46 (src/glm46, forked from
+# maya-mm3; NVIDIA from V100 on, and AMD on Linux), which reads a llama.cpp GGUF set in place, mixed quants included
+# (ReadyArt/GLM-4.6-Derestricted-GGUF's Q8_0-IQ3_S-IQ3_S-IQ4_XS, 3.94 bits): packed by tools/glm46/pack_gguf.py.
+# The NextN block is the model's own MTP drafter (--mtp, on): it drafts, the trunk's verify window decides every
+# token.  The experts live as the other engines' do - as many of its layers' routed experts in VRAM as fit, the rest
+# staged (pinned RAM) or computed on the CPU lane, with promotions and the layer split over several GPUs.  Its
+# contexts: the GGUF's own (GLM-4.6: 200K); one request at a time unless --parallel.  Control vectors
+# (--control-vector-scaled) and --ablate as the GLM engine's.
+GLM46 = Q.MODEL["glm46"]                           # "GLM-4.6" (--model glm-4.6, or glm-4.5: the same engine)
+GLM46_SHOWN = Q.SHOWN["glm46"]
+GLM46_EXE = BUILD / ("maya-glm46.exe" if WIN else "maya-glm46")
+GLM46_PACK = "maya-glm46"                          # (the pack's folder in the model's: glm46.txt, tensors.txt, tokenizer/)
+GLM46_CONFIG = "maya-glm-4.6.json"                 # (the config's name in this folder; one model a setup)
+GLM46_MIN_CC = 70                                  # (V100 sm_70 and newer, as maya-mm3's)
+
 # Hy4-Flash (v1.1.68): Tencent's tencent/Hy4-flash (hy_v4_flash, 220B with its n-gram tables: 42 layers and an MTP
 # block, MLA attention with a sliding window and 12 indexed layers, 512 experts, 16 a token, 4 hyper-connection streams,
 # Engram) on its own engine maya-hy4 (src/hy4; NVIDIA: CUDA, Linux and Windows, V100 on; AMD: HIP, Linux - a
@@ -891,6 +907,7 @@ IK2_DIR = "maya-ik2"                               # (in the model's folder: tok
 IK2_MODEL_NAME = "inkling-2-mini"
 IK2_MIN_CC = IK2F.MIN_CC
 IK2_PROFILE = ROOT / "data" / "expert-profile-ik2mini.bin"   # (the offload path's starting VRAM tier: maya-ik2's IK2_WARM)
+# (the setup's picker: the models it offers and downloads; GLM-4.6 is brought by --model glm-4.6 --model-dir)
 FAMILIES =("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
@@ -900,7 +917,8 @@ def exe_for_target(target: str) -> Path:
     fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
     if target == "maya-glm-helper":                    # (GLM's AMD helper program for the two-GPU mode: mixed_builds)
         return BUILD / ("maya-glm-helper.exe" if WIN else "maya-glm-helper")
-    return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE, "maya-hy4": HY4_EXE, "maya-ik2": IK2_EXE}[target]
+    return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE, "maya-hy4": HY4_EXE, "maya-ik2": IK2_EXE,
+            "maya-glm46": GLM46_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 
 
@@ -1110,6 +1128,7 @@ def select_build_backend(backend: str) -> None:
     MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
     HY4_EXE = BUILD / ("maya-hy4.exe" if WIN else "maya-hy4")
     IK2_EXE = BUILD / ("maya-ik2.exe" if WIN else "maya-ik2")
+    GLM46_EXE = BUILD / ("maya-glm46.exe" if WIN else "maya-glm46")
     STAMP = BUILD / "MAYA-BUILD.json"
 
 
@@ -1775,7 +1794,8 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         fail("Project Maya runs on Linux and Windows (and on Apple Silicon: --backend metal)",
              "the engine needs an NVIDIA GPU and CUDA")
     min_cc = ((DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else (MM3_GGUF_MIN_CC if gguf else mm3_min_cc()) if mm3
-              else QWEN_MIN_CC if family == "qwen" else HY4_MIN_CC if hy4 else IK2_MIN_CC if ik2 else MIN_CC)
+              else QWEN_MIN_CC if family == "qwen" else HY4_MIN_CC if hy4 else IK2_MIN_CC if ik2
+              else GLM46_MIN_CC if family == "glm46" else MIN_CC)
     if S.is_wsl():
         warn("this is WSL2, which Maya does not support: WSL2's driver pins only about 1 GB of "
              "RAM for the GPU, and Maya's RAM tier pins tens of GB. Use a native Linux install.")
@@ -2067,7 +2087,7 @@ def config_family(cfg: dict) -> str:
 
 
 # each model's name on the setup's screen, under its logo (Qwen's: the model, whichever of its files - never its id)
-FAMILY_TITLE = {**Q.MODEL, "qwen": "Qwen-3.8-Flash-Next"}
+FAMILY_TITLE = {**Q.MODEL, "qwen": "Qwen-3.8-Flash-Next", "glm46": GLM46_SHOWN}
 
 
 def setup_title(cfg: dict) -> str:
@@ -2081,7 +2101,7 @@ def setup_title(cfg: dict) -> str:
 # the models whose engine answers several requests at once (--parallel): GLM-5.3-Flash's, DeepSeek-V4.1-Flash's
 # (maya-ds4 --parallel: a conversation's state each, their tokens decoded together), MiniMax-M3.1-Flash's (maya-mm3
 # --parallel: a KV cache each in VRAM - no KV streaming, no DSpark)
-PARALLEL_FAMILIES = ("glm", "deepseek", "minimax")
+PARALLEL_FAMILIES = ("glm", "deepseek", "minimax", "glm46")
 
 
 def check_parallel(a, family: str) -> None:
@@ -2101,6 +2121,8 @@ def g53_offered() -> list:
 def choose_family(a, prev: dict) -> str:
     """"glm" or "deepseek": what the options say (--model, --gguf-dir, --draft), else asked - the model set up before
     is the default."""
+    if getattr(a, "glm46", False):
+        return "glm46"
     if a.model:
         return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else \
             "hy4" if a.model == HY4 else "ik2" if a.model == IK2 else "glm"
@@ -3155,7 +3177,7 @@ def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
     return meta
 
 
-ENGINE_TARGETS = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2")
+ENGINE_TARGETS = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2", "maya-glm46")
 
 
 def target_of_exe(exe) -> str | None:
@@ -3380,8 +3402,10 @@ def refresh_engine(cfg: dict) -> None:
     meta = read_json(STAMP)
     exe = Path(cfg["exe"]).resolve()
     target = "maya-ds4" if exe == DS4_EXE.resolve() else "maya-mm3" if exe == MM3_EXE.resolve() else \
-        "maya-hy4" if exe == HY4_EXE.resolve() else "maya-ik2" if exe == IK2_EXE.resolve() else "maya"
-    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve(), MM3_EXE.resolve(), HY4_EXE.resolve(), IK2_EXE.resolve()):
+        "maya-hy4" if exe == HY4_EXE.resolve() else "maya-ik2" if exe == IK2_EXE.resolve() else \
+        "maya-glm46" if exe == GLM46_EXE.resolve() else "maya"
+    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve(), MM3_EXE.resolve(), HY4_EXE.resolve(),
+                               IK2_EXE.resolve(), GLM46_EXE.resolve()):
         return
     src = S.source_hash(S.ENGINE_SOURCES)
     if meta.get("src") == src and target in (meta.get("targets") or ["maya"]):
@@ -6677,6 +6701,10 @@ def server_command(cfg_path: Path, a) -> tuple:
     elif config_family(cfg) == "qwen":
         say("  Loading takes a few minutes: the engine places the most-used experts in VRAM, the next ones in RAM as far")
         say("  as the free RAM goes (MAYA_EXPERT_RAM_GB caps it) and reads the rest from the SSD when they are routed.")
+    elif config_family(cfg) == "glm46":
+        say("  Loading takes a few minutes: the engine places as many of the model's routed experts in VRAM as fit the")
+        say("  cards, keeps the next ones in pinned RAM (staged) or computes them on the CPU lane, and loads the NextN")
+        say("  block that drafts (its drafts are checked by the model - the answers are the model's own).")
 
     elif ds4:
         say("  Loading takes a few minutes: the engine places the experts in VRAM by how often they are used, copies the")
@@ -7488,6 +7516,8 @@ def _set_up(a, prev: dict) -> Path | None:
         return set_up_hy4(a, prev)
     if family == "ik2":
         return set_up_ik2(a, prev)
+    if family == "glm46":
+        return set_up_glm46(a, prev)
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -11864,6 +11894,153 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision, drafter)   # 8
 
 
+
+# ------------------------------------------------------------------------------------------------ GLM-4.6
+GLM46_IDS = ("glm-4.6", "glm46", "glm-4.5")        # (--model: the GGUF set you have - the same engine serves both)
+
+
+def glm46_pack_gguf(folder: Path) -> Path | None:
+    """The first GGUF of a glm4moe set in `folder` (a lone file too); None when there is none."""
+    folder = folder if folder.is_dir() else folder.parent
+    firsts = sorted(folder.glob("*-00001-of-*.gguf"))
+    if firsts:
+        return firsts[0]
+    files = sorted(folder.glob("*.gguf"))
+    return files[0] if files else None
+
+
+def glm46_shards(first: Path) -> list[Path]:
+    """Every shard of the set `first` belongs to (a lone file: itself), in order."""
+    m = re.search(r"-00001-of-(\d{5})\.gguf$", first.name)
+    if not m:
+        return [first]
+    stem = first.name[: first.name.index("-00001-of-")]
+    return [first.parent / f"{stem}-{k:05d}-of-{m.group(1)}.gguf" for k in range(1, int(m.group(1)) + 1)]
+
+
+def glm46_quant_name(first: Path) -> str:
+    """A set's quant label, from the GGUF's own general.size_label / name."""
+    try:
+        from gguf_reader import GGUFFile
+        md = GGUFFile(first).metadata
+        return str(md.get("general.size_label") or md.get("general.name") or "gguf")
+    except Exception:  # noqa: BLE001 - a header it cannot read: the setup's check says so
+        return "gguf"
+
+
+def glm46_pack_step(a, d: Path, first: Path) -> Path:
+    """Step 6: the pack (tools/glm46/pack_gguf.py) - a GGUF set read in place, the tokenizer exported beside it."""
+    step(6, "the pack")
+    pack = d / GLM46_PACK
+    if pack.exists() and not a.repack:
+        ok(f"pack: {pack} (as before; --repack builds it again)")
+        return pack
+    say("  Indexing the model's tensors (the geometry and every tensor's place in its shard) ...")
+    r = subprocess.run([sys.executable, str(ROOT / "tools" / "glm46" / "pack_gguf.py"), "--model", str(first)],
+                       cwd=str(ROOT), text=True)
+    if r.returncode != 0 or not (pack / "glm46.txt").exists():
+        fail(f"the pack did not build ({pack})", "the messages above say why; nothing else has changed")
+    ok(f"pack: {pack}")
+    return pack
+
+
+def set_up_glm46(a, prev: dict) -> Path | None:
+    """GLM-4.6 (or GLM-4.5) from a GGUF set you have (--model glm-4.6 --model-dir FOLDER): the pack, the
+    configuration and its start script.  There is no download in this setup - the files are a llama.cpp glm4moe set
+    (ReadyArt/GLM-4.6-Derestricted-GGUF's mixed quant, or another), read in place."""
+    prev_args = prev.get("args") or []
+    prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
+    a.gpus_before = prev.get("gpu")                    # (_set_up names the model under the screen's logo)
+    pc = check_pc(a, "glm46")                          # 1
+    step(2, "your choices")                            # 2
+    folder = Path(a.model_dir or a.gguf_dir).expanduser() if (a.model_dir or a.gguf_dir) else None
+    if folder is None:
+        fail(f"{GLM46_SHOWN} is set up from files you already have", 
+             f"{ME} --model glm-4.6 --model-dir <the folder with its .gguf shards>")
+    first = glm46_pack_gguf(folder.resolve())
+    if first is None:
+        fail(f"{folder}: no .gguf file", "give the folder of a GLM-4.5 / GLM-4.6 GGUF set (llama.cpp's glm4moe)")
+    shards = glm46_shards(first)
+    missing = [s.name for s in shards if not s.exists()]
+    if missing:
+        fail(f"{first.parent}: the set is incomplete - missing {', '.join(missing)}",
+             "download every shard of the set, then run this again")
+    try:
+        from gguf_reader import GGUFFile
+        md = GGUFFile(first).metadata
+    except Exception as e:  # noqa: BLE001 - its header is what the setup reads
+        fail(f"{first.name}: its header could not be read ({e})", "check the file")
+    if md.get("general.architecture") != "glm4moe":
+        fail(f"{first.name}: {md.get('general.architecture')!r}, not a GLM-4.5 / GLM-4.6 (glm4moe) GGUF",
+             "give the folder of a GLM-4.5 / GLM-4.6 GGUF set (the architecture key in its header says glm4moe)")
+    quant = glm46_quant_name(first)
+    d = first.parent
+    ok(f"model: {GLM46_SHOWN} - {quant}, {len(shards)} shard(s) in {d}")
+    llama = tools_step(a)                              # 3
+    meta = build_step(a, pc, llama, "maya-glm46")      # 4
+    step(5, "the model's files")
+    ok(f"files: {d} (read in place: nothing is copied)")
+    if not GLM46_EXE.exists():
+        fail(f"the engine was not built ({GLM46_EXE})", "the messages above say why (maya-glm46 needs a V100 or "
+             "newer NVIDIA card, or an AMD GPU on Linux)")
+    pack = glm46_pack_step(a, d, first)                # 6
+    step(7, "the context")
+    trained = int(md.get("glm4moe.context_length") or 0) or DEFAULT_CONTEXT
+    contexts = sorted({*CONTEXTS, trained})            # (the model's own reach: GLM-4.6 is 200K)
+    rec = DEFAULT_CONTEXT if DEFAULT_CONTEXT in contexts else contexts[-1]
+    ctx = choose_context(a, prev_ctx, contexts, rec)
+    ok(f"context: {ctx} tokens (the model's own reach: {trained})")
+    per_layer = 2 * (8 * 128) * 2 * 2                  # (K + V, 8 KV heads of 128 values, 2 bytes: 4 KB a position)
+    layers = int(md.get("glm4moe.block_count") or 0)   # (every layer has one; the NextN block too)
+    kv_gb = ctx * per_layer * max(1, layers) / 2**30
+    note = f"the context's K / V rows sit in VRAM (maya-glm46 streams none): {kv_gb:.1f} GB at {context_label(ctx)}"
+    (warn if kv_gb > 0.45 * max(1.0, sum(float(g.get("vram_gb") or 0) for g in pc["gpus"])) else say)(
+        note + (" - --context N sets a shorter one" if kv_gb > 4 else ""))
+    return write_config_glm46(a, pc, meta, pack, ctx, quant, d)   # 8
+
+
+def write_config_glm46(a, pc: dict, meta: dict, pack: Path, ctx: int, quant: str, d: Path) -> Path:
+    """GLM-4.6's config and its start script (maya-glm-4.6.json): maya-glm46 with the pack, the context, the cards
+    the server shows it (the layer split over several), the model's own sampling and thinking, and what a setup again
+    keeps of the config before (the port, the key, the env, the engine's settings set by hand or on the Models page)."""
+    step(8, "the configuration and the start script")
+    cfg_path = ROOT / GLM46_CONFIG
+    old = read_json(cfg_path) if cfg_path.exists() else {}
+    port = a.port or old.get("port") or 8080
+    gpus = ([int(x) for x in str(a.gpus).replace(",", " ").split() if x.strip().isdigit()] if a.gpus else
+            [int(a.gpu)] if a.gpu is not None else [int(g["index"]) for g in pc["gpus"]])
+    if not gpus:
+        gpus = [0]
+    # (the cards: the server shows the engine only these - CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES from "gpu" - and
+    #  maya-glm46 splits its layers over every card it sees, by each one's free memory)
+    args = ["--pack", str(pack), "--max-context", str(ctx)]
+    kept = keep_args(old.get("args") or [], args, ("--staging", "--resident-cap", "--reserve-gb", "--chunk",
+                                                   "--cpu-threads", "--expert-profile", "--mtp", "--mtp-drafts",
+                                                   "--ablate", "--cvec-mode", "--cvec-dir",
+                                                   "--control-vector-scaled", "--control-vector-layer-range"))
+    inst = {"family": "glm46", "quant": quant, "model_dir": str(d)}
+    sampling, effort = Q.model_defaults({"installer": inst})
+    cfg = {"exe": str(GLM46_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
+           "model_name": "glm-4.6", "gpu": gpus, "sampling": sampling, "reasoning_effort": effort,
+           "installer": inst, "port": port}
+    kept += keep_server_settings(cfg, old, a)
+    env = {**(old.get("env") or {}), **parse_env(a.env)}
+    if env:
+        cfg["env"] = env
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if kept:
+        ok("kept from the config before: " + ", ".join(kept))
+    cfg["log"] = str(cfg_path.with_suffix(".log"))
+    cfg["installer"] = {**inst, "written": time.strftime("%Y-%m-%d %H:%M")}
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    ok(f"config: {cfg_path}")
+    ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
+    return cfg_path
+
+
 def set_up_and_serve(a, prev: dict) -> tuple | None:
     """On the setup's screen: the setup, then Maya running on the same screen - its server's output there, Ctrl+C
     stops it.  (The config, the server's exit code or None when it was not started), or None when the model was not
@@ -11888,6 +12065,10 @@ def model_option(a) -> str | None:
     if getattr(a, "mm3_quant", None):
         a.mm3_quant = Q.MM3_QUANT_ALIASES.get(a.mm3_quant, a.mm3_quant)
     if not a.model:
+        return None
+    if str(a.model).strip().lower() in GLM46_IDS:   # (zai-org's GLM-4.6 / 4.5 GGUF sets: --model-dir)
+        a.glm46 = True
+        a.model = GLM46
         return None
     hit = Q.resolve(a.model, list(glm_downloads()))   # (GLM-5.3's downloads included)
     if hit is None:
@@ -11952,12 +12133,12 @@ def main() -> int:
                          f"cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (an experimental preview),"
                          " or a GLM-5.3-Flash "
                          "download by its name (" + ", ".join(MODELS) + "; every name used before still works)")
-    ap.add_argument("--model-dir", help=f"use the files you already have of {DS4}, MiniMax, {HY4} or {QWEN_SHOWN}: their "
-                                        "folder (a GGUF's shards, or the EXL3 quant's files and the Engram shards 47 / "
-                                        "48 of DeepSeek's repo), or an EXL3 folder of GLM-5.3-Flash or "
-                                        "MiniMax-M3.1-Flash at any bit rate (whole by its own index; its own sampling "
-                                        "and chat template are used); it must be writable - the pack is written inside "
-                                        "it")
+    ap.add_argument("--model-dir", help=f"use the files you already have of {DS4}, MiniMax, {HY4}, {GLM46_SHOWN} or "
+                                        f"{QWEN_SHOWN}: their folder (a GGUF's shards, or the EXL3 quant's files and the "
+                                        "Engram shards 47 / 48 of DeepSeek's repo), or an EXL3 folder of GLM-5.3-Flash "
+                                        "or MiniMax-M3.1-Flash at any bit rate (whole by its own index; its own sampling "
+                                        "and chat template are used); a GLM-4.6 / GLM-4.5 set with --model glm-4.6; it "
+                                        "must be writable - the pack is written inside it")
     ap.add_argument("--ds4-quant", choices=list(DS4_QUANTS) + [DS4_ABL_ALIAS],
                     help=f"{DS4}'s files: maya-s = Maya's quant (the experts in 2-3 bits; the default once "
                          "published; maya-m: 3.4 bits, once published; maya-xs: ~1.6 bits, with its own "

@@ -51,6 +51,39 @@ rejected drafts wrote are rewritten - in order, before any query past them - by 
 token is the trunk's own, whatever the drafts are (`--mtp` changes the speed, never the answer).  Off for
 `--parallel` and with `--mtp off`.
 
+## Maya's setup, dashboard and API (the TUI)
+
+`maya-glm46` is a first-class engine of the Maya launcher, so GLM-4.6 gets the same setup screen, dashboard and API
+as GLM-5.3-Flash and DeepSeek (the Monitor's Throughput, Where the experts live, the GPUs / VRAM map of a layer
+split, the chat, the OpenAI and Anthropic endpoints).  Point the setup at the GGUF set you have:
+
+    ./maya.sh --setup --model glm-4.6 --model-dir ~/models/GLM-4.6-Derestricted-Q8_0-IQ3_S-IQ3_S-IQ4_XS
+
+(plain text with `--plain`, unattended with `--yes`; the folder must hold every shard of the set - a lone `.gguf`
+works, a set of `-0000N-of-0000N.gguf` shards is found by its first).  The setup
+
+1. checks the GPUs, asks which cards (the layer split over several) and the context - GLM-4.6's own reach comes from
+   the GGUF (`glm4moe.context_length`, 200K), the default is 32K; the K / V rows sit in VRAM (this engine streams
+   none), so a long context costs its cache: about 4 KB a position a layer, ~0.4 GB a 1K positions for all 93;
+2. builds `maya-glm46` (CUDA: V100 and newer; AMD: the HIP build);
+3. builds the pack (`tools/glm46/pack_gguf.py`, no copy of the weights) and exports the tokenizer and chat template;
+4. writes `maya-glm-4.6.json` and `run-maya-glm-4.6.sh`.
+
+Then `./maya.sh` (or `run-maya-glm-4.6.sh`) starts the dashboard on `http://127.0.0.1:8080/`, the API on `/v1`
+(OpenAI) and `/v1/messages` (Anthropic), with the Monitor's live numbers from the engine's `INFO` / `STAT` / `VRAM`
+lines: decode speed, the expert tiers (VRAM / pinned RAM / SSD only, the CPU lane's share), the GPU map of each
+card, and `Speculation: MTP` (the NextN block drafting; the answers are the model's own).  A setup again
+(`--repack`, `--context`, `--port`, `--gpus 0,1`, `--env KEY=VALUE`, `--mtp off`, `--mtp-drafts N`) keeps an earlier
+config's engine settings it does not ask for; the Models page's switches and the chat write into the same config.
+
+    ./maya.sh --config maya-glm-4.6.json             # start exactly this config
+    ./maya.sh --check                                # what this PC can run, before the download or setup
+    ./maya.sh --bench                                # the standard speed test (its own engine, same config)
+    ./maya.sh --report                               # maya-report.txt: the PC, the setup, the speed lines
+
+GLM-4.6 without the launcher (a service, a script, another front end) is the engine's own protocol above; the
+launcher's config is just `exe`, `args`, `tokenizer`, `gpu` and the model's sampling.
+
 Everything the other engines have:
 
 * **batched prefill** (`--chunk N` tokens through a layer at once; the dense projections as GEMMs, the experts

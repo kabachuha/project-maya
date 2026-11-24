@@ -97,6 +97,7 @@ def geometry_of(shards: list[pathlib.Path]) -> tuple[dict, dict]:
         "rope_theta": float(need("rope.freq_base")),
         "rms_norm_eps": float(need("attention.layer_norm_rms_epsilon")),
         "routed_scaling_factor": float(md.get(p + "expert_weights_scale", 1.0)),
+        "context_length": int(md.get(p + "context_length", 0)),
         "moe_layer_freq": ",".join("0" if i < dense else "1" for i in range(trunk)),
         "bos_token_id": int(md.get("tokenizer.ggml.bos_token_id", 1)),
         "eos_token_id": int(md.get("tokenizer.ggml.eos_token_id", 2)),
@@ -156,10 +157,9 @@ def main() -> int:
     (out / "glm46.txt").write_text("".join(f"{k} {v}\n" for k, v in geom.items()), encoding="utf-8")
 
     if not a.no_tokenizer:
-        tok = out / "tokenizer"
-        tok.mkdir(exist_ok=True)
+        # (strata_tokenizer extracts into `<out>/tokenizer/`: the pack's own layout)
         rc = subprocess.run([sys.executable, str(REPO / "tools" / "strata_tokenizer.py"), "--gguf", str(shards[0]),
-                             "--out", str(tok)], check=False).returncode
+                             "--out", str(out)], check=False).returncode
         if rc != 0:
             print("NOTE: the tokenizer export failed (one-shot --ids runs still work)", file=sys.stderr)
     print(f"pack: {out} - {kept} tensors from {len(shards)} shard(s); trunk {trunk} layers "

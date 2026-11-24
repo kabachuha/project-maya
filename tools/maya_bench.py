@@ -148,8 +148,9 @@ def drafting_choice(args, env: dict, engine_lines, answers, family: str = "") ->
                 break
     if not said:                             # (GLM's and DeepSeek's engines say it in their log lines)
         text = "\n".join(engine_lines).lower()
-        if family in ("glm", ""):
-            said = "MTP" if "glm mtp:" in text else "DFlash2" if "glm dflash" in text else ""
+        if family in ("glm", "glm46", ""):   # (maya-glm46: its INFO mtp=<drafts> - the NextN block, on by default)
+            said = "MTP" if "glm mtp:" in text or re.search(r"\bmtp=[1-9]", text) else \
+                "DFlash2" if "glm dflash" in text else ""
         elif family == "deepseek":
             said = "DSpark" if re.search(r"^dspark", text, re.M) else ""
         said = said or "no drafting"

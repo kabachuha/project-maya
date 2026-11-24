@@ -315,8 +315,8 @@ void serve_header(glm46::Model& m, bool spec_on, const std::string& kv_fmt) {
     for (const std::string& l : m.vram_lines()) std::printf("%s\n", l.c_str());   // (the Monitor's GPU map)
     const auto& st0 = m.stats();
     std::printf("INFO engine=glm46 engine_kind=glm46 model=GLM-4.6 experts_vram=%ld experts=%ld "
-                "expert_slots=%ld ram_slots=%ld dspark=%d kv=%s cpu_threads=%d cpu_experts=%ld ctx=%d", st0.resident,
-                st0.experts, st0.resident, st0.pooled, m.draft_block() > 0 && spec_on ? 1 : 0, kv_fmt.c_str(),
+                "expert_slots=%ld ram_slots=%ld dspark=0 mtp=%d kv=%s cpu_threads=%d cpu_experts=%ld ctx=%d", st0.resident,
+                st0.experts, st0.resident, st0.pooled, m.draft_block() > 0 && spec_on ? m.draft_block() : 0, kv_fmt.c_str(),
                 st0.cpu_threads, st0.experts - st0.resident, m.max_ctx());
     if (st0.kv_ring > 0) std::printf(" kv_resident=%d", st0.kv_ring);   // (KV streaming: a layer's positions in VRAM)
     std::printf("\n");

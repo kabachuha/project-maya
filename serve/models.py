@@ -219,12 +219,13 @@ def trained_context(model_dir) -> int | None:
 
 
 def trained_context_ds4(pack) -> int | None:
-    """DeepSeek's, MiniMax's and Hy4-flash's: the context its pack says the model was trained for (ds4.txt's / mm3.txt's
-    max_position_embeddings, from the model's config.json or a GGUF's context_length; hy4.txt's context_length;
+    """DeepSeek's, MiniMax's, Hy4-flash's and GLM-4.6's: the context its pack says the model was trained for (ds4.txt's /
+    mm3.txt's max_position_embeddings, from the model's config.json or a GGUF's context_length; hy4.txt's and
+    glm46.txt's context_length;
     V4.1-Flash, M3.1-Flash and Hy4-flash: 1,048,576, their native reach), the top of the dashboard's Context size.
     None when the pack does not say."""
     for name, key in (("ds4.txt", "max_position_embeddings"), ("mm3.txt", "max_position_embeddings"),
-                      ("hy4.txt", "context_length")):
+                      ("hy4.txt", "context_length"), ("glm46.txt", "context_length")):
         try:
             with open(Path(pack) / name, encoding="utf-8", errors="replace") as f:
                 for line in f:
