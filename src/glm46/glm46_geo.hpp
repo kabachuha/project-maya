@@ -53,6 +53,7 @@ struct Geo {
         eot = (int) p.num("eot_token_id", eos);
         qkv_bias = p.num("qkv_bias", 1.0) != 0.0;
         nextn = (int) p.num("nextn", 0);
+        ix_dim = 0;   // (glm4moe has no indexer: the inherited number would size a phantom key cache in the plan)
         const auto no = [&](const std::string& what) {
             err = "geometry not covered: " + what;
             return false;

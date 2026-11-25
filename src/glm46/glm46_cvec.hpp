@@ -35,9 +35,15 @@ inline bool cvec_load(const std::vector<std::pair<std::string, float>>& files, i
                 err = path + ": not a control vector GGUF (general.architecture is not 'controlvector')";
                 return false;
             }
+            // (the model hint llama.cpp's control vector generator wrote: its architecture name.  An older llama.cpp
+            //  spells GLM-4.5 / 4.6's glm4moe "glm4_moe" - the gghfez vectors carry that - so both are the model
+            //  here; a vector of another model is used too, with a note: llama.cpp applies it regardless)
             const maya::MetaValue* hint = f.get("controlvector.model_hint");
-            if (hint != nullptr && hint->s != "glm4moe")
-                std::fprintf(stderr, "maya-glm46: %s was made for '%s', not glm4moe\n", path.c_str(), hint->s.c_str());
+            std::string h = hint != nullptr ? hint->s : "";
+            for (char& c : h) c = (char) std::tolower((unsigned char) c);
+            if (!h.empty() && h != "glm4moe" && h != "glm4_moe" && h != "glm4")
+                std::fprintf(stderr, "maya-glm46: NOTE: %s was made for '%s', not glm4moe - applied as llama.cpp "
+                                     "would\n", path.c_str(), hint->s.c_str());
             int found = 0;
             for (const maya::TensorInfo& t : f.tensors()) {
                 if (t.name.rfind("direction.", 0) != 0) continue;

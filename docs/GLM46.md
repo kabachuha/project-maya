@@ -102,7 +102,10 @@ Everything the other engines have:
   (`--control-vector FILE` is scale 1; `--control-vector-layer-range A B`; `--cvec-mode add|project`;
   `--cvec-dir per-layer|single:L`).  The loader reads llama-cvector-generator GGUFs (`direction.<l>`, 0-based,
   layer 0 never steered) and sums the files' directions times their scales; the vector is applied after the
-  steered layer's FFN write, where llama.cpp's `build_cvec` sits.
+  steered layer's FFN write, where llama.cpp's `build_cvec` sits.  A vector's `controlvector.model_hint` of
+  `glm4_moe` (an older llama.cpp's spelling of this architecture, which the gghfez files carry) is accepted as
+  this model, as `glm4moe` and `glm4` are; only another model's hint gets a NOTE (it is applied too, as
+  llama.cpp would).
 
 ## What is not served yet
 
@@ -129,6 +132,12 @@ KV streaming off); `--parallel` decodes without drafts.  They are the next steps
 * `python tools/glm46/mtp_accept.py` - a synthetic model whose NextN block drafts the trunk's next token read one
   step early (`glm46_synth_gguf.py --mtp-identity`): 10-20 of its drafts are accepted per request, the tokens
   stay exactly `--mtp off`'s, and `--mtp-drafts 1..8` all pass - the verify / commit / chain-after-commit path.
+* `python tools/glm46/plan_check.py --model <dir>` - the memory plan's two per-layer estimates against the pack's
+  tensors: a layer's dense bytes must leave the three stacked `ffn_*_exps` tensors out (they are its experts, not
+  weights) and one expert's blob must be their slice.  `GLM46_PLAN_TRACE=1 maya-glm46 ...` prints what each card
+  needs: its layers' dense weights, the chunk's scratch, the staging slots (one expert's blob each - about 10.9 MB
+  for the shipped quant), its K / V at the context, and the reserve.  A start that does not fit says the same and
+  suggests a smaller `--chunk`, fewer `--staging` slots, a shorter `--max-context`, or more GPUs.
 
 The synthetic model (`tools/glm46/glm46_synth_gguf.py`) is the tensor set and type map above at 1/10 the width,
 9 layers, 8 experts a token's 2 - small enough for one GPU, structurally the shipped quant.

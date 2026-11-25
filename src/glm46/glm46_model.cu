@@ -904,7 +904,11 @@ struct Model::Impl {
         const std::string pre = "blk." + std::to_string(li) + ".";
         size_t b = 0;
         for (auto it = pk.t.lower_bound(pre); it != pk.t.end() && it->first.compare(0, pre.size(), pre) == 0; ++it) {
-            if (it->first.find(".experts.") != std::string::npos) continue;
+            if (it->first.find(".experts.") != std::string::npos) continue;   // (an EXL3 pack: one tensor an expert)
+            // (a GGUF pack: the routed experts are three stacked tensors, [n_exp][out][in] - its own blobs, not dense)
+            if (gguf && (it->first.rfind(pre + "ffn_gate_exps.", 0) == 0 || it->first.rfind(pre + "ffn_up_exps.", 0) == 0 ||
+                         it->first.rfind(pre + "ffn_down_exps.", 0) == 0))
+                continue;
             const Tensor& x = it->second;
             // (a GGUF's Q8_0 indexer projections: kept as stored where q8_index takes them, else F32 on the device; its
             //  other block types as stored)
@@ -1055,10 +1059,11 @@ struct Model::Impl {
     // scales, a GGUF's three matrices aligned
     size_t blob_estimate(int li) const {
         const std::string E = P + "layers." + std::to_string(li) + ".block_sparse_moe.experts.0.";
-        if (gguf) {
+        if (gguf) {   // (a GGUF pack: one expert's slice of each stacked [n_exp][out][in] tensor, as expert_layout_gg)
+            const std::string N = "blk." + std::to_string(li) + ".";
             size_t b = 0;
-            for (const char* r : {"w1", "w3", "w2"})
-                if (const Tensor* t = pk.get(E + r + ".weight")) b += up(t->bytes);
+            for (const char* t : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"})
+                if (const Tensor* x = pk.get(N + t)) b += up(x->bytes / (uint64_t) std::max(1, g.n_exp));
             return b;
         }
         const Tensor* t = pk.get(E + "w1.trellis");
@@ -1136,10 +1141,28 @@ struct Model::Impl {
             ctx = std::max(8192, ctx / 2 / 4096 * 4096);
             if (ring >= ctx) ring = 0;
         }
-        while (!fits(ctx, ring, slots, &why) && slots > 16) slots = std::max(16, slots / 2);
+        while (!fits(ctx, ring, slots, &why) && slots > kMinSlots) slots = std::max(kMinSlots, slots / 2);
+        const auto parts_of = [&](size_t di) {   // (the need, named: dense (its layers' weights) + scratch + slots + KV)
+            double den = 0;
+            for (int li : D[di].layers) den += (double) dense_bytes(li);
+            const double slots_b = (double) slots * (double) blob_max;
+            const double kv = kv_of(di, ctx, ring);
+            const double need = fixed_of(di, slots) + kv + reserve;
+            char b[256];
+            std::snprintf(b, sizeof b, "CUDA%d: dense %.3f + scratch/head %.2f + %d slots %.2f (%.2f MB each) + KV %.2f "
+                                        "+ reserve %.1f = %.2f GB, free %.2f GB", D[di].id, den / GB,
+                          std::max(0.0, fixed_of(di, slots) - den - slots_b) / GB, slots, slots_b / GB,
+                          blob_max / 1e6, kv / GB, reserve / GB, need / GB, (double) D[di].free0 / GB);
+            return std::string(b);
+        };
+        if (const char* pv = ::glm46::env("GLM46_PLAN_TRACE"); pv != nullptr && std::atoi(pv) != 0)
+            for (size_t di = 0; di < D.size(); ++di)
+                std::fprintf(stderr, "glm46 plan (%d positions, %d staging slots): %s\n", ctx, slots, parts_of(di).c_str());
         if (!fits(ctx, ring, slots, &why)) {
-            err = "not enough GPU memory for GLM-4.6's dense part at 8K positions (" + why +
-                  "): more GPUs, or a smaller --chunk";
+            std::string all;
+            for (size_t di = 0; di < D.size(); ++di) all += (all.empty() ? "" : "; ") + parts_of(di);
+            err = "not enough GPU memory at 8K positions (" + all +
+                  "): a smaller --chunk, fewer --staging slots, a shorter --max-context, or more GPUs";
             return false;
         }
         // KV streaming's host cache: every position of every layer, pinned
