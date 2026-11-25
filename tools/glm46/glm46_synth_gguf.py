@@ -3,8 +3,8 @@
 The smoke-test model: the tensor set and the per-tensor types of the shipped mixed quant
 (Q8_0 attention / dense / shared experts / head, IQ3_S gate+up experts, IQ4_XS down experts, F32
 norms, router and biases, exactly ReadyArt/GLM-4.6-Derestricted-Q8_0-IQ3_S-IQ3_S-IQ4_XS's map),
-with the dimensions scaled down and values from a seeded RNG.  --quant xs writes the smaller
-ReadyArt map instead (Q6_K dense, IQ2_XS gate+up, IQ3_S down).
+with the dimensions scaled down and values from a seeded RNG.  --quant xs / xxs write the two
+smaller ReadyArt maps instead (Q6_K / IQ2_XS / IQ3_S; Q5_K / IQ2_XXS / IQ3_XXS).
 
 Geometry (small enough for one 3090; the kernels' hard bounds respected):
     dim 512, 12 query heads / 1 KV head (kG = 12, the GLM-4.5/4.6 ratio), head 128, rope 64,
@@ -17,7 +17,7 @@ same code llama.cpp's quantize tool uses, so the blocks are canonical.
 
 Usage:
     python tools/glm46/glm46_synth_gguf.py --out glm46-synth.gguf \
-        [--lib ~/llama.cpp/build/bin/libggml-base.so] [--seed 777] [--quant mixed|xs]
+        [--lib ~/llama.cpp/build/bin/libggml-base.so] [--seed 777] [--quant mixed|xs|xxs]
     python tools/glm46/pack_gguf.py --model <dir with the gguf>     (writes maya-glm46/)
 
 The tokenizer is absent on purpose: the engine's one-shot path runs token ids, and the real
@@ -36,13 +36,15 @@ import numpy as np
 # GGUF metadata value types (ggml spec order)
 U8, I8, U16, I16, U32, I32, F32, BOOL, STRING, ARRAY, U64, I64, F64 = range(13)
 # ggml tensor type ids this writer emits
-GGML_F32, GGML_F16, GGML_Q8_0, GGML_Q6_K, GGML_IQ2_XS, GGML_IQ3_S, GGML_IQ4_XS = 0, 1, 8, 14, 17, 21, 23
+GGML_F32, GGML_F16, GGML_Q8_0, GGML_Q5_K, GGML_Q6_K, GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ3_S, \
+    GGML_IQ4_XS = 0, 1, 8, 13, 14, 16, 17, 18, 21, 23
 
 # the per-role types of the two shipped ReadyArt maps: the 4-bit-ish set this smoke model was made for, and the smaller
 # Q6_K-IQ2_XS-IQ2_XS-IQ3_S one (--quant xs: dense / attention / shared experts / head Q6_K, gate + up IQ2_XS, down
 # IQ3_S - the engine's kernels take either, so both are exercised)
 TQ = dict(dense=GGML_Q8_0, gate=GGML_IQ3_S, up=GGML_IQ3_S, down=GGML_IQ4_XS, head=GGML_Q8_0)
 TQ_XS = dict(dense=GGML_Q6_K, gate=GGML_IQ2_XS, up=GGML_IQ2_XS, down=GGML_IQ3_S, head=GGML_Q6_K)
+TQ_XXS = dict(dense=GGML_Q5_K, gate=GGML_IQ2_XXS, up=GGML_IQ2_XXS, down=GGML_IQ3_XXS, head=GGML_Q5_K)
 
 ALIGN = 32
 
@@ -123,8 +125,8 @@ class Quantizer:
 
 
 def _row_bytes(tid: int, n_per_row: int) -> int:
-    el, by = {GGML_Q8_0: (32, 34), GGML_Q6_K: (256, 210), GGML_IQ2_XS: (256, 74), GGML_IQ3_S: (256, 110),
-              GGML_IQ4_XS: (256, 136)}[tid]
+    el, by = {GGML_Q8_0: (32, 34), GGML_Q5_K: (256, 176), GGML_Q6_K: (256, 210), GGML_IQ2_XXS: (256, 66),
+              GGML_IQ2_XS: (256, 74), GGML_IQ3_XXS: (256, 98), GGML_IQ3_S: (256, 110), GGML_IQ4_XS: (256, 136)}[tid]
     if n_per_row % el:
         raise ValueError(f"row width {n_per_row} is not whole {el}-element blocks")
     return n_per_row // el * by
@@ -282,8 +284,8 @@ def selftest(path: Path) -> None:
     assert md["glm4moe.block_count"] == G["n_layers"] + 1, "block count"
     assert md["glm4moe.nextn_predict_layers"] == 1, "nextn"
     assert md["glm4moe.expert_count"] == G["n_exp"] and md["glm4moe.expert_used_count"] == G["k_exp"], "experts"
-    nm = {GGML_Q8_0: "Q8_0", GGML_Q6_K: "Q6_K", GGML_IQ2_XS: "IQ2_XS", GGML_IQ3_S: "IQ3_S",
-          GGML_IQ4_XS: "IQ4_XS"}
+    nm = {GGML_Q8_0: "Q8_0", GGML_Q5_K: "Q5_K", GGML_Q6_K: "Q6_K", GGML_IQ2_XXS: "IQ2_XXS", GGML_IQ2_XS: "IQ2_XS",
+          GGML_IQ3_XXS: "IQ3_XXS", GGML_IQ3_S: "IQ3_S", GGML_IQ4_XS: "IQ4_XS"}
     assert by["blk.0.attn_q.weight"].type_name == nm[TQ["dense"]], "attention projection type"
     assert by["blk.0.ffn_gate.weight"].type_name == nm[TQ["dense"]], "dense FFN type"
     assert by[f"blk.{G['dense_lead']}.ffn_gate_exps.weight"].type_name == nm[TQ["gate"]], "gate experts type"
@@ -305,16 +307,17 @@ def main() -> int:
     ap.add_argument("--lib", default="/home/khrapov/AI4/llama.cpp/build/bin/libggml-base.so",
                     help="a libggml with ggml_quantize_chunk")
     ap.add_argument("--seed", type=int, default=777)
-    ap.add_argument("--quant", choices=("mixed", "xs"), default="mixed",
+    ap.add_argument("--quant", choices=("mixed", "xs", "xxs"), default="mixed",
                     help="the per-tensor type map: mixed = Q8_0 / IQ3_S / IQ3_S / IQ4_XS (the set this model was "
-                         "made for), xs = Q6_K / IQ2_XS / IQ2_XS / IQ3_S (the smaller set)")
+                         "made for), xs = Q6_K / IQ2_XS / IQ2_XS / IQ3_S, xxs = Q5_K / IQ2_XXS / IQ2_XXS / IQ3_XXS "
+                         "(the two smaller shipped sets)")
     ap.add_argument("--mtp-identity", action="store_true",
                     help="the NextN block as a zero block whose eh_proj is [0 | I] (its draft is the trunk's next "
                          "token read one step early: the verify / commit path's smoke test)")
     a = ap.parse_args()
     G["mtp_identity"] = a.mtp_identity
-    TQ.update(TQ_XS if a.quant == "xs" else dict(dense=GGML_Q8_0, gate=GGML_IQ3_S, up=GGML_IQ3_S, down=GGML_IQ4_XS,
-                                                  head=GGML_Q8_0))
+    TQ.update({"xs": TQ_XS, "xxs": TQ_XXS}.get(a.quant, dict(
+        dense=GGML_Q8_0, gate=GGML_IQ3_S, up=GGML_IQ3_S, down=GGML_IQ4_XS, head=GGML_Q8_0)))
     md, tensors = build(a.lib, a.seed)
     write_gguf_typed(Path(a.out), md, tensors)
     selftest(Path(a.out))

@@ -71,10 +71,10 @@ def main() -> int:
     ap.add_argument("--cvec-mode", choices=("add", "project"), default="add")
     ap.add_argument("--cvec-range", nargs=2, type=int, default=None)
     ap.add_argument("--seed", type=int, default=777)
-    ap.add_argument("--synth-quant", choices=("mixed", "xs"), default="mixed",
-                    help="the synthetic model's per-tensor type map: mixed (Q8_0 / IQ3_S / IQ3_S / IQ4_XS) or xs "
-                         "(Q6_K / IQ2_XS / IQ2_XS / IQ3_S, the smaller shipped quant's); an existing --model keeps "
-                         "its own")
+    ap.add_argument("--synth-quant", choices=("mixed", "xs", "xxs"), default="mixed",
+                    help="the synthetic model's per-tensor type map: mixed (Q8_0 / IQ3_S / IQ3_S / IQ4_XS), xs "
+                         "(Q6_K / IQ2_XS / IQ2_XS / IQ3_S) or xxs (Q5_K / IQ2_XXS / IQ2_XXS / IQ3_XXS) - the two "
+                         "smaller shipped quants'; an existing --model keeps its own")
     a = ap.parse_args()
 
     model_dir = pathlib.Path(a.model) if a.model else pathlib.Path(tempfile.mkdtemp(prefix="glm46-parity-"))

@@ -22,7 +22,10 @@ GGUF serves in place - no weight copies.  The NextN block is served as the model
     biases and the per-expert selection bias.  ~10.9 MB an expert;
   * the smaller `Q6_K-IQ2_XS-IQ2_XS-IQ3_S` (2.9 bpw, ~129 GB, 3 shards): Q6_K for the dense weights (attention,
     the dense / shared FFNs, head, embedding, the NextN einsum), IQ2_XS for the routed gate and up, IQ3_S for the
-    down.  ~7.6 MB an expert - the whole model fits better in RAM and a larger share of the experts in VRAM.
+    down.  ~7.6 MB an expert - the whole model fits better in RAM and a larger share of the experts in VRAM;
+  * the smallest `Q5_K-IQ2_XXS-IQ2_XXS-IQ3_XXS` (2.6 bpw, ~114 GB, 3 shards): Q5_K dense, IQ2_XXS gate and up,
+    IQ3_XXS down; ~7.1 MB an expert.  IQ2_XXS is the roughest of the sets - the answer quality it costs shows most
+    outside the languages and domains it was measured on.
   Other type mixes are accepted as long as `src/ds4/ds4_iq` covers them (Q4_K / Q5_K / Q6_K / Q8_0 dense, the
   IQ1 / IQ2 / IQ3 / IQ4 experts); anything else is refused at load, named.
 
@@ -177,9 +180,11 @@ streaming off (each conversation has its own cache).  They are the next steps, n
   sigmoid router likewise.  Exact to ~1e-7.  The same test writes int8 / fp8 / fp4 K / V caches through the
   engine's own `qk_norm_rope`, decodes them back on the host (scales, the Hadamard rotation) and checks the
   attention against the double reference over exactly those rows: ~1e-6.
-* `python tools/glm46/glm46_synth_gguf.py --quant xs` / `parity.py` - the smaller quant's type map (Q6_K dense,
-  IQ2_XS experts, IQ3_S down) runs the whole engine, parity and MTP included (2%, top-1 agreeing as the Q8_0 set);
-  `tools/glm46/plan_check.py --model ...` checks its memory plan (dense bytes, the per-expert blob).
+* `python tools/glm46/glm46_synth_gguf.py --quant xs|xxs` / `parity.py` - the smaller quants' type maps (Q6_K or
+  Q5_K dense, IQ2_XS / IQ2_XXS experts, IQ3_S / IQ3_XXS down) run the whole engine, parity and MTP included (2%,
+  top-1 agreeing as the Q8_0 set); `tools/glm46/plan_check.py --model ...` checks their memory plan (dense bytes,
+  the per-expert blob), and `--resident-cap 0 --staging 0` puts the experts on the CPU lane (ggml's IQ2_XXS /
+  IQ3_XXS dots) to the same tokens.
 * `python tools/glm46/parity.py --model <dir with the synthetic model>` - `maya-glm46 --dump-logits` against
   `ref/glm46.py` (the architecture's reference forward) on the synthetic model: a relative RMS of ~2% on the
   logits and every top-1 agreeing, the same difference llama.cpp's own CPU and CUDA builds show against the
