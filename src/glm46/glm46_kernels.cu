@@ -2647,7 +2647,8 @@ void to_bf16(const float* x, int rows, int cols, int ld, uint16_t* y, int ldo, c
 template <int KF, int VF>
 __global__ void __launch_bounds__(128) full_attn_kernel(const float* q, const uint16_t* kc, const uint16_t* vc,
                                                         int ring, const int* pos, int T, int Hq, int Hkv,
-                                                        float scale, float* out, KvHost hs, KvQ kq) {
+                                                        float scale, float* out, KvHost hs, KvQ kq, int splits,
+                                                        float* part) {
     __shared__ float qs[kG][128];
     __shared__ __align__(4) uint16_t ks[kTile][kRow], vs[kTile][kRow];
     __shared__ __align__(4) float ksc[kTile], vsc[kTile];
@@ -2657,6 +2658,10 @@ __global__ void __launch_bounds__(128) full_attn_kernel(const float* q, const ui
     int8_t (*v8)[2 * kRow] = (int8_t (*)[2 * kRow]) vs;
     const int t = blockIdx.x, g = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5;
     const int hi = pos[t];
+    // (splits > 1: this block's run of the query's keys 0 .. hi; splits 1: all of them)
+    const int z = splits > 1 ? (int) blockIdx.z : 0;
+    const int chunk = (hi + splits) / splits;
+    const int kb = z * chunk, klast = splits > 1 ? (kb + chunk - 1 < hi ? kb + chunk - 1 : hi) : hi;
     const bool krot = KF != kKvBf16 && (kq.rot & 1), vrot = VF != kKvBf16 && (kq.rot & 2);
     for (int i = tid; i < kG * 128; i += 128) {
         const int h = i / 128, d = i % 128;
@@ -2680,15 +2685,15 @@ __global__ void __launch_bounds__(128) full_attn_kernel(const float* q, const ui
     float acc[kG];
 #pragma unroll
     for (int h = 0; h < kG; ++h) acc[h] = 0.0f;
-    for (int k0 = 0; k0 <= hi; k0 += kTile) {
+    for (int k0 = kb; k0 <= klast; k0 += kTile) {
         __syncthreads();
         // (KV streaming: a key from its VRAM ring row while that row holds it, else from the host cache)
-        load_tile<KF>(k0, hi, g, Hkv, hs, true, kc, kq.kc, kq.ks, ks, k8, ksc);
-        load_tile<VF>(k0, hi, g, Hkv, hs, false, vc, kq.vc, kq.vs, vs, v8, vsc);
+        load_tile<KF>(k0, klast, g, Hkv, hs, true, kc, kq.kc, kq.ks, ks, k8, ksc);
+        load_tile<VF>(k0, klast, g, Hkv, hs, false, vc, kq.vc, kq.vs, vs, v8, vsc);
         __syncthreads();
         {
             const int j = tid & 63, h0 = (tid >> 6) * 8;
-            const bool ok = k0 + j <= hi;
+            const bool ok = k0 + j <= klast;
             float s8[8];
 #pragma unroll
             for (int h = 0; h < 8; ++h) s8[h] = 0.0f;
@@ -2741,6 +2746,16 @@ __global__ void __launch_bounds__(128) full_attn_kernel(const float* q, const ui
         }
     }
     __syncthreads();
+    if (splits > 1) {   // (the run's unnormalised sums, max and total: attn_combine_kernel finishes - and unrotates)
+        float* pp = part + (((size_t) t * Hkv + g) * splits + z) * kG * kPart;
+#pragma unroll
+        for (int h = 0; h < kG; ++h) pp[h * kPart + tid] = acc[h];
+        if (tid < kG) {
+            pp[tid * kPart + 128] = mrow[tid];
+            pp[tid * kPart + 129] = lrow[tid];
+        }
+        return;
+    }
     if (!vrot) {
 #pragma unroll
         for (int h = 0; h < kG; ++h)
@@ -2762,10 +2777,13 @@ __global__ void __launch_bounds__(128) full_attn_kernel(const float* q, const ui
 }
 
 void full_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const int* pos, int T, int Hq, int Hkv, int ring,
-               float scale, float* out, cudaStream_t s, const KvHost& hs, const KvQ& kq) {
+               float scale, float* out, cudaStream_t s, const KvHost& hs, const KvQ& kq, int splits, float* part) {
     if (T <= 0) return;
-    const dim3 g(T, Hkv);
-#define GLM46_FULL(K, V) full_attn_kernel<K, V><<<g, 128, 0, s>>>(q, kc, vc, ring, pos, T, Hq, Hkv, scale, out, hs, kq)
+    splits = std::max(1, std::min(splits, kCombMaxS));
+    if (splits > 1 && part == nullptr) splits = 1;
+    const dim3 g(T, Hkv, (unsigned) splits);
+#define GLM46_FULL(K, V) \
+    full_attn_kernel<K, V><<<g, 128, 0, s>>>(q, kc, vc, ring, pos, T, Hq, Hkv, scale, out, hs, kq, splits, part)
     switch (kq.kf * 4 + kq.vf) {
         case 0: GLM46_FULL(kKvBf16, kKvBf16); break;
         case 1: GLM46_FULL(kKvBf16, kKvI8); break;
@@ -2785,6 +2803,9 @@ void full_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const int
         default: GLM46_FULL(kKvFp4, kKvFp4); break;
     }
 #undef GLM46_FULL
+    if (splits > 1)   // (a block a head: each head's values are its own, in run order as one block walking them)
+        attn_combine_kernel<<<dim3((unsigned) T, (unsigned) Hkv, (unsigned) kG), 128, 0, s>>>(
+            part, Hq, Hkv, splits, kq.vf != kKvBf16 && (kq.rot & 2), out);
     check("full_attn");
 }
 

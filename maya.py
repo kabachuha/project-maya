@@ -12032,8 +12032,8 @@ def write_config_glm46(a, pc: dict, meta: dict, pack: Path, ctx: int, quant: str
             warn("--drafting dfly2 is Hy4-Flash's drafter: GLM-4.6 drafts with its own NextN (MTP) block")
         args += ["--mtp", "on"]
     flags = ("--staging", "--resident-cap", "--reserve-gb", "--chunk", "--cpu-threads", "--expert-profile",
-             "--mtp", "--mtp-drafts", "--ablate", "--cvec-mode", "--cvec-dir", "--kv-cache", "--kv-streaming",
-             "--kv-resident", "--control-vector-scaled", "--control-vector-layer-range")
+             "--mtp", "--mtp-drafts", "--attn-splits", "--ablate", "--cvec-mode", "--cvec-dir", "--kv-cache",
+             "--kv-streaming", "--kv-resident", "--control-vector-scaled", "--control-vector-layer-range")
     if how is not None:   # (--drafting / --kv-cache given now: their choices win over what the config before had)
         flags = tuple(f for f in flags if f != "--mtp")
     if getattr(a, "kv_cache", None) is not None:

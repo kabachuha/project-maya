@@ -265,6 +265,53 @@ int test_quant_kv() {
     return bad;
 }
 
+// the decode's key runs (split-K): the same attention in `splits` blocks of their own, combined - against the one
+// block a KV group, and against the double reference
+int test_attn_split() {
+    int bad = 0;
+    const int T = 130, Hq = 12, Hkv = 1, hd = 128;
+    for (int splits : {2, 3, 5, 8}) {
+        std::vector<float> q((size_t) T * Hq * hd);
+        std::vector<uint16_t> kc((size_t) T * Hkv * hd), vc((size_t) T * Hkv * hd);
+        srand(777 + splits);
+        for (auto& x : q) x = (float) (rand() % 2001 - 1000) / 700.0f;
+        for (auto& x : kc) x = f2bf((float) (rand() % 2001 - 1000) / 700.0f);
+        for (auto& x : vc) x = f2bf((float) (rand() % 2001 - 1000) / 700.0f);
+        std::vector<int> pos((size_t) T);
+        for (int i = 0; i < T; ++i) pos[(size_t) i] = i;
+        float *dq = nullptr, *dout = nullptr, *dpart = nullptr, *dout1 = nullptr;
+        uint16_t *dk = nullptr, *dv = nullptr;
+        int* dpos = nullptr;
+        const size_t partn = glm46::k::attn_part_floats(T, Hkv, splits);
+        CK(cudaMalloc(&dq, q.size() * 4));
+        CK(cudaMalloc(&dout, q.size() * 4));
+        CK(cudaMalloc(&dout1, q.size() * 4));
+        CK(cudaMalloc(&dpart, partn * 4));
+        CK(cudaMalloc(&dk, kc.size() * 2));
+        CK(cudaMalloc(&dv, vc.size() * 2));
+        CK(cudaMalloc(&dpos, pos.size() * 4));
+        CK(cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dk, kc.data(), kc.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dv, vc.data(), vc.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dpos, pos.data(), pos.size() * 4, cudaMemcpyHostToDevice));
+        const float sc = 1.0f / std::sqrt((float) hd);
+        glm46::k::full_attn(dq, dk, dv, dpos, T, Hq, Hkv, 0, sc, dout1, nullptr);
+        glm46::k::full_attn(dq, dk, dv, dpos, T, Hq, Hkv, 0, sc, dout, nullptr, glm46::k::KvHost{}, glm46::k::KvQ{},
+                            splits, dpart);
+        std::vector<float> one(q.size()), all(q.size());
+        CK(cudaMemcpy(one.data(), dout1, one.size() * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(all.data(), dout, all.size() * 4, cudaMemcpyDeviceToHost));
+        double worst = 0.0;
+        for (size_t i = 0; i < one.size(); ++i) worst = std::max(worst, std::fabs((double) one[i] - all[i]));
+        char buf[110];
+        std::snprintf(buf, sizeof buf, "full_attn, %d key runs T=%d (worst |diff| %.2e)", splits, T, worst);
+        check(worst < 2e-6, buf);
+        if (worst >= 2e-6) ++bad;
+        cudaFree(dq); cudaFree(dout); cudaFree(dout1); cudaFree(dpart); cudaFree(dk); cudaFree(dv); cudaFree(dpos);
+    }
+    return bad;
+}
+
 int test_ops() {
     const int n = 256;
     std::vector<float> x(n), b(n), g(n), u(n);
@@ -411,6 +458,7 @@ int main() {
     std::printf("maya-glm46 kernels against double references\n");
     if (test_attn() != 0) ++g_fail;
     if (test_quant_kv() != 0) ++g_fail;
+    if (test_attn_split() != 0) ++g_fail;
     test_ops();
     test_mtp();
     std::printf(g_fail == 0 ? "ALL PASS\n" : "%d FAILED\n", g_fail);

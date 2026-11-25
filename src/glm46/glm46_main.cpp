@@ -1650,7 +1650,7 @@ int usage() {
                  "                [--max-context N] [--chunk N] [--staging N] [--resident-cap N] [--reserve-gb X]\n"
                  "                [--vision on|off] [--vision-gpu I] [--images FILE] [--layer-split auto|L,L,...]\n"
                  "                [--tp 1|2|4] [--cache-gb X] [--kv-cache F|K,V (bf16 int8 fp8 fp4; default bf16)]\n"
-                 "                [--kv-rot on|off] [--kv-streaming on|off] [--expert-profile FILE]\n"
+                 "                [--kv-rot on|off] [--kv-streaming on|off] [--attn-splits 0|1|N] [--expert-profile FILE]\n"
                  "                [--score REF [--write-ref OUT]] [--cpu-threads N] [--mtp on|off|--mtp-drafts N]\n"
                  "                [--kv-resident N] [--tp-chunk N] [--tp-ffn-rows N] [--dspark-cost X] [--suffix-draft N]\n"
                  "                [--prefill-gemm blas|hipblaslt|auto] [--prefill-tune FILE] [--no-prefill-tune]\n"
@@ -1789,7 +1789,8 @@ int main(int argc, char** argv) {
             if (K < 0 || V < 0) return usage();
             o.kv_k = K;
             o.kv_v = V;
-        } else if (a == "--kv-rot" || a == "--kv-rotate") {   // (#490's name too)
+        } else if (a == "--attn-splits") o.attn_splits = std::max(0, std::atoi(val().c_str()));
+        else if (a == "--kv-rot" || a == "--kv-rotate") {   // (#490's name too)
             const std::string v = val();
             if (v != "on" && v != "off") return usage();
             o.kv_rot = v == "on";

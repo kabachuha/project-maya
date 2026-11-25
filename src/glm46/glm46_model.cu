@@ -77,6 +77,7 @@ namespace {
 constexpr size_t kAlign = 256;
 constexpr int kHeadRows = 32;   // the output head's rows a GEMM (its F32 logits buffer)
 constexpr int kWin = 16;        // a window's tokens at most (the token path's kernels: mv's columns, win_experts)
+constexpr int kAttnSplitKeys = 2048;   // a decode attention run's shortest key range (below it: one block a KV group)
 size_t up(size_t n) { return (n + kAlign - 1) / kAlign * kAlign; }
 double now() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -174,7 +175,8 @@ struct Dev {
     float* win_cpu = nullptr;            // mapped: the CPU parts [kWin][dim], then the flags [kWin] int, the wait word
     unsigned win_wait = 0;
     float *win_h = nullptr, *win_part = nullptr;
-    float* attp = nullptr;               // a token's / a window's attention splits' partials (k::attn_part_floats)
+    float* attp = nullptr;               // a decode token's attention runs' partials (k::attn_part_floats: split-K)
+    int att_splits_max = 1;              // its runs here (SM count / KV heads, at most Model::attn_splits)
     float* wtmp = nullptr;               // (Q8_0 indexer projections) the prompt path's F32 copy of one of them
     float* abl_r = nullptr;              // (--ablate) the direction projected out of each residual write (null: off)
     // scratch (chunk rows)
@@ -376,11 +378,11 @@ struct Model::Impl {
     x3::Mat head;
     float* norm1 = nullptr;
     int head_dev = 0;
-    // a token's and a verify window's attention: each query's kept blocks in this many runs on blocks of their own,
-    // combined in run order (k::sparse_attn's splits - one block a KV group walking all of them left the GPU idle: a
-    // query's sums depend on the splits alone, so a window's rows keep the token path's bits).  MAYA_GLM46_ATTN_SPLIT=1:
-    // one run (the decode as before)
-    int attn_splits = 16;
+    // a decode token's attention: its keys in up to this many runs on blocks of their own, combined in run order
+    // (k::full_attn's splits - one block a KV group walking the whole context left the GPU idle at a long one; a
+    // query's sums depend on the runs alone, so the count cannot change an answer past F32 rounding).
+    // GLM46_ATTN_SPLIT=1: one run (the decode as before)
+    int attn_splits = 32;
     std::vector<float> inv_freq;
     std::vector<float*> inv_dev;
     long long fwd = 0;
@@ -1377,7 +1379,7 @@ struct Model::Impl {
         k::rope_inv_freq(g.theta, g.n_rot, inv_freq.data());
         inv_dev.resize(D.size());
         if (const char* sv = ::glm46::env("GLM46_ATTN_SPLIT")) attn_splits = std::max(1, std::atoi(sv));
-        attn_splits = std::min(attn_splits, g.topk);
+        if (o.attn_splits > 0) attn_splits = std::min(attn_splits, o.attn_splits);
         const int T = o.chunk;
         // KV streaming (--kv-resident): the VRAM caches a ring of the last kv_ring positions (whole blocks, 4096 and a
         // prompt chunk at least), the rest of the context read from host memory; 0: all in VRAM
@@ -1558,7 +1560,10 @@ struct Model::Impl {
             if (!A(d.win_plan_d, win_plan_bytes())) return false;
             CK(cudaHostAlloc(&d.win_cpu, ((size_t) kWin * g.dim + kWin + 4) * 4, cudaHostAllocMapped | cudaHostAllocPortable));
             if (!A(d.win_h, (size_t) kWin * 8 * g.ff) || !A(d.win_part, (size_t) kWin * 8 * g.dim)) return false;
-            if (attn_splits > 1 && !A(d.attp, k::attn_part_floats(kWin, g.n_kv, attn_splits))) return false;
+            int sm = 8;
+            if (cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, d.id) != cudaSuccess) sm = 8;
+            d.att_splits_max = std::max(1, std::min(attn_splits, sm / std::max(1, g.n_kv)));
+            if (d.att_splits_max > 1 && !A(d.attp, k::attn_part_floats(1, g.n_kv, d.att_splits_max))) return false;
         }
         // KV streaming: every layer's whole cache in host memory (one pinned, mapped allocation, carved), written as the
         // VRAM ring is and read where the ring no longer holds a key
@@ -2020,6 +2025,12 @@ struct Model::Impl {
                       " GB pinned) - the positions past the ring are read over PCIe a token (slow once the context "
                       "is well past them; it is for a context that would not fit VRAM at all)";
             info.push_back(kv);
+            if (o.attn_splits != 1) {
+                int smax = 1;
+                for (const Dev& dd : D) smax = std::max(smax, dd.att_splits_max);
+                info.push_back("attention: a decode token's keys in up to " + std::to_string(smax) +
+                               " runs a KV group at a long context (split-K; --attn-splits 1: one block a group)");
+            }
         }
         // the Monitor's map of each GPU: the dense weights, the KV caches, the scratch, the DSpark draft, the routed
         // experts' slots (resident and staging), the vision tower
@@ -2173,8 +2184,8 @@ struct Model::Impl {
         else
             for (int r = 0; r < T; ++r) {
                 const Layer::SeqKv& c = l.sk[(size_t) rseq[(size_t) r]];
-                k::full_attn(d.q + (size_t) r * Q, c.kc, c.vc, d.pos + r, 1, g.n_head, g.n_kv, l.kvh.ring, ascale,
-                             d.att + (size_t) r * Q, d.s, l.kvh, c.kvq);
+                attn_token(d.q + (size_t) r * Q, c.kc, c.vc, d.pos + r, d.pos_h[r], ascale, d.att + (size_t) r * Q, d,
+                           l.kvh, c.kvq);
             }
         pmark(d, kPAttn);
         const x3::MvJob oj = job(l.o, d.att, Q, d.ao, g.dim);
@@ -2566,8 +2577,24 @@ struct Model::Impl {
         return c;
     }
 
+    // one query's attention over its keys 0 .. last: at a long context in runs of >= 2K keys on blocks of their own
+    // (split-K: the partials in d.attp, attn_combine_kernel merges them) - a token with one block a KV group leaves
+    // the GPU idle; at a short one the single block a group is cheaper
+    int attn_runs(const Dev& d, int nkeys) const {
+        if (o.attn_splits == 1) return 1;
+        const int cap = std::max(1, std::min(attn_splits, d.att_splits_max));
+        if (o.attn_splits > 1) return std::min(o.attn_splits, cap);
+        return std::min(cap, std::max(1, nkeys / kAttnSplitKeys));
+    }
+    void attn_token(const float* q, const uint16_t* kc, const uint16_t* vc, const int* pos, int last, float scale,
+                    float* out, Dev& d, const k::KvHost& kvh, const k::KvQ& kq) {
+        const int S = attn_runs(d, last + 1);
+        k::full_attn(q, kc, vc, pos, 1, g.n_head, g.n_kv, kvh.ring, scale, out, d.s, kvh, kq, S,
+                     S > 1 ? d.attp : nullptr);
+    }
+
     // one token's layer on the decode kernels
-    bool layer_token(Layer& l, Dev& d, int di, std::string& err) {
+    bool layer_token(Layer& l, Dev& d, int di, int last, std::string& err) {
         const auto job = [](const x3::Mat& m, const float* x, float* y) {
             x3::MvJob j;
             j.m = &m;
@@ -2592,8 +2619,7 @@ struct Model::Impl {
                         g.eps, l.kc, l.vc, d.s, 0, l.kvq, l.kvh);
         pmark(d, kPAttnIn);
         pmark(d, kPIndex);
-        k::full_attn(d.q, l.kc, l.vc, d.pos, 1, g.n_head, g.n_kv, l.kvh.ring, 1.0f / std::sqrt((float) g.hd), d.att,
-                     d.s, l.kvh, l.kvq);
+        attn_token(d.q, l.kc, l.vc, d.pos, last, 1.0f / std::sqrt((float) g.hd), d.att, d, l.kvh, l.kvq);
         pmark(d, kPAttn);
         const x3::MvJob oj = job(l.o, d.att, d.ao);
         if (!x3::mv(&oj, 1, d.s)) {
@@ -2857,7 +2883,7 @@ struct Model::Impl {
         Layer& l = L[(size_t) li];
         Dev& d = D[(size_t) l.dev];
         const int di = l.dev;
-        if (T == 1 && o.fast_decode && rseq.empty()) return layer_token(l, d, di, err);   // (rows: the window's)
+        if (T == 1 && o.fast_decode && rseq.empty()) return layer_token(l, d, di, pmax, err);   // (rows: the window's)
         if (T <= kWin && o.fast_decode) return layer_window(l, d, di, T, err);
         // h += x W: the BLAS's beta 1; with hipBLASLt (beta 0 products only) or --ablate the product into ao, then the
         // add - the same sum of the product and h (projected first: ablate)
@@ -2886,8 +2912,11 @@ struct Model::Impl {
                         g.eps, l.kc, l.vc, d.s, 0, l.kvq, l.kvh);
         pmark(d, kPAttnIn);
         const float one = 1.0f, zero = 0.0f;
-        k::full_attn(d.q, l.kc, l.vc, d.pos, T, g.n_head, g.n_kv, l.kvh.ring, 1.0f / std::sqrt((float) g.hd), d.att,
-                     d.s, l.kvh, l.kvq);
+        if (T == 1)
+            attn_token(d.q, l.kc, l.vc, d.pos, pmax, 1.0f / std::sqrt((float) g.hd), d.att, d, l.kvh, l.kvq);
+        else
+            k::full_attn(d.q, l.kc, l.vc, d.pos, T, g.n_head, g.n_kv, l.kvh.ring, 1.0f / std::sqrt((float) g.hd), d.att,
+                         d.s, l.kvh, l.kvq);
         pmark(d, kPAttn);
         k::to_f16(d.att, T, g.n_head * g.hd, g.n_head * g.hd, d.att16, g.n_head * g.hd, d.s);
         gemm_acc(l.o, d.att16, g.n_head * g.hd);   // h += attn Wo

@@ -120,7 +120,7 @@ void sparse_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const i
                  int Hq, int Hkv, int topk, int blk, float scale, float* out, cudaStream_t s, const KvQ& kq = KvQ{},
                  const KvHost& hs = KvHost{}, int splits = 1, float* part = nullptr);
 /// part's floats for sparse_attn's splits over T queries and Hkv groups.
-inline size_t attn_part_floats(int T, int Hkv, int splits) { return (size_t) T * Hkv * splits * 16 * 130; }
+inline size_t attn_part_floats(int T, int Hkv, int splits) { return (size_t) T * Hkv * splits * 12 * 130; }
 
 /// The router over logits [T][E] (F32): s = sigmoid, chosen by s + bias (the K largest, ties to the lower expert),
 /// weights s / sum over the chosen -> top [T][K], w [T][K].
@@ -144,9 +144,13 @@ void submit(cudaStream_t s);
 /// kq: their formats (--kv-cache: BF16 / int8 / fp8 / fp4, and the Hadamard rotation bit a format); its kc / vc are
 /// the BF16 rows.  hs: KV streaming (hs.ring > 0) - a position the ring no longer holds (its tag) is read from the
 /// host cache (hs.q's formats hold for it).
+/// splits > 1 (with part: attn_part_floats(T, Hkv, splits) floats, at most 32): a query's keys in that many runs on
+/// blocks of their own - one block a (query, KV group) leaves the GPU idle at decode - each run its own online
+/// softmax, combined by attn_combine_kernel in run order.  A decode token's sums depend on the splits alone, so
+/// the split count cannot change an answer past F32 rounding.
 void full_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const int* pos, int T, int Hq, int Hkv,
                int ring, float scale, float* out, cudaStream_t s, const KvHost& hs = KvHost{},
-               const KvQ& kq = KvQ{});
+               const KvQ& kq = KvQ{}, int splits = 1, float* part = nullptr);
 /// x's rows of n values each plus the bias (x += b, broadcast over the rows).
 void bias_add(float* x, const float* b, int T, int n, cudaStream_t s);
 

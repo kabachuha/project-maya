@@ -44,7 +44,7 @@ engine says `NOTE: --mtp: this pack has no NextN (MTP) block`).
 
     ./build/maya-glm46 --pack ~/models/GLM-4.6-Q8_0-IQ3_S-IQ3_S-IQ4_XS/maya-glm46 \
         --ids 1,2,3,4 [--gen N] [--dump-logits FILE --last N] [--max-context N] [--gpus 0,1] \
-        [--mtp on|off] [--mtp-drafts N]
+        [--mtp on|off] [--mtp-drafts N] [--kv-cache int8] [--attn-splits 0|1|N]
 
     ./build/maya-glm46 --pack ... --serve            # GEN <max_new> [keys] <ids>, STOP, QUIT
 
@@ -163,6 +163,18 @@ decode token reads the whole context's keys, so the positions past the ring are 
 cache already fits VRAM, where a decode token reads it in ~15 ms; a shorter context (above) is the same VRAM saving
 without the host reads.  With `--parallel` it is off (each conversation has its own cache).
 
+**The decode's attention** is the other cost that grows with the context: a token attends every key of it, and one
+block a KV head group (the token path walked all the keys in one block) left the card's other SMs idle.  At a long
+context `full_attn` now walks the keys in **runs of blocks of their own** (split-K: `--attn-splits N`, 0 = auto - a
+run of 2K keys, up to SM count / 8 runs; 1 = the single block, as before) and `attn_combine` merges the runs' online
+softmaxes in run order, exactly as one block would (the kernel test: one run and 8 agree to 2e-7 - F32's rounding;
+streaming caches and MTP verify windows included).  On the synthetic model at 5K keys a decode token went from 16.0
+to 2.25 ms (1 / 8 runs, 4/8 forced); a 32K context on a 3090-sized pair uses up to 10 runs, so it takes the same share of a token's time
+down.  The prompt path already has T x Hkv blocks - its cost is raw FLOPS, not parallelism.  That is why this is
+split-K rather than a tensor-core kernel: with int8 rows a 32K decode already reads ~4-6 GB of K / V a token
+(~6-9 ms), so tensor cores would only trade the remaining compute for that floor - FP16 `wmma` would gain a couple
+of milliseconds, at the cost of a BF16-rounded `q` and probabilities; the prompt's O(T^2) is where MMA would pay.
+
 Diagnostics: `GLM46_TIMING=1` prints a decoded token's routing waits, CPU-lane and promotion time; the serve `STAT`
 line has `vram_hit` (the routed experts found in VRAM) and `cpu` (the share the lane computed); `--verbose` prints a
 layer's GPU time; `GLM46_PLAN_TRACE=1` prints the start's memory plan a card at a time.
@@ -177,7 +189,8 @@ streaming off (each conversation has its own cache).  They are the next steps, n
 
 * `ctest -R glm46_kernels_test` - the new attention kernel (GQA, causal, BF16 rows) across sequence lengths
   that cross the 64-key tile boundary, against a double reference; the q/k/v bias add, the plain SwiGLU and the
-  sigmoid router likewise.  Exact to ~1e-7.  The same test writes int8 / fp8 / fp4 K / V caches through the
+  sigmoid router likewise.  Exact to ~1e-7.  The decode's key runs are checked against one block walking them all
+  (2 - 8 runs: 2e-7).  The same test writes int8 / fp8 / fp4 K / V caches through the
   engine's own `qk_norm_rope`, decodes them back on the host (scales, the Hadamard rotation) and checks the
   attention against the double reference over exactly those rows: ~1e-6.
 * `python tools/glm46/glm46_synth_gguf.py --quant xs|xxs` / `parity.py` - the smaller quants' type maps (Q6_K or
