@@ -107,11 +107,55 @@ Everything the other engines have:
   this model, as `glm4moe` and `glm4` are; only another model's hint gets a NOTE (it is applied too, as
   llama.cpp would).
 
+## Speed on a PC whose experts stream from RAM
+
+A token routes 8 experts in each of the 92 layers - 736 expert computations, ~10.9 MB of weights each in the shipped
+quant.  What decode costs is decided by where those experts live: the resident region (VRAM), the staging slots
+(the hot ones copied into VRAM), the pinned RAM pool (the CPU lane computes them) and the files on the SSD.  With
+two cards, 32 + 24 GB, and the 32K context, about 1,600 of the 14,720 experts are resident; the other ~89% run on
+the CPU lane, and that is the 4 tok/s - llama.cpp in the same regime is in the same range.
+
+What moves it, in the order it pays:
+
+* **the learned expert profile** (`--expert-profile FILE`, which a setup writes as
+  `data/expert-profile-glm46.bin`): the engine counts every layer's routings and saves them after a request; the
+  next engine start puts the most-routed experts in VRAM instead of a round-robin.  MoE routing is heavy-tailed, so
+  the resident 11% can cover much more than 11% of the 736 slots a token (this is the same mechanism the other
+  engines' shipped profiles use).  The file is per PC and per model geometry (92 x 160), a wrong one is ignored;
+  run, talk to it, restart (`./maya.sh`, or the Models page) and compare with `--bench`.
+* **a shorter context** - the K / V rows are in VRAM (about 4 KB a position a layer: 12 GB at 32K for all 93
+  layers, 3 GB at 8K) - so `--max-context 8192` hands ~9 GB to resident experts.  The context is a setup setting
+  (`--context`), and the setup prints the cache's size.
+* **`--mtp off`** on this kind of PC: a verify window of 4 rows reads the *union* of their experts (up to ~26 a layer
+  instead of 8) while it yields up to 4 tokens only if they are accepted.  Where almost every expert streams, that
+  is a loss (the GLM engine measured x0.62 on one V100); where most are resident it wins.  Set it in the config
+  (`--drafting off` in a setup writes `--mtp off`; `--drafting on` writes `--mtp on`), then compare with `--bench`.
+* **`--chunk`** (a setup setting): the prompt chunk's scratch is ~1.1 GB a card at 1024 tokens - `--chunk 512`
+  gives ~0.5 GB of it back to the experts.
+* **`--cpu-threads N`**: the lane's experts are ggml's IQ3_S / IQ4_XS dots on this CPU; on a 13th/14th-gen Intel
+  the E-cores can drag (try 8, the P-cores, against the default).  The engine also measures at load whether an
+  expert is faster copied into a staging slot or computed on the lane ("CPU lane vs staging (measured)").
+
+**KV streaming** (`--kv-streaming on`, `--kv-resident N`; `on` alone keeps 32K positions a layer in VRAM) is
+implemented now: every position's K / V rows live in pinned host memory as well as in a VRAM ring of N positions
+(whole 4096-position blocks, never below a prompt chunk), and attention reads a key from the ring while it holds the
+position, else from host memory over PCIe.  It is the way to run a context that does not fit VRAM at all (GLM-4.6's
+200K needs ~76 GB of K / V at BF16: impossible on a 32 + 24 GB pair) - but this model's attention is **dense**: every
+decode token reads the whole context's keys, so the positions past the ring are read over PCIe each token (about
+112 MB a layer a token at 24K positions: hundreds of ms a token).  That is why it is off by default here: at 32K the
+cache already fits VRAM, where a decode token reads it in ~15 ms; a shorter context (above) is the same VRAM saving
+without the host reads.  With `--parallel` it is off (each conversation has its own cache).
+
+Diagnostics: `GLM46_TIMING=1` prints a decoded token's routing waits, CPU-lane and promotion time; the serve `STAT`
+line has `vram_hit` (the routed experts found in VRAM) and `cpu` (the share the lane computed); `--verbose` prints a
+layer's GPU time; `GLM46_PLAN_TRACE=1` prints the start's memory plan a card at a time.
+
 ## What is not served yet
 
 Tensor parallel (`--tp`) and DSpark drafts are refused with a message (the model's own NextN block is the
-drafter here); the vision tower is off for this text pack; the K / V caches are BF16 only (`--kv-cache bf16`,
-KV streaming off); `--parallel` decodes without drafts.  They are the next steps, not silent fallbacks.
+drafter here); the vision tower is off for this text pack; the K / V caches are BF16 only (`--kv-cache bf16` -
+KV streaming included, which is off with `--parallel`); `--parallel` decodes without drafts.  They are the next
+steps, not silent fallbacks.
 
 ## Verification
 

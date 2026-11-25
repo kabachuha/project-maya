@@ -67,6 +67,8 @@ build-vision.bat
 /data/hy4-cpu-lane.txt
 /data/hy4-cpu-lane.txt.new
 /data/vram-room.json
+/data/expert-profile-glm46.bin
+/data/expert-profile-glm46.bin.tmp
 # the nightly check and the saved answers: each machine's own (tools/maya_nightly.py, tools/maya_golden.py)
 /maya-nightly.json
 /maya-nightly-results.txt

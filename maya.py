@@ -12014,11 +12014,22 @@ def write_config_glm46(a, pc: dict, meta: dict, pack: Path, ctx: int, quant: str
     # (the cards: the server shows the engine only these - CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES from "gpu" - and
     #  maya-glm46 splits its layers over every card it sees, by each one's free memory)
     args = ["--pack", str(pack), "--max-context", str(ctx)]
-    kept = keep_args(old.get("args") or [], args, ("--staging", "--resident-cap", "--reserve-gb", "--chunk",
-                                                   "--cpu-threads", "--expert-profile", "--mtp", "--mtp-drafts",
-                                                   "--ablate", "--cvec-mode", "--cvec-dir",
-                                                   "--control-vector-scaled", "--control-vector-layer-range"))
-    inst = {"family": "glm46", "quant": quant, "model_dir": str(d)}
+    prof = ROOT / "data" / "expert-profile-glm46.bin"   # (learned: absent now, the engine saves the routings there)
+    args += ["--expert-profile", str(prof)]
+    how = getattr(a, "drafting", None)                  # (--drafting off: the MTP block off - the test on a PC whose
+    if how == "off":                                    #  experts stream: a verify window's rows read their union)
+        args += ["--mtp", "off"]
+    elif how is not None:                               # (on / mtp: the block on; measure: it is on by default here)
+        if how == "dfly2":
+            warn("--drafting dfly2 is Hy4-Flash's drafter: GLM-4.6 drafts with its own NextN (MTP) block")
+        args += ["--mtp", "on"]
+    flags = ("--staging", "--resident-cap", "--reserve-gb", "--chunk", "--cpu-threads", "--expert-profile",
+             "--mtp", "--mtp-drafts", "--ablate", "--cvec-mode", "--cvec-dir", "--kv-streaming", "--kv-resident",
+             "--control-vector-scaled", "--control-vector-layer-range")
+    if how is not None:   # (--drafting given now: its choice wins over what the config before had)
+        flags = tuple(f for f in flags if f != "--mtp")
+    kept = keep_args(old.get("args") or [], args, flags)
+    inst = {"family": "glm46", "quant": quant, "model_dir": str(d), "drafting": "off" if how == "off" else "mtp"}
     sampling, effort = Q.model_defaults({"installer": inst})
     cfg = {"exe": str(GLM46_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": "glm-4.6", "gpu": gpus, "sampling": sampling, "reasoning_effort": effort,

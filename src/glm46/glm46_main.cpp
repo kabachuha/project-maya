@@ -1890,10 +1890,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--kv-cache: glm4moe's attention reads its K / V rows as BF16 (--kv-cache bf16 only)\n");
         std::exit(2);
     }
-    if (o.kv_resident > 0) {
-        std::fprintf(stderr, "--kv-streaming is not served for glm4moe yet (every position's rows stay in VRAM)\n");
-        std::exit(2);
-    }
     if (!enc_rgb.empty()) {   // the vision tower alone: a picture's rows into --dump-image
         int w = 0, h = 0;
         if (o.pack.empty() || enc_out.empty() || std::sscanf(enc_size.c_str(), "%dx%d", &w, &h) != 2) return usage();

@@ -2644,7 +2644,7 @@ void to_bf16(const float* x, int rows, int cols, int ld, uint16_t* y, int ldo, c
 // [row][Hkv][128] (ring 0: row = the position; else position % ring).  grid (T, Hkv), 128 threads - window_attn's tiling.
 __global__ void __launch_bounds__(128) full_attn_kernel(const float* q, const uint16_t* kc, const uint16_t* vc,
                                                         int ring, const int* pos, int T, int Hq, int Hkv,
-                                                        float scale, float* out) {
+                                                        float scale, float* out, KvHost hs) {
     __shared__ float qs[kG][128];
     __shared__ __align__(4) uint16_t ks[kTile][kRow], vs[kTile][kRow];
     __shared__ float sc[kG][kTile + 1];
@@ -2669,9 +2669,13 @@ __global__ void __launch_bounds__(128) full_attn_kernel(const float* q, const ui
             const int kp = k0 + j;
             uint32_t kw = 0, vw = 0;
             if (kp <= hi) {
-                const size_t row = (size_t) (ring > 0 ? kp % ring : kp);
-                kw = *(const uint32_t*) (kc + (row * Hkv + g) * 128 + c * 2);
-                vw = *(const uint32_t*) (vc + (row * Hkv + g) * 128 + c * 2);
+                // (KV streaming: the ring's row while it holds the position, else the position's row in host memory)
+                bool host = false;
+                const size_t row = hs.ring > 0 ? kv_row(hs, kp, host) : (size_t) (ring > 0 ? kp % ring : kp);
+                const uint16_t* krow = host ? hs.kc : kc;
+                const uint16_t* vrow = host ? hs.vc : vc;
+                kw = *(const uint32_t*) (krow + (row * Hkv + g) * 128 + c * 2);
+                vw = *(const uint32_t*) (vrow + (row * Hkv + g) * 128 + c * 2);
             }
             *(uint32_t*) &ks[j][c * 2] = kw;
             *(uint32_t*) &vs[j][c * 2] = vw;
@@ -2730,9 +2734,9 @@ __global__ void __launch_bounds__(128) full_attn_kernel(const float* q, const ui
 }
 
 void full_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const int* pos, int T, int Hq, int Hkv, int ring,
-               float scale, float* out, cudaStream_t s) {
+               float scale, float* out, cudaStream_t s, const KvHost& hs) {
     if (T <= 0) return;
-    full_attn_kernel<<<dim3(T, Hkv), 128, 0, s>>>(q, kc, vc, ring, pos, T, Hq, Hkv, scale, out);
+    full_attn_kernel<<<dim3(T, Hkv), 128, 0, s>>>(q, kc, vc, ring, pos, T, Hq, Hkv, scale, out, hs);
     check("full_attn");
 }
 
