@@ -66,7 +66,7 @@ struct Options {
     // the K / V caches' formats (--kv-cache, glm46_kernels.cuh's kKv*: 0 BF16 - the model's dtype, exact - 1 INT8, 2 FP8
     // E4M3 with a power-of-two scale a 32, 3 FP4 E2M1 with an E4M3 scale a 16) and whether their rows are rotated before
     // they are rounded (--kv-rot); the index keys stay BF16 (the blocks each query keeps do not move)
-    int kv_k = 0, kv_v = 0;   // (glm4moe's attention reads the BF16 rows: 0/0; a quantized cache is refused)
+    int kv_k = 0, kv_v = 0;   // (both 0: exact; 1 int8 / 2 fp8 / 3 fp4: a row ~2 / 2 / 3.5 times smaller - its scale rounded
     bool kv_rot = true;
     // --parallel: conversations at once - a KV cache (and index-key cache) each, the context's room for every one of
     // them (more than 1: no KV streaming, no DSpark draft, the layer split)

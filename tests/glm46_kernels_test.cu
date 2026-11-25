@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -114,6 +115,152 @@ int test_attn() {
         check(worst < 1e-4, buf);
         if (worst >= 1e-4) ++bad;
         cudaFree(dq); cudaFree(dout); cudaFree(dk); cudaFree(dv); cudaFree(dpos);
+    }
+    return bad;
+}
+
+// ---- a quantized K / V cache (--kv-cache): the engine's own qk_norm_rope writes it, these decode a row back (the
+// reference reads exactly the values the kernel reads), and the 128-point Hadamard undoes the rotation
+float e4m3_h(uint32_t b) {
+    const uint32_t e = (b >> 3) & 15u, m = b & 7u;
+    const float a = e == 0u ? (float) m * 0.001953125f : std::ldexp(1.0f + (float) m / 8.0f, (int) e - 7);
+    return (b & 0x80u) ? -a : a;
+}
+float e2m1_h(uint32_t c) {
+    const uint32_t m = c & 7u;
+    const float a = m < 4u ? 0.5f * (float) m : m == 4u ? 2.0f : m == 5u ? 3.0f : m == 6u ? 4.0f : 6.0f;
+    return (c & 8u) ? -a : a;
+}
+float kv_val(int fmt, const uint8_t* code, const uint8_t* sc, int d) {
+    if (fmt == glm46::k::kKvI8) return (float) ((const int8_t*) code)[d] * *(const float*) sc;
+    if (fmt == glm46::k::kKvFp8) return e4m3_h(code[d]) * std::ldexp(1.0f, (int) sc[d >> 5] - 127);
+    const uint8_t byte = code[d >> 1];
+    return e2m1_h((d & 1) ? (byte >> 4) : (byte & 15u)) * e4m3_h(sc[d >> 4]);
+}
+// H / sqrt(128) over 128 values (Sylvester order; its own inverse)
+void had128_h(float* v) {
+    float o[128];
+    for (int k = 0; k < 128; ++k) {
+        double a = 0.0;
+        for (int j = 0; j < 128; ++j) a += __builtin_popcount((unsigned) (k & j)) & 1 ? -(double) v[j] : (double) v[j];
+        o[k] = (float) (a / std::sqrt(128.0));
+    }
+    std::memcpy(v, o, sizeof o);
+}
+// attention over exact float rows, as ref_full_attn but over decoded ones
+void ref_full_attn_f(const std::vector<float>& q, const std::vector<float>& k, const std::vector<float>& v, int T,
+                     int Hq, int Hkv, std::vector<float>& out) {
+    const int hd = 128, kg = Hq / Hkv;
+    out.assign((size_t) T * Hq * hd, 0.0f);
+    const double scale = 1.0 / std::sqrt((double) hd);
+    for (int t = 0; t < T; ++t)
+        for (int g = 0; g < Hkv; ++g)
+            for (int h = 0; h < kg; ++h) {
+                const int hq = g * kg + h;
+                std::vector<double> e((size_t) t + 1);
+                double mx = -1e300;
+                for (int kp = 0; kp <= t; ++kp) {
+                    double dot = 0.0;
+                    for (int d = 0; d < hd; ++d)
+                        dot += (double) q[((size_t) t * Hq + hq) * hd + d] * (double) k[((size_t) kp * Hkv + g) * hd + d];
+                    e[(size_t) kp] = dot * scale;
+                    mx = std::max(mx, e[(size_t) kp]);
+                }
+                double sum = 0.0;
+                for (int kp = 0; kp <= t; ++kp) sum += (e[(size_t) kp] = std::exp(e[(size_t) kp] - mx));
+                for (int d = 0; d < hd; ++d) {
+                    double a = 0.0;
+                    for (int kp = 0; kp <= t; ++kp) a += e[(size_t) kp] / sum * (double) v[((size_t) kp * Hkv + g) * hd + d];
+                    out[((size_t) t * Hq + hq) * hd + d] = (float) a;
+                }
+            }
+}
+
+int test_quant_kv() {
+    int bad = 0;
+    const int T = 130, Hq = 12, Hkv = 1, hd = 128, n_rot = 64, half = n_rot / 2;
+    for (int fmt : {glm46::k::kKvI8, glm46::k::kKvFp8, glm46::k::kKvFp4}) {
+        std::vector<float> q((size_t) T * Hq * hd), k((size_t) T * Hkv * hd), v((size_t) T * Hkv * hd);
+        std::vector<float> qn1((size_t) hd), kn1((size_t) hd), inv((size_t) half);
+        std::vector<int> pos((size_t) T);
+        srand(4321 + fmt);
+        for (auto& x : q) x = (float) (rand() % 2001 - 1000) / 500.0f;
+        for (auto& x : k) x = (float) (rand() % 2001 - 1000) / 500.0f;
+        for (auto& x : v) x = (float) (rand() % 2001 - 1000) / 500.0f;
+        for (auto& x : qn1) x = 0.5f + (float) (rand() % 101) / 100.0f;
+        for (auto& x : kn1) x = 0.5f + (float) (rand() % 101) / 100.0f;
+        for (int i = 0; i < half; ++i) inv[(size_t) i] = (float) std::pow(10000.0, -2.0 * i / n_rot);
+        for (int i = 0; i < T; ++i) pos[(size_t) i] = i;
+        const size_t rows = (size_t) T, block = glm46::k::kv_bytes(fmt, fmt, rows);
+        uint8_t* hblk = (uint8_t*) std::malloc(block);
+        std::memset(hblk, 0, block);
+        uint16_t *kc16 = nullptr, *vc16 = nullptr;
+        glm46::k::KvQ kq;
+        glm46::k::kv_carve(hblk, rows, fmt, fmt, 3, kc16, vc16, kq);
+        uint8_t* dblk = nullptr;
+        float *dq = nullptr, *dout = nullptr, *dqn = nullptr, *dkn = nullptr, *dinv = nullptr;
+        int* dpos = nullptr;
+        CK(cudaMalloc(&dblk, block));
+        CK(cudaMalloc(&dq, q.size() * 4));
+        CK(cudaMalloc(&dout, q.size() * 4));
+        CK(cudaMalloc(&dqn, (size_t) hd * 4));
+        CK(cudaMalloc(&dkn, (size_t) hd * 4));
+        CK(cudaMalloc(&dinv, (size_t) half * 4));
+        CK(cudaMalloc(&dpos, (size_t) T * 4));
+        CK(cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dqn, qn1.data(), (size_t) hd * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dkn, kn1.data(), (size_t) hd * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dinv, inv.data(), (size_t) half * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dpos, pos.data(), (size_t) T * 4, cudaMemcpyHostToDevice));
+        float *dk = nullptr, *dv = nullptr;
+        CK(cudaMalloc(&dk, k.size() * 4));
+        CK(cudaMalloc(&dv, v.size() * 4));
+        CK(cudaMemcpy(dk, k.data(), k.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dv, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
+        // the engine's write path: q and k in place (norm, rope), both caches at their positions, rotated, quantized
+        uint16_t *kcc = nullptr, *vcc = nullptr;
+        glm46::k::KvQ kqd;
+        glm46::k::kv_carve(dblk, rows, fmt, fmt, 3, kcc, vcc, kqd);
+        glm46::k::qk_norm_rope(dq, dk, dv, dqn, dkn, dpos, T, Hq, Hkv, hd, n_rot, dinv, 1e-5f, kcc, vcc, nullptr, 0,
+                               kqd);
+        std::vector<float> qt(q.size());
+        CK(cudaMemcpy(qt.data(), dq, qt.size() * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hblk, dblk, block, cudaMemcpyDeviceToHost));
+        // decode the rows the kernel will read (codes / scales at kv_carve's offsets), then undo the rotation
+        std::vector<float> kd((size_t) T * Hkv * hd), vd((size_t) T * Hkv * hd);
+        const size_t cb = glm46::k::kv_code_bytes(fmt), sb = glm46::k::kv_scale_bytes(fmt);
+        uint16_t *kch = nullptr, *vch = nullptr;
+        glm46::k::KvQ kqh;   // (the host copy's own carve: kqd's pointers are the device ones)
+        glm46::k::kv_carve(hblk, rows, fmt, fmt, 3, kch, vch, kqh);
+        const uint8_t* kcode = kqh.kc;
+        const uint8_t* ksc = kqh.ks;
+        const uint8_t* vcode = kqh.vc;
+        const uint8_t* vsc = kqh.vs;
+        for (int r = 0; r < T; ++r) {
+            float kr[128], vr[128];
+            for (int d = 0; d < hd; ++d) {
+                kr[d] = kv_val(fmt, kcode + ((size_t) r * Hkv) * cb, ksc + ((size_t) r * Hkv) * sb, d);
+                vr[d] = kv_val(fmt, vcode + ((size_t) r * Hkv) * cb, vsc + ((size_t) r * Hkv) * sb, d);
+            }
+            had128_h(kr);
+            had128_h(vr);
+            std::memcpy(&kd[(size_t) r * hd], kr, sizeof kr);
+            std::memcpy(&vd[(size_t) r * hd], vr, sizeof vr);
+        }
+        glm46::k::full_attn(dq, kcc, vcc, dpos, T, Hq, Hkv, 0, 1.0f / std::sqrt((float) hd), dout, nullptr,
+                            glm46::k::KvHost{}, kqd);
+        std::vector<float> got(q.size()), want;
+        CK(cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost));
+        ref_full_attn_f(qt, kd, vd, T, Hq, Hkv, want);
+        double worst = 0.0;
+        for (size_t i = 0; i < got.size(); ++i) worst = std::max(worst, std::fabs((double) got[i] - want[i]));
+        char buf[110];
+        std::snprintf(buf, sizeof buf, "full_attn, %s cache T=%d (worst |diff| %.2e)", glm46::k::kv_name(fmt), T, worst);
+        check(worst < 2e-3, buf);
+        if (worst >= 2e-3) ++bad;
+        std::free(hblk);
+        cudaFree(dblk); cudaFree(dq); cudaFree(dout); cudaFree(dqn); cudaFree(dkn); cudaFree(dinv); cudaFree(dpos);
+        cudaFree(dk); cudaFree(dv);
     }
     return bad;
 }
@@ -263,6 +410,7 @@ int test_mtp() {
 int main() {
     std::printf("maya-glm46 kernels against double references\n");
     if (test_attn() != 0) ++g_fail;
+    if (test_quant_kv() != 0) ++g_fail;
     test_ops();
     test_mtp();
     std::printf(g_fail == 0 ? "ALL PASS\n" : "%d FAILED\n", g_fail);

@@ -10,15 +10,21 @@ GGUF serves in place - no weight copies.  The NextN block is served as the model
 
 * **GQA attention**: 96 query heads / 8 KV heads (12 a group), 128 a head; q, k and v have a bias; a per-head
   RMSNorm on q and k (128 values) and a **partial rope** on the first 64 dims (llama.cpp's "Neox" pairing -
-  channel *i* with *i* + 32, frequency *i*); a causal pass over a BF16 K / V cache.
+  channel *i* with *i* + 32, frequency *i*); a causal pass over a K / V cache that is BF16, or (`--kv-cache`)
+  int8 / fp8 / fp4 with the rows stored rotated.
 * **Plain residual**: `h += attention`, then `h = rms(h) * w` (post-attention norm), the FFN, `h += ffn`.
 * **MoE**: a 3-layer dense lead (FF width 12288), then 160 routed experts (FF 1536): sigmoid gating with a
   per-expert *selection* bias, the top 8 taken on the biased scores but weighted by the *unbiased* sigmoid,
   renormalised and scaled by 2.5; one shared expert (always on) beside them.
-* The shipped quant - ReadyArt's `Q8_0-IQ3_S-IQ3_S-IQ4_XS` (3.94 bpw) - is Q8_0 for attention, the dense and
-  shared FFNs, the head and the embedding; IQ3_S for the routed gate and up, IQ4_XS for the down; F32 for the
-  norms, router, biases and the per-expert selection bias.  Other type mixes are accepted as long as
-  `src/ds4/ds4_iq` covers them; anything else is refused at load, named.
+* **the shipped quants** (ReadyArt's `GLM-4.6-Derestricted-GGUF`), both with the NextN block:
+  * `Q8_0-IQ3_S-IQ3_S-IQ4_XS` (3.94 bpw, ~176 GB, 4 shards): Q8_0 for attention, the dense and shared FFNs, the
+    head and the embedding; IQ3_S for the routed gate and up, IQ4_XS for the down; F32 for the norms, router,
+    biases and the per-expert selection bias.  ~10.9 MB an expert;
+  * the smaller `Q6_K-IQ2_XS-IQ2_XS-IQ3_S` (2.9 bpw, ~129 GB, 3 shards): Q6_K for the dense weights (attention,
+    the dense / shared FFNs, head, embedding, the NextN einsum), IQ2_XS for the routed gate and up, IQ3_S for the
+    down.  ~7.6 MB an expert - the whole model fits better in RAM and a larger share of the experts in VRAM.
+  Other type mixes are accepted as long as `src/ds4/ds4_iq` covers them (Q4_K / Q5_K / Q6_K / Q8_0 dense, the
+  IQ1 / IQ2 / IQ3 / IQ4 experts); anything else is refused at load, named.
 
 ## The pack
 
@@ -63,8 +69,9 @@ split, the chat, the OpenAI and Anthropic endpoints).  Point the setup at the GG
 works, a set of `-0000N-of-0000N.gguf` shards is found by its first).  The setup
 
 1. checks the GPUs, asks which cards (the layer split over several) and the context - GLM-4.6's own reach comes from
-   the GGUF (`glm4moe.context_length`, 200K), the default is 32K; the K / V rows sit in VRAM (this engine streams
-   none), so a long context costs its cache: about 4 KB a position a layer, ~0.4 GB a 1K positions for all 93;
+   the GGUF (`glm4moe.context_length`, 200K), the default is 32K.  The K / V rows are in VRAM, 2 KB a position a
+   layer in the setup's default `--kv-cache int8` (4 KB with `bf16`, 1.1 KB with `fp4`): 6 GB at 32K for all 93
+   layers with int8, 1.5 GB at 8K.  `--context` and `--kv-cache` choose;
 2. builds `maya-glm46` (CUDA: V100 and newer; AMD: the HIP build);
 3. builds the pack (`tools/glm46/pack_gguf.py`, no copy of the weights) and exports the tokenizer and chat template;
 4. writes `maya-glm-4.6.json` and `run-maya-glm-4.6.sh`.
@@ -109,11 +116,13 @@ Everything the other engines have:
 
 ## Speed on a PC whose experts stream from RAM
 
-A token routes 8 experts in each of the 92 layers - 736 expert computations, ~10.9 MB of weights each in the shipped
-quant.  What decode costs is decided by where those experts live: the resident region (VRAM), the staging slots
-(the hot ones copied into VRAM), the pinned RAM pool (the CPU lane computes them) and the files on the SSD.  With
-two cards, 32 + 24 GB, and the 32K context, about 1,600 of the 14,720 experts are resident; the other ~89% run on
-the CPU lane, and that is the 4 tok/s - llama.cpp in the same regime is in the same range.
+A token routes 8 experts in each of the 92 layers - 736 expert computations, ~10.9 MB of weights each in the
+Q8_0-IQ3_S set (~7.6 MB in the Q6_K-IQ2_XS one).  What decode costs is decided by where those experts live: the
+resident region (VRAM), the staging slots (the hot ones copied into VRAM), the pinned RAM pool (the CPU lane
+computes them) and the files on the SSD.  With two cards, 32 + 24 GB, and the 32K context, about 1,600 of the
+14,720 experts are resident; the other ~89% run on the CPU lane, and that is the 4 tok/s - llama.cpp in the same
+regime is in the same range.  The smaller quant both shrinks the model (~129 GB: every expert's read from RAM is
+30% shorter) and its dense part (Q6_K ~13.5 GB vs Q8_0 ~17 GB), which leaves more for resident experts.
 
 What moves it, in the order it pays:
 
@@ -123,8 +132,13 @@ What moves it, in the order it pays:
   the resident 11% can cover much more than 11% of the 736 slots a token (this is the same mechanism the other
   engines' shipped profiles use).  The file is per PC and per model geometry (92 x 160), a wrong one is ignored;
   run, talk to it, restart (`./maya.sh`, or the Models page) and compare with `--bench`.
-* **a shorter context** - the K / V rows are in VRAM (about 4 KB a position a layer: 12 GB at 32K for all 93
-  layers, 3 GB at 8K) - so `--max-context 8192` hands ~9 GB to resident experts.  The context is a setup setting
+* **the K / V cache's format** (`--kv-cache int8`, a setup's default; `fp8`, `fp4`, `bf16`): the rows are stored
+  rotated by the 128-point Hadamard transform and rounded to 8 bits (an F32 scale a row for int8, a power-of-two
+  scale a 32 values for fp8) - half the VRAM of bf16, at a rounding the rotation makes small (the kernel test below
+  checks the decoding of every format to ~1e-6 against a double reference).  At 32K that is 6 GB instead of 12 GB,
+  ~550 more resident experts; `fp4` is 3.5 times smaller still.
+* **a shorter context** - the K / V rows are in VRAM (2 KB a position a layer with int8: 6 GB at 32K for all 93
+  layers, 1.5 GB at 8K) - so `--max-context 8192` hands ~5 GB to resident experts.  The context is a setup setting
   (`--context`), and the setup prints the cache's size.
 * **`--mtp off`** on this kind of PC: a verify window of 4 rows reads the *union* of their experts (up to ~26 a layer
   instead of 8) while it yields up to 4 tokens only if they are accepted.  Where almost every expert streams, that
@@ -153,19 +167,23 @@ layer's GPU time; `GLM46_PLAN_TRACE=1` prints the start's memory plan a card at 
 ## What is not served yet
 
 Tensor parallel (`--tp`) and DSpark drafts are refused with a message (the model's own NextN block is the
-drafter here); the vision tower is off for this text pack; the K / V caches are BF16 only (`--kv-cache bf16` -
-KV streaming included, which is off with `--parallel`); `--parallel` decodes without drafts.  They are the next
-steps, not silent fallbacks.
+drafter here); the vision tower is off for this text pack; `--parallel` decodes without drafts and turns KV
+streaming off (each conversation has its own cache).  They are the next steps, not silent fallbacks.
 
 ## Verification
 
 * `ctest -R glm46_kernels_test` - the new attention kernel (GQA, causal, BF16 rows) across sequence lengths
   that cross the 64-key tile boundary, against a double reference; the q/k/v bias add, the plain SwiGLU and the
-  sigmoid router likewise.  Exact to ~1e-7.
+  sigmoid router likewise.  Exact to ~1e-7.  The same test writes int8 / fp8 / fp4 K / V caches through the
+  engine's own `qk_norm_rope`, decodes them back on the host (scales, the Hadamard rotation) and checks the
+  attention against the double reference over exactly those rows: ~1e-6.
+* `python tools/glm46/glm46_synth_gguf.py --quant xs` / `parity.py` - the smaller quant's type map (Q6_K dense,
+  IQ2_XS experts, IQ3_S down) runs the whole engine, parity and MTP included (2%, top-1 agreeing as the Q8_0 set);
+  `tools/glm46/plan_check.py --model ...` checks its memory plan (dense bytes, the per-expert blob).
 * `python tools/glm46/parity.py --model <dir with the synthetic model>` - `maya-glm46 --dump-logits` against
   `ref/glm46.py` (the architecture's reference forward) on the synthetic model: a relative RMS of ~2% on the
   logits and every top-1 agreeing, the same difference llama.cpp's own CPU and CUDA builds show against the
-  same reference (q8_1 activations, FP16 weight bands, BF16 caches).  A row where the reference's routing sits on
+  same reference (q8_1 activations, FP16 weight bands, BF16 caches - the parity tool runs `--kv-cache bf16`).  A row where the reference's routing sits on
   a #2/#3 near tie (< 0.02) may pick the other expert - as llama.cpp's backends do - and the tool says so.
 * The control vectors: `python tools/glm46/parity.py --cvec FILE:SCALE [--cvec-mode add|project]`, and the same
   flags on the engine's logits.

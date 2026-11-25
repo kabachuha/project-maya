@@ -2169,12 +2169,12 @@ struct Model::Impl {
         pmark(d, kPIndex);
         const float ascale = 1.0f / std::sqrt((float) g.hd);
         if (!rows)
-            k::full_attn(d.q, l.kc, l.vc, d.pos, T, g.n_head, g.n_kv, l.kvh.ring, ascale, d.att, d.s, l.kvh);
+            k::full_attn(d.q, l.kc, l.vc, d.pos, T, g.n_head, g.n_kv, l.kvh.ring, ascale, d.att, d.s, l.kvh, l.kvq);
         else
             for (int r = 0; r < T; ++r) {
                 const Layer::SeqKv& c = l.sk[(size_t) rseq[(size_t) r]];
                 k::full_attn(d.q + (size_t) r * Q, c.kc, c.vc, d.pos + r, 1, g.n_head, g.n_kv, l.kvh.ring, ascale,
-                             d.att + (size_t) r * Q, d.s, l.kvh);
+                             d.att + (size_t) r * Q, d.s, l.kvh, c.kvq);
             }
         pmark(d, kPAttn);
         const x3::MvJob oj = job(l.o, d.att, Q, d.ao, g.dim);
@@ -2593,7 +2593,7 @@ struct Model::Impl {
         pmark(d, kPAttnIn);
         pmark(d, kPIndex);
         k::full_attn(d.q, l.kc, l.vc, d.pos, 1, g.n_head, g.n_kv, l.kvh.ring, 1.0f / std::sqrt((float) g.hd), d.att,
-                     d.s, l.kvh);
+                     d.s, l.kvh, l.kvq);
         pmark(d, kPAttn);
         const x3::MvJob oj = job(l.o, d.att, d.ao);
         if (!x3::mv(&oj, 1, d.s)) {
@@ -2887,7 +2887,7 @@ struct Model::Impl {
         pmark(d, kPAttnIn);
         const float one = 1.0f, zero = 0.0f;
         k::full_attn(d.q, l.kc, l.vc, d.pos, T, g.n_head, g.n_kv, l.kvh.ring, 1.0f / std::sqrt((float) g.hd), d.att,
-                     d.s, l.kvh);
+                     d.s, l.kvh, l.kvq);
         pmark(d, kPAttn);
         k::to_f16(d.att, T, g.n_head * g.hd, g.n_head * g.hd, d.att16, g.n_head * g.hd, d.s);
         gemm_acc(l.o, d.att16, g.n_head * g.hd);   // h += attn Wo

@@ -1649,7 +1649,7 @@ int usage() {
                  "usage: maya-glm46 --pack DIR --ids IDS|@FILE [--gen N] [--dump-logits FILE --last N] [--gpus LIST]\n"
                  "                [--max-context N] [--chunk N] [--staging N] [--resident-cap N] [--reserve-gb X]\n"
                  "                [--vision on|off] [--vision-gpu I] [--images FILE] [--layer-split auto|L,L,...]\n"
-                 "                [--tp 1|2|4] [--cache-gb X] [--kv-cache F|K,V (bf16 int8 fp8 fp4; default int8)]\n"
+                 "                [--tp 1|2|4] [--cache-gb X] [--kv-cache F|K,V (bf16 int8 fp8 fp4; default bf16)]\n"
                  "                [--kv-rot on|off] [--kv-streaming on|off] [--expert-profile FILE]\n"
                  "                [--score REF [--write-ref OUT]] [--cpu-threads N] [--mtp on|off|--mtp-drafts N]\n"
                  "                [--kv-resident N] [--tp-chunk N] [--tp-ffn-rows N] [--dspark-cost X] [--suffix-draft N]\n"
@@ -1884,10 +1884,6 @@ int main(int argc, char** argv) {
     }
     if (o.dspark) {
         std::fprintf(stderr, "--dspark: this engine serves no DSpark draft for glm4moe\n");
-        std::exit(2);
-    }
-    if (o.kv_k != 0 || o.kv_v != 0) {
-        std::fprintf(stderr, "--kv-cache: glm4moe's attention reads its K / V rows as BF16 (--kv-cache bf16 only)\n");
         std::exit(2);
     }
     if (!enc_rgb.empty()) {   // the vision tower alone: a picture's rows into --dump-image

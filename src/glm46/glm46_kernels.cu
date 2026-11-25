@@ -2640,20 +2640,38 @@ void to_bf16(const float* x, int rows, int cols, int ld, uint16_t* y, int ldo, c
 }
 
 // ---- GLM-4.5+/GLM-4.6: the full causal attention over the K / V caches (no indexer, no blocks).  A chunk's queries
-// (a decode: one) each attend the positions 0 .. pos[t] of their own head group; the caches are BF16 rows
-// [row][Hkv][128] (ring 0: row = the position; else position % ring).  grid (T, Hkv), 128 threads - window_attn's tiling.
+// (a decode: one) each attend the positions 0 .. pos[t] of their own head group; the caches are rows [row][Hkv][128]
+// (ring 0: row = the position; else position % ring) - BF16, or (--kv-cache) int8 / fp8 / fp4 in kv_carve's layout.
+// rot (bit 0 K, bit 1 V): the rows were stored rotated by the 128-point Hadamard transform - the queries are rotated
+// alike and the output rotated back (H (sum p H v) = sum p v).  grid (T, Hkv), 128 threads - window_attn's tiling.
+template <int KF, int VF>
 __global__ void __launch_bounds__(128) full_attn_kernel(const float* q, const uint16_t* kc, const uint16_t* vc,
                                                         int ring, const int* pos, int T, int Hq, int Hkv,
-                                                        float scale, float* out, KvHost hs) {
+                                                        float scale, float* out, KvHost hs, KvQ kq) {
     __shared__ float qs[kG][128];
     __shared__ __align__(4) uint16_t ks[kTile][kRow], vs[kTile][kRow];
+    __shared__ __align__(4) float ksc[kTile], vsc[kTile];
     __shared__ float sc[kG][kTile + 1];
     __shared__ float mrow[kG], lrow[kG], arow[kG];
-    const int t = blockIdx.x, g = blockIdx.y, tid = threadIdx.x;
+    int8_t (*k8)[2 * kRow] = (int8_t (*)[2 * kRow]) ks;   // (int8: the tiles as int8 rows, 260 bytes apart)
+    int8_t (*v8)[2 * kRow] = (int8_t (*)[2 * kRow]) vs;
+    const int t = blockIdx.x, g = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5;
     const int hi = pos[t];
+    const bool krot = KF != kKvBf16 && (kq.rot & 1), vrot = VF != kKvBf16 && (kq.rot & 2);
     for (int i = tid; i < kG * 128; i += 128) {
         const int h = i / 128, d = i % 128;
         qs[h][d] = q[((size_t) t * Hq + g * kG + h) * 128 + d] * scale;
+    }
+    if (krot) {   // (the queries rotated as the keys: (H q) . (H k) = q . k)
+        __syncthreads();
+        for (int h = wp; h < kG; h += 4) {
+            float x[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) x[i] = qs[h][lane * 4 + i];
+            had128w(x, lane);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) qs[h][lane * 4 + i] = x[i];
+        }
     }
     if (tid < kG) {
         mrow[tid] = -INFINITY;
@@ -2664,22 +2682,9 @@ __global__ void __launch_bounds__(128) full_attn_kernel(const float* q, const ui
     for (int h = 0; h < kG; ++h) acc[h] = 0.0f;
     for (int k0 = 0; k0 <= hi; k0 += kTile) {
         __syncthreads();
-        for (int i = tid; i < kTile * 64; i += 128) {
-            const int j = i >> 6, c = i & 63;
-            const int kp = k0 + j;
-            uint32_t kw = 0, vw = 0;
-            if (kp <= hi) {
-                // (KV streaming: the ring's row while it holds the position, else the position's row in host memory)
-                bool host = false;
-                const size_t row = hs.ring > 0 ? kv_row(hs, kp, host) : (size_t) (ring > 0 ? kp % ring : kp);
-                const uint16_t* krow = host ? hs.kc : kc;
-                const uint16_t* vrow = host ? hs.vc : vc;
-                kw = *(const uint32_t*) (krow + (row * Hkv + g) * 128 + c * 2);
-                vw = *(const uint32_t*) (vrow + (row * Hkv + g) * 128 + c * 2);
-            }
-            *(uint32_t*) &ks[j][c * 2] = kw;
-            *(uint32_t*) &vs[j][c * 2] = vw;
-        }
+        // (KV streaming: a key from its VRAM ring row while that row holds it, else from the host cache)
+        load_tile<KF>(k0, hi, g, Hkv, hs, true, kc, kq.kc, kq.ks, ks, k8, ksc);
+        load_tile<VF>(k0, hi, g, Hkv, hs, false, vc, kq.vc, kq.vs, vs, v8, vsc);
         __syncthreads();
         {
             const int j = tid & 63, h0 = (tid >> 6) * 8;
@@ -2690,10 +2695,14 @@ __global__ void __launch_bounds__(128) full_attn_kernel(const float* q, const ui
             if (ok) {
 #pragma unroll 4
                 for (int d = 0; d < 128; ++d) {
-                    const float kv = bf2f(ks[j][d]);
+                    const float kv = KF == kKvI8 ? (float) k8[j][d] : bf2f(ks[j][d]);
 #pragma unroll
                     for (int h = 0; h < 8; ++h)
                         if (h0 + h < kG) s8[h] = fmaf(qs[h0 + h][d], kv, s8[h]);
+                }
+                if constexpr (KF == kKvI8) {
+#pragma unroll
+                    for (int h = 0; h < 8; ++h) s8[h] *= ksc[j];
                 }
             }
 #pragma unroll
@@ -2722,21 +2731,60 @@ __global__ void __launch_bounds__(128) full_attn_kernel(const float* q, const ui
 #pragma unroll
             for (int h = 0; h < kG; ++h) {
                 float s = acc[h] * arow[h];
-                for (int j = 0; j < kTile; ++j) s = fmaf(sc[h][j], bf2f(vs[j][d]), s);
+                if constexpr (VF == kKvI8) {
+                    for (int j = 0; j < kTile; ++j) s = fmaf(sc[h][j] * vsc[j], (float) v8[j][d], s);
+                } else {
+                    for (int j = 0; j < kTile; ++j) s = fmaf(sc[h][j], bf2f(vs[j][d]), s);
+                }
                 acc[h] = s;
             }
         }
     }
     __syncthreads();
+    if (!vrot) {
 #pragma unroll
-    for (int h = 0; h < kG; ++h)
-        out[((size_t) t * Hq + g * kG + h) * 128 + tid] = lrow[h] > 0.0f ? acc[h] / lrow[h] : 0.0f;
+        for (int h = 0; h < kG; ++h)
+            out[((size_t) t * Hq + g * kG + h) * 128 + tid] = lrow[h] > 0.0f ? acc[h] / lrow[h] : 0.0f;
+        return;
+    }
+    // (the values were rotated: the output rotated back, H (sum p H v) = sum p v)
+#pragma unroll
+    for (int h = 0; h < kG; ++h) qs[h][tid] = lrow[h] > 0.0f ? acc[h] / lrow[h] : 0.0f;
+    __syncthreads();
+    for (int h = wp; h < kG; h += 4) {
+        float x[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) x[i] = qs[h][lane * 4 + i];
+        had128w(x, lane);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) out[((size_t) t * Hq + g * kG + h) * 128 + lane * 4 + i] = x[i];
+    }
 }
 
 void full_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const int* pos, int T, int Hq, int Hkv, int ring,
-               float scale, float* out, cudaStream_t s, const KvHost& hs) {
+               float scale, float* out, cudaStream_t s, const KvHost& hs, const KvQ& kq) {
     if (T <= 0) return;
-    full_attn_kernel<<<dim3(T, Hkv), 128, 0, s>>>(q, kc, vc, ring, pos, T, Hq, Hkv, scale, out, hs);
+    const dim3 g(T, Hkv);
+#define GLM46_FULL(K, V) full_attn_kernel<K, V><<<g, 128, 0, s>>>(q, kc, vc, ring, pos, T, Hq, Hkv, scale, out, hs, kq)
+    switch (kq.kf * 4 + kq.vf) {
+        case 0: GLM46_FULL(kKvBf16, kKvBf16); break;
+        case 1: GLM46_FULL(kKvBf16, kKvI8); break;
+        case 2: GLM46_FULL(kKvBf16, kKvFp8); break;
+        case 3: GLM46_FULL(kKvBf16, kKvFp4); break;
+        case 4: GLM46_FULL(kKvI8, kKvBf16); break;
+        case 5: GLM46_FULL(kKvI8, kKvI8); break;
+        case 6: GLM46_FULL(kKvI8, kKvFp8); break;
+        case 7: GLM46_FULL(kKvI8, kKvFp4); break;
+        case 8: GLM46_FULL(kKvFp8, kKvBf16); break;
+        case 9: GLM46_FULL(kKvFp8, kKvI8); break;
+        case 10: GLM46_FULL(kKvFp8, kKvFp8); break;
+        case 11: GLM46_FULL(kKvFp8, kKvFp4); break;
+        case 12: GLM46_FULL(kKvFp4, kKvBf16); break;
+        case 13: GLM46_FULL(kKvFp4, kKvI8); break;
+        case 14: GLM46_FULL(kKvFp4, kKvFp8); break;
+        default: GLM46_FULL(kKvFp4, kKvFp4); break;
+    }
+#undef GLM46_FULL
     check("full_attn");
 }
 

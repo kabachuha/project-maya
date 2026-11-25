@@ -71,6 +71,10 @@ def main() -> int:
     ap.add_argument("--cvec-mode", choices=("add", "project"), default="add")
     ap.add_argument("--cvec-range", nargs=2, type=int, default=None)
     ap.add_argument("--seed", type=int, default=777)
+    ap.add_argument("--synth-quant", choices=("mixed", "xs"), default="mixed",
+                    help="the synthetic model's per-tensor type map: mixed (Q8_0 / IQ3_S / IQ3_S / IQ4_XS) or xs "
+                         "(Q6_K / IQ2_XS / IQ2_XS / IQ3_S, the smaller shipped quant's); an existing --model keeps "
+                         "its own")
     a = ap.parse_args()
 
     model_dir = pathlib.Path(a.model) if a.model else pathlib.Path(tempfile.mkdtemp(prefix="glm46-parity-"))
@@ -78,7 +82,7 @@ def main() -> int:
     if not gguf.exists():
         model_dir.mkdir(parents=True, exist_ok=True)
         r = subprocess.run([sys.executable, str(HERE / "glm46_synth_gguf.py"), "--out", str(gguf), "--seed",
-                            str(a.seed)])
+                            str(a.seed), "--quant", a.synth_quant])
         if r.returncode != 0:
             return r.returncode
         r = subprocess.run([sys.executable, str(HERE / "pack_gguf.py"), "--model", str(model_dir), "--no-tokenizer"])

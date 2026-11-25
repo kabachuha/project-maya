@@ -794,6 +794,11 @@ GLM46_EXE = BUILD / ("maya-glm46.exe" if WIN else "maya-glm46")
 GLM46_PACK = "maya-glm46"                          # (the pack's folder in the model's: glm46.txt, tensors.txt, tokenizer/)
 GLM46_CONFIG = "maya-glm-4.6.json"                 # (the config's name in this folder; one model a setup)
 GLM46_MIN_CC = 70                                  # (V100 sm_70 and newer, as maya-mm3's)
+# the context's K / V rows a position a layer (8 KV heads of 128 values, K + V), by --kv-cache format: BF16 256 bytes
+# a row, INT8 / FP8 128 + 4, FP4 64 + 8 (the engine's kv_row_bytes; the 8-bit rows are stored rotated, so the rounding
+# is small)
+GLM46_KV_BYTES = {"bf16": 4096, "int8": 2112, "fp8": 2112, "fp4": 1152}
+GLM46_KV_FORMAT = "int8"                          # (a setup's default: half the VRAM of BF16, for resident experts)
 
 # Hy4-Flash (v1.1.68): Tencent's tencent/Hy4-flash (hy_v4_flash, 220B with its n-gram tables: 42 layers and an MTP
 # block, MLA attention with a sliding window and 12 indexed layers, 512 experts, 16 a token, 4 hyper-connection streams,
@@ -11990,16 +11995,19 @@ def set_up_glm46(a, prev: dict) -> Path | None:
     rec = DEFAULT_CONTEXT if DEFAULT_CONTEXT in contexts else contexts[-1]
     ctx = choose_context(a, prev_ctx, contexts, rec)
     ok(f"context: {ctx} tokens (the model's own reach: {trained})")
-    per_layer = 2 * (8 * 128) * 2 * 2                  # (K + V, 8 KV heads of 128 values, 2 bytes: 4 KB a position)
+    kvc = getattr(a, "kv_cache", None) or GLM46_KV_FORMAT
+    per_layer = GLM46_KV_BYTES.get(kvc, GLM46_KV_BYTES["bf16"])
     layers = int(md.get("glm4moe.block_count") or 0)   # (every layer has one; the NextN block too)
     kv_gb = ctx * per_layer * max(1, layers) / 2**30
-    note = f"the context's K / V rows sit in VRAM (maya-glm46 streams none): {kv_gb:.1f} GB at {context_label(ctx)}"
+    how_it_sits = "in VRAM" if "--kv-streaming" not in (prev_args[:-1]) else "a ring in VRAM, all in RAM too"
+    note = (f"the context's K / V rows ({kvc}, {'rotated ' if kvc != 'bf16' else ''}"
+            f"{per_layer // 1024} KB a position a layer) sit {how_it_sits}: {kv_gb:.1f} GB at {context_label(ctx)}")
     (warn if kv_gb > 0.45 * max(1.0, sum(float(g.get("vram_gb") or 0) for g in pc["gpus"])) else say)(
-        note + (" - --context N sets a shorter one" if kv_gb > 4 else ""))
-    return write_config_glm46(a, pc, meta, pack, ctx, quant, d)   # 8
+        note + (" - --context N sets a shorter one" if kv_gb > 2 else ""))
+    return write_config_glm46(a, pc, meta, pack, ctx, quant, d, kvc)   # 8
 
 
-def write_config_glm46(a, pc: dict, meta: dict, pack: Path, ctx: int, quant: str, d: Path) -> Path:
+def write_config_glm46(a, pc: dict, meta: dict, pack: Path, ctx: int, quant: str, d: Path, kvc: str) -> Path:
     """GLM-4.6's config and its start script (maya-glm-4.6.json): maya-glm46 with the pack, the context, the cards
     the server shows it (the layer split over several), the model's own sampling and thinking, and what a setup again
     keeps of the config before (the port, the key, the env, the engine's settings set by hand or on the Models page)."""
@@ -12013,7 +12021,7 @@ def write_config_glm46(a, pc: dict, meta: dict, pack: Path, ctx: int, quant: str
         gpus = [0]
     # (the cards: the server shows the engine only these - CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES from "gpu" - and
     #  maya-glm46 splits its layers over every card it sees, by each one's free memory)
-    args = ["--pack", str(pack), "--max-context", str(ctx)]
+    args = ["--pack", str(pack), "--max-context", str(ctx), "--kv-cache", kvc]
     prof = ROOT / "data" / "expert-profile-glm46.bin"   # (learned: absent now, the engine saves the routings there)
     args += ["--expert-profile", str(prof)]
     how = getattr(a, "drafting", None)                  # (--drafting off: the MTP block off - the test on a PC whose
@@ -12024,12 +12032,15 @@ def write_config_glm46(a, pc: dict, meta: dict, pack: Path, ctx: int, quant: str
             warn("--drafting dfly2 is Hy4-Flash's drafter: GLM-4.6 drafts with its own NextN (MTP) block")
         args += ["--mtp", "on"]
     flags = ("--staging", "--resident-cap", "--reserve-gb", "--chunk", "--cpu-threads", "--expert-profile",
-             "--mtp", "--mtp-drafts", "--ablate", "--cvec-mode", "--cvec-dir", "--kv-streaming", "--kv-resident",
-             "--control-vector-scaled", "--control-vector-layer-range")
-    if how is not None:   # (--drafting given now: its choice wins over what the config before had)
+             "--mtp", "--mtp-drafts", "--ablate", "--cvec-mode", "--cvec-dir", "--kv-cache", "--kv-streaming",
+             "--kv-resident", "--control-vector-scaled", "--control-vector-layer-range")
+    if how is not None:   # (--drafting / --kv-cache given now: their choices win over what the config before had)
         flags = tuple(f for f in flags if f != "--mtp")
+    if getattr(a, "kv_cache", None) is not None:
+        flags = tuple(f for f in flags if f != "--kv-cache")
     kept = keep_args(old.get("args") or [], args, flags)
-    inst = {"family": "glm46", "quant": quant, "model_dir": str(d), "drafting": "off" if how == "off" else "mtp"}
+    inst = {"family": "glm46", "quant": quant, "model_dir": str(d), "drafting": "off" if how == "off" else "mtp",
+            "kv_cache": kvc}
     sampling, effort = Q.model_defaults({"installer": inst})
     cfg = {"exe": str(GLM46_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": "glm-4.6", "gpu": gpus, "sampling": sampling, "reasoning_effort": effort,
@@ -12273,6 +12284,11 @@ def main() -> int:
                          "without it (sustained speed, ~5-30 minutes, the model loaded twice) and keep the faster; "
                          "then start the model "
                          "(with --no-start: only measure)")
+    ap.add_argument("--kv-cache", choices=("bf16", "int8", "fp8", "fp4"), default=None,
+                    help=f"{GLM46_SHOWN}'s K / V cache format: int8, the default - the rows stored rotated (the 8-bit "
+                         f"rounding is small) and half the VRAM of bf16, which the resident experts get; fp8 the same "
+                         f"size, fp4 3.5 times smaller (rougher), bf16 exact.  An engine without --kv-cache ignores "
+                         f"it; its own default is bf16.")
     ap.add_argument("--drafting", choices=("measure", "on", "off", "mtp", "dfly2"),
                     help="the drafter (DFlash2 with --draft dflash2, DeepSeek's DSpark): measure = the speed "
                          "calibration keeps it only if it is faster on this PC (the default with --yes; asked "

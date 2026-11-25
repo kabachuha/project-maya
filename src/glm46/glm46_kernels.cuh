@@ -140,10 +140,13 @@ bool plan_dev(const int* top, const float* w, int T, int K, const unsigned long 
 void submit(cudaStream_t s);
 
 /// GLM-4.5+/GLM-4.6's full causal attention: query t (rows of Hq heads, 128 each) attends the positions 0 .. pos[t]
-/// of its KV head group's rows in the BF16 caches (ring 0: row = the position, else position % ring); out [T][Hq][128].
-/// hs: KV streaming (hs.ring > 0) - a position the ring no longer holds (its tag) is read from the host cache.
+/// of its KV head group's rows in the caches (ring 0: row = the position, else position % ring); out [T][Hq][128].
+/// kq: their formats (--kv-cache: BF16 / int8 / fp8 / fp4, and the Hadamard rotation bit a format); its kc / vc are
+/// the BF16 rows.  hs: KV streaming (hs.ring > 0) - a position the ring no longer holds (its tag) is read from the
+/// host cache (hs.q's formats hold for it).
 void full_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const int* pos, int T, int Hq, int Hkv,
-               int ring, float scale, float* out, cudaStream_t s, const KvHost& hs = KvHost{});
+               int ring, float scale, float* out, cudaStream_t s, const KvHost& hs = KvHost{},
+               const KvQ& kq = KvQ{});
 /// x's rows of n values each plus the bias (x += b, broadcast over the rows).
 void bias_add(float* x, const float* b, int T, int n, cudaStream_t s);
 
